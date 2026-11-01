@@ -23,6 +23,10 @@ Subcommands:
   validate-model             Run the full post-build quality checklist (failures exit non-zero).
   validate-topology          Lightweight topology check — isolated attrs, fact-table coverage, misclassified numerics.
   discover                   Probe endpoint variants when the server version is unknown.
+  create-compound-metric     Derived metric from arithmetic over metrics (expression tree; --join outer).
+  create-conditional-metric  Filtered derived metric: Sum/Avg/Count of a fact metric or a distinct count
+                             of an attribute, ANDed conditions, optional latest/first-period rule.
+  delete-derived-metric      Delete one derived metric after a dependents check.
 
 Authentication
 ~~~~~~~~~~~~~~
@@ -5054,51 +5058,255 @@ def cmd_create_transformation(m: MSTR, args):
     print(json.dumps({"ok": True, "transformation_id": tid}, indent=2))
 
 
+# ── Derived metrics: compound (tree), conditional (embedded filter), delete ───────────────────
+# Verified write paths, all on /api/model/dataModels/{id}/metrics in one changeset each:
+# memory/reference_mosaic_derived_metrics.md §0 (tree compounds), §0c (conditional metrics),
+# §0d (level rules and counts on periodic-snapshot facts).
+
+DESCRIPTION_MAX = 250   # longer descriptions are cut in the UI (memory/feedback_mosaic_ship_bar.md)
+_TREE_OPS = {"+": "plus", "-": "minus", "*": "times", "/": "divide"}
+_OBJECT_ID = _re.compile(r"[0-9A-Fa-f]{32}")
+_ARITH_TOKEN = _re.compile(r"\s*(?:(?P<ref>\[[^\]]+\])|(?P<num>\d+(?:\.\d+)?)|(?P<op>[()+\-*/])"
+                           r"|(?P<id>[0-9A-Fa-f]{32})(?![0-9A-Za-z]))")
+
+
+def _check_description(text: str) -> str:
+    text = text or ""
+    if len(text) > DESCRIPTION_MAX:
+        die(f"description is {len(text)} characters; the limit is {DESCRIPTION_MAX}")
+    return text
+
+
+def compound_metric_tree(formula: str, resolve) -> dict:
+    """Arithmetic over metrics → expression tree (§0): `[A] - [B]`, `([A] + [B]) / [C]`,
+    `[A] * 100`, `-[A]`. Operands are `[name]`, `[objectId]`, `[fact_metric:name]`,
+    `[metric:name]`, or a bare 32-character objectId (the old space-separated syntax).
+    Constants are whole numbers (the tree's int64 variant; write 0.5 as 1 / 2).
+    resolve(text) returns the operand's {"objectId", "subType", "name"}."""
+    s, pos, toks = formula.strip(), 0, []
+    while pos < len(s):
+        mt = _ARITH_TOKEN.match(s, pos)
+        if not mt or mt.end() == pos:
+            die(f"formula: cannot read '{s[pos:pos + 20]}' (operands are [metric name] or an objectId; "
+                f"operators + - * / and parentheses)")
+        pos = mt.end()
+        toks.append(mt)
+    if not toks:
+        die("formula is empty")
+    i = 0
+
+    def peek():
+        return toks[i].group("op") if i < len(toks) else None
+
+    def factor():
+        nonlocal i
+        if i >= len(toks):
+            die("formula ends after an operator")
+        t = toks[i]
+        i += 1
+        if t.group("ref") or t.group("id"):
+            raw = t.group("ref")[1:-1].strip() if t.group("ref") else t.group("id")
+            return {"type": "object_reference", "target": resolve(raw)}
+        if t.group("num"):
+            if "." in t.group("num"):
+                die(f"formula: constant {t.group('num')} is not a whole number (write 0.5 as 1 / 2)")
+            return {"type": "constant", "variant": {"type": "int64", "value": t.group("num")}}
+        if t.group("op") == "(":
+            node = expr()
+            if peek() != ")":
+                die("formula: missing )")
+            i += 1
+            return node
+        if t.group("op") == "-":
+            return {"type": "operator", "function": "unary_minus", "children": [factor()]}
+        die(f"formula: unexpected '{t.group(0).strip()}'")
+
+    def term():
+        nonlocal i
+        node = factor()
+        while peek() in ("*", "/"):
+            op = peek()
+            i += 1
+            node = {"type": "operator", "function": _TREE_OPS[op], "children": [node, factor()]}
+        return node
+
+    def expr():
+        nonlocal i
+        node = term()
+        while peek() in ("+", "-"):
+            op = peek()
+            i += 1
+            node = {"type": "operator", "function": _TREE_OPS[op], "children": [node, term()]}
+        return node
+
+    tree = expr()
+    if i != len(toks):
+        die(f"formula: unexpected '{toks[i].group(0).strip()}'")
+    if not any(t.group("ref") or t.group("id") for t in toks):
+        die("formula references no metric")
+    return tree
+
+
+def compound_metric_body(name: str, tree: dict, *, description: str = "", join: str = "",
+                         fmt_values: list | None = None) -> dict:
+    """/metrics body for a compound metric: expression tree with dimty null (a compound
+    rejects a dimty, 8004d711). join "outer" keeps a row when one operand has no data for it
+    (the blank operand counts as 0); the default inner join drops that row."""
+    info = {"name": name, "subType": "metric"}
+    if description:
+        info["description"] = description
+    body: dict = {"information": info, "expression": {"tree": tree}, "dimty": None}
+    if join:
+        body["formulaJoinType"] = join
+    if fmt_values:
+        body["format"] = {"header": [], "values": list(fmt_values)}
+    return body
+
+
+def _metric_operand_index(fact_metrics: list, derived_metrics: list) -> dict:
+    """lower(name) and upper(objectId) → candidate operand refs, fact and derived metrics."""
+    index: dict = {}
+    for items, sub_type in ((fact_metrics, "fact_metric"), (derived_metrics, "metric")):
+        for o in items:
+            info = (o.get("information") or {}) if isinstance(o, dict) else {}
+            if not info.get("objectId"):
+                continue
+            ref = {"objectId": info["objectId"], "subType": sub_type, "name": info.get("name") or ""}
+            index.setdefault(ref["name"].lower(), []).append(ref)
+            index.setdefault(ref["objectId"].upper(), []).append(ref)
+    return index
+
+
+def _resolve_metric_operand(index: dict, raw: str) -> dict:
+    want = None
+    if ":" in raw and raw.split(":", 1)[0].strip().lower() in ("fact_metric", "metric"):
+        want, raw = (p.strip() for p in raw.split(":", 1))
+        want = want.lower()
+    key = raw.upper() if _OBJECT_ID.fullmatch(raw) else raw.lower()
+    hits = [h for h in index.get(key, []) if want is None or h["subType"] == want]
+    if not hits:
+        die(f"formula: no fact or derived metric matches [{raw}]")
+    if len(hits) > 1:
+        die(f"formula: [{raw}] matches {len(hits)} metrics; write [fact_metric:{raw}], [metric:{raw}] or the objectId")
+    return dict(hits[0])
+
+
+def _list_model_metrics(m: MSTR, model_id: str) -> tuple[list, list]:
+    mp = f"/api/model/dataModels/{model_id}"
+    facts, failed = _list_all(m, f"{mp}/factMetrics", "factMetrics")
+    if failed is not None: die(f"list factMetrics: {format_mstr_error(failed)}")
+    derived, failed = _list_all(m, f"{mp}/metrics", "metrics")
+    if failed is not None: die(f"list metrics: {format_mstr_error(failed)}")
+    return facts, derived
+
+
+def _named(items: list, name_or_id: str) -> list[dict]:
+    """information blocks whose name (case-insensitive) or objectId matches."""
+    infos = [o.get("information") or {} for o in items if isinstance(o, dict)]
+    return [i for i in infos if (i.get("objectId") or "").upper() == name_or_id.upper()
+            or (i.get("name") or "").lower() == name_or_id.lower()]
+
+
 def cmd_create_compound_metric(m: MSTR, args):
-    """Create a compound metric from a formula referencing existing metric IDs.
-    --formula: infix tokens, e.g. 'METRIC:<id1> - METRIC:<id2>'  (METRIC:<id> metric_reference tokens,
-    OP:<op> operator tokens).  Simple: 'A - B' where A,B are metric IDs."""
-    _require_unverified_ok(args, "create-compound-metric",
-                           "it posts an `expression` to /factMetrics, and the spec's fact-metric body "
-                           "has no expression (derived metrics go to /metrics; see "
-                           "memory/reference_mosaic_derived_metrics.md for the verified shapes).")
+    """Create (or, with --replace, rewrite in place) a compound derived metric from
+    arithmetic over existing fact or derived metrics, e.g. '[Sales] - [Returns]' or
+    '([Units Sold] / [Units Available]) * 100'.
+
+    Verified write path (memory/reference_mosaic_derived_metrics.md §0): expression tree
+    with dimty null, POST /metrics (create) or a full-body PUT /metrics/{id} (replace), in
+    one changeset. --join outer keeps groups where one operand has no rows (blank counts
+    as 0); without it such groups drop out of the result. On --replace, the description and
+    number format are kept unless given again; pass --join again (the read-back may not
+    carry it).
+    """
+    if getattr(args, "unverified_ok", False):
+        print("[note] --unverified-ok is no longer needed: create-compound-metric uses the verified "
+              "tree path", file=sys.stderr)
+    description = _check_description(getattr(args, "description", "") or "")
     m.login(identity=True)
-    tokens = []
-    for raw in args.formula.split():
-        if raw in {"+","-","*","/","(",")"}:
-            tokens.append({"type":"operator","value": raw})
-        else:
-            tokens.append({"type":"metric_reference","value": raw})
+    mp = f"/api/model/dataModels/{args.model_id}"
+    q = {"showAdvancedProperties": "true"}
+    facts, derived = _list_model_metrics(m, args.model_id)
+    index = _metric_operand_index(facts, derived)
+    tree = compound_metric_tree(args.formula, lambda raw: _resolve_metric_operand(index, raw))
+    fmt_values = _resolve_metric_format(args.format) if getattr(args, "format", None) else None
+
+    existing = [i for i in _named(derived, args.name) if (i.get("name") or "").lower() == args.name.lower()]
+    if len(existing) > 1:
+        die(f"'{args.name}' names {len(existing)} derived metrics: {[e.get('objectId') for e in existing]}")
+    replace = bool(getattr(args, "replace", False))
+    if existing and not replace:
+        die(f"a derived metric named '{args.name}' already exists ({existing[0].get('objectId')}); "
+            f"pass --replace to rewrite it in place")
+    if replace and not existing:
+        die(f"--replace: no derived metric named '{args.name}' on this model")
+    target_id = existing[0]["objectId"] if existing else None
+    if target_id:
+        r = m.get(f"{mp}/metrics/{target_id}", params=q)
+        if not r.ok: die(f"read '{args.name}': {format_mstr_error(r)}")
+        cur = _json_or(r, {})
+        description = description or (cur.get("information") or {}).get("description") or ""
+        if fmt_values is None:
+            fmt_values = (cur.get("format") or {}).get("values")
+    join = getattr(args, "join", None) or ""
+    body = compound_metric_body(args.name, tree, description=description, join=join, fmt_values=fmt_values)
+    method, path = ("PUT", f"{mp}/metrics/{target_id}") if target_id else ("POST", f"{mp}/metrics")
+    if getattr(args, "dry_run", False):
+        print(json.dumps({"ok": True, "dry_run": True,
+                          "plan": [{"method": method, "path": path, "params": q, "body": body}]}, indent=2))
+        return
     cs = open_cs(m)
-    r = m.post(f"/api/model/dataModels/{args.model_id}/factMetrics",
-               json={"information":{"name": args.name},
-                     "expression":{"tokens": tokens},
-                     "dimty":{}, "format":{"header":[],"values":[]}})
-    mid = (_json_or(r, {}).get("information") or {}).get("objectId") if r.ok else None
-    if not mid:
+    try:
+        r = (m.put if target_id else m.post)(path, params=q, json=body)
+        if not r.ok: die(f"{'replace' if target_id else 'create'} metric: {format_mstr_error(r)}")
+        metric_id = target_id or (_json_or(r, {}).get("information") or {}).get("objectId")
+        if not metric_id: die(f"create metric: no objectId in response {r.text[:200]}")
+        commit_cs(m, cs)
+    except BaseException:  # die() raises SystemExit; discard on every failure path
         discard_cs(m, cs)
-        die(f"compound metric: {r.status_code} {r.text[:300]}")
-    commit_cs(m, cs)
-    print(json.dumps({"ok": True, "metric_id": mid}, indent=2))
+        raise
+    print(json.dumps({"ok": True, "metric_id": metric_id,
+                      "action": "replaced" if target_id else "created"}, indent=2))
 
 
 # Aggregate-function objectIds are platform constants (same on every tenant) —
-# memory/reference_mosaic_derived_metrics.md "Well-known function objectIds".
+# memory/reference_mosaic_derived_metrics.md "Well-known function objectIds". Count is sent by
+# name without a target, the shape verified live for both counting forms (§0d).
 AGG_FUNCTION_IDS = {"Sum": "8107C31BDD9911D3B98100C04F2233EA",
                     "Avg": "8107C31DDD9911D3B98100C04F2233EA"}
+CONDITIONAL_FUNCTIONS = ("Avg", "Count", "Sum")
+
+# A metric's own level rule on a period-type attribute (snapshot date, month, week). The
+# *_fact rules read the latest/first period among the rows that qualify for the metric, and do
+# so per group: "latest" for a group is that group's last period with qualifying rows, not
+# the latest period overall. The *_lookup rules were accepted by the service but answered the
+# same way on an in-memory model (§0d); for "latest period overall", filter on a
+# latest-period flag column instead.
+LEVEL_RULE_AGGREGATIONS = {"last": "last_in_fact", "first": "first_in_fact",
+                           "last_lookup": "last_in_relationship", "first_lookup": "first_in_relationship"}
 
 
-def conditional_metric_tokens(function: str, source: dict, filter_id: str = "") -> list[dict]:
+def conditional_metric_tokens(function: str, source: dict, filter_id: str = "", *,
+                              distinct: bool = False) -> list[dict]:
     """Tokens for `Fn<UseLookupForAttributes=False>([Source]){~+}`; with filter_id,
-    the `<embedded filter>` binding goes just before end_of_text.
+    the `<embedded filter>` binding goes just before end_of_text. distinct=True (Count only)
+    adds `Distinct=True` for a distinct count of an attribute.
 
-    source is {"objectId", "subType": "fact_metric", "name"}. Every token carries
-    a "value", end_of_text included — omitting one fails with 8004cb04.
+    source is {"objectId", "subType": "fact_metric" | "attribute", "name"}. Every token
+    carries a "value", end_of_text included — omitting one fails with 8004cb04.
     """
-    tokens = [
-        {"type": "function", "value": function,
-         "target": {"objectId": AGG_FUNCTION_IDS[function], "subType": "function", "name": function}},
-        {"type": "character", "value": "<"},
+    if function in AGG_FUNCTION_IDS:
+        head = {"type": "function", "value": function,
+                "target": {"objectId": AGG_FUNCTION_IDS[function], "subType": "function", "name": function}}
+    else:
+        head = {"type": "function", "value": function}
+    tokens = [head, {"type": "character", "value": "<"}]
+    if distinct:
+        tokens += [{"type": "identifier", "value": "Distinct"},
+                   {"type": "function", "value": "="},
+                   {"type": "boolean", "value": "True"},
+                   {"type": "character", "value": ","}]
+    tokens += [
         {"type": "identifier", "value": "UseLookupForAttributes"},
         {"type": "function", "value": "="},
         {"type": "boolean", "value": "False"},
@@ -5118,21 +5326,33 @@ def conditional_metric_tokens(function: str, source: dict, filter_id: str = "") 
     return tokens + [{"type": "end_of_text", "value": ""}]
 
 
+def level_rule_unit(attribute: dict, rule: str) -> dict:
+    """dimty unit that makes the metric read the latest/first value of a period-type attribute
+    (LEVEL_RULE_AGGREGATIONS). A metric with its own unit keeps the rule under a filter; a
+    filtered metric over a fact metric that has the rule loses it (§0d)."""
+    return {"dimtyUnitType": "attribute",
+            "target": {"objectId": attribute["objectId"], "subType": "attribute", "name": attribute["name"]},
+            "aggregation": LEVEL_RULE_AGGREGATIONS[rule], "filtering": "apply", "groupBy": True}
+
+
 def conditional_metric_body(name: str, function: str, source: dict, fmt_values: list | None = None,
-                            description: str = "", filter_id: str = "") -> dict:
+                            description: str = "", filter_id: str = "", *, distinct: bool = False,
+                            level: tuple[dict, str] | None = None) -> dict:
     """/metrics body for a conditional metric. Without filter_id it is the
     unfiltered create (POST); with it, the binding update (PUT) — filter-bound
-    tokens plus the conditionality block."""
+    tokens plus the conditionality block. level=(attribute ref, rule) adds a level rule."""
     info = {"name": name, "subType": "metric"}
     if description:
         info["description"] = description
+    units = [{"dimtyUnitType": "report_base_level", "aggregation": "normal",
+              "filtering": "apply", "groupBy": True}]
+    if level:
+        units.append(level_rule_unit(*level))
     body = {
         "information": info,
         "expression": {"text": f"{function}({{{source['name']}}})",
-                       "tokens": conditional_metric_tokens(function, source, filter_id)},
-        "dimty": {"dimtyUnits": [{"dimtyUnitType": "report_base_level", "aggregation": "normal",
-                                  "filtering": "apply", "groupBy": True}],
-                  "excludeAttribute": False, "allowAddingUnit": True},
+                       "tokens": conditional_metric_tokens(function, source, filter_id, distinct=distinct)},
+        "dimty": {"dimtyUnits": units, "excludeAttribute": False, "allowAddingUnit": True},
         "format": {"header": [], "values": list(fmt_values or [])},
     }
     if filter_id:
@@ -5144,15 +5364,28 @@ def conditional_metric_body(name: str, function: str, source: dict, fmt_values: 
     return body
 
 
-def embedded_element_filter_body(attribute: dict, elements: list[str]) -> dict:
-    """POST /metrics/{id}/embeddedObjects body for `<attribute> IN (elements)`.
+def _element_list_predicate(attribute: dict, elements: list[str]) -> dict:
+    return {"type": "predicate_element_list",
+            "predicateTree": {
+                "attribute": attribute,
+                "elements": [{"elementId": f"h{v};{attribute['objectId']}", "display": v} for v in elements],
+                "function": "in"}}
+
+
+def embedded_filter_body(conditions: list[tuple[dict, list[str]]]) -> dict:
+    """POST /metrics/{id}/embeddedObjects body: one `<attribute> IN (elements)` list per
+    condition, ANDed under an operator node when there are several (verified with 2 and 3).
     elements are ID-form values; each elementId is `h<value>;<attribute objectId>`."""
-    return {"subType": "filter", "qualification": {"tree": {
-        "type": "predicate_element_list",
-        "predicateTree": {
-            "attribute": attribute,
-            "elements": [{"elementId": f"h{v};{attribute['objectId']}", "display": v} for v in elements],
-            "function": "in"}}}}
+    if not conditions:
+        die("a conditional metric needs at least one condition")
+    parts = [_element_list_predicate(a, list(e)) for a, e in conditions]
+    tree = parts[0] if len(parts) == 1 else {"type": "operator", "function": "and", "children": parts}
+    return {"subType": "filter", "qualification": {"tree": tree}}
+
+
+def embedded_element_filter_body(attribute: dict, elements: list[str]) -> dict:
+    """Single-condition form of embedded_filter_body."""
+    return embedded_filter_body([(attribute, elements)])
 
 
 def resolve_model_object_ref(m: MSTR, model_id: str, collection: str, sub_type: str,
@@ -5172,45 +5405,170 @@ def resolve_model_object_ref(m: MSTR, model_id: str, collection: str, sub_type: 
 
 
 def cmd_create_conditional_metric(m: MSTR, args):
-    """Create a conditional (filtered) derived metric: Fn(<fact metric>) scoped to
-    <attribute> IN (<elements>) by a filter embedded in the metric.
+    """Create a conditional (filtered) derived metric scoped by a filter embedded in the
+    metric: one `<attribute> IN (<elements>)` condition, plus any --and conditions (ANDed).
 
-    Verified write path (memory/reference_mosaic_derived_metrics.md §0c), ONE
-    changeset: POST /metrics (unfiltered) → POST /metrics/{id}/embeddedObjects
-    (the filter) → PUT /metrics/{id} (filter-bound tokens + conditionality) →
-    commit. Any failure discards the changeset. Number format values are copied
-    from the source fact metric.
+    What it aggregates (exactly one):
+      --source-metric F [--function Sum|Avg|Count]   Fn(<fact metric>); Count counts fact rows
+      --count-attribute A                            Count<Distinct=True>(<attribute>)
+    Optional level rule: --level-rule last|first|last_lookup|first_lookup with
+    --level-attribute P (a period-type attribute) makes the metric read the latest/first
+    period's value — needed on periodic-snapshot facts, where a filtered metric over a
+    fact metric that carries the rule loses it (memory/reference_mosaic_derived_metrics.md
+    §0d). A distinct count of an attribute ignores the rule unless that attribute is
+    related to the period attribute; count a fact metric (--function Count) instead.
+
+    Verified write path (§0c), ONE changeset: POST /metrics (unfiltered) → POST
+    /metrics/{id}/embeddedObjects (the filter) → PUT /metrics/{id} (filter-bound tokens +
+    conditionality) → commit. Any failure discards the changeset. The number format is
+    --format, else the source fact metric's (Sum/Avg), else `integer` (counts).
     """
+    source_name = getattr(args, "source_metric", None)
+    count_attr = getattr(args, "count_attribute", None)
+    function = getattr(args, "function", None)
+    if bool(source_name) == bool(count_attr):
+        die("pass exactly one of --source-metric or --count-attribute")
+    if count_attr and function not in (None, "Count"):
+        die("--count-attribute always counts distinct elements; drop --function")
+    function = "Count" if count_attr else (function or "Sum")
+    if function not in CONDITIONAL_FUNCTIONS:
+        die(f"--function must be one of {list(CONDITIONAL_FUNCTIONS)}")
+    level_rule = getattr(args, "level_rule", None)
+    level_attr_name = getattr(args, "level_attribute", None)
+    if bool(level_rule) != bool(level_attr_name):
+        die("--level-rule and --level-attribute go together")
+    if level_rule and level_rule not in LEVEL_RULE_AGGREGATIONS:
+        die(f"--level-rule must be one of {sorted(LEVEL_RULE_AGGREGATIONS)}")
+    extra = [list(c) for c in (getattr(args, "and_conditions", None) or [])]
+    for c in extra:
+        if len(c) < 2:
+            die(f"--and {' '.join(c)}: give an attribute and at least one element value")
+    if not args.elements:
+        die("--elements needs at least one value")
+    description = _check_description(getattr(args, "description", "") or "")
+    fmt_preset = getattr(args, "format", None)
+
     m.login(identity=True)
     mp = f"/api/model/dataModels/{args.model_id}"
-    source = resolve_model_object_ref(m, args.model_id, "factMetrics", "fact_metric", args.source_metric)
-    attribute = resolve_model_object_ref(m, args.model_id, "attributes", "attribute", args.attribute)
-    r = m.get(f"{mp}/factMetrics/{source['objectId']}")
-    if not r.ok: die(f"source metric GET: {format_mstr_error(r)}")
-    fmt_values = ((r.json() or {}).get("format") or {}).get("values")
+    if count_attr:
+        source = resolve_model_object_ref(m, args.model_id, "attributes", "attribute", count_attr)
+    else:
+        source = resolve_model_object_ref(m, args.model_id, "factMetrics", "fact_metric", source_name)
+    conditions = [(resolve_model_object_ref(m, args.model_id, "attributes", "attribute", args.attribute),
+                   list(args.elements))]
+    for c in extra:
+        conditions.append((resolve_model_object_ref(m, args.model_id, "attributes", "attribute", c[0]), c[1:]))
+    level = None
+    if level_rule:
+        level = (resolve_model_object_ref(m, args.model_id, "attributes", "attribute", level_attr_name),
+                 level_rule)
+    if fmt_preset:
+        fmt_values = _resolve_metric_format(fmt_preset)
+    elif function == "Count":
+        fmt_values = _resolve_metric_format("integer")
+    else:
+        r = m.get(f"{mp}/factMetrics/{source['objectId']}")
+        if not r.ok: die(f"source metric GET: {format_mstr_error(r)}")
+        fmt_values = ((r.json() or {}).get("format") or {}).get("values")
+    distinct = bool(count_attr)
+
+    def body(filter_id=""):
+        return conditional_metric_body(args.name, function, source, fmt_values, description,
+                                       filter_id=filter_id, distinct=distinct, level=level)
+
     q = {"showAdvancedProperties": "true"}
+    filter_body = embedded_filter_body(conditions)
+    if getattr(args, "dry_run", False):
+        print(json.dumps({"ok": True, "dry_run": True, "plan": [
+            {"step": "create", "method": "POST", "path": f"{mp}/metrics", "params": q, "body": body()},
+            {"step": "embed filter", "method": "POST", "path": f"{mp}/metrics/<new metric id>/embeddedObjects",
+             "params": {"showExpressionAs": "tree"}, "body": filter_body},
+            {"step": "bind filter", "method": "PUT", "path": f"{mp}/metrics/<new metric id>", "params": q,
+             "body": body("<embedded filter id>")},
+        ]}, indent=2))
+        return
     cs = open_cs(m)
     try:
-        r = m.post(f"{mp}/metrics", params=q,
-                   json=conditional_metric_body(args.name, args.function, source, fmt_values,
-                                                args.description))
+        r = m.post(f"{mp}/metrics", params=q, json=body())
         if not r.ok: die(f"create metric: {format_mstr_error(r)}")
         metric_id = r.json()["information"]["objectId"]
         r = m.post(f"{mp}/metrics/{metric_id}/embeddedObjects", params={"showExpressionAs": "tree"},
-                   json=embedded_element_filter_body(attribute, args.elements))
+                   json=filter_body)
         if not r.ok: die(f"embed filter: {format_mstr_error(r)}")
         emb = r.json() or {}
         filter_id = emb.get("id") or (emb.get("information") or {}).get("objectId")
         if not filter_id: die(f"embed filter: no id in response {str(emb)[:200]}")
-        r = m.put(f"{mp}/metrics/{metric_id}", params=q,
-                  json=conditional_metric_body(args.name, args.function, source, fmt_values,
-                                               args.description, filter_id=filter_id))
+        r = m.put(f"{mp}/metrics/{metric_id}", params=q, json=body(filter_id))
         if not r.ok: die(f"bind filter: {format_mstr_error(r)}")
         commit_cs(m, cs)
     except BaseException:  # die() raises SystemExit; discard on every failure path
         discard_cs(m, cs)
         raise
     print(json.dumps({"ok": True, "metric_id": metric_id, "embedded_filter_id": filter_id}, indent=2))
+
+
+def _metric_references(definition: dict, target: dict) -> bool:
+    """True when a derived metric's definition (tokens read-back) refers to target: its
+    objectId anywhere in the body, or `{name}` / `[name]` in the expression text."""
+    blob = json.dumps(definition).upper()
+    if target["objectId"].upper() in blob:
+        return True
+    text = ((definition.get("expression") or {}).get("text") or "").lower()
+    name = (target.get("name") or "").lower()
+    return bool(name) and (f"{{{name}}}" in text or f"[{name}]" in text)
+
+
+def cmd_delete_derived_metric(m: MSTR, args):
+    """Delete one derived metric (never a fact metric or attribute) in a changeset.
+
+    Before deleting, reads every other derived metric of the model and lists the ones that
+    refer to it; refuses when there are any, unless --force. (What the service does to a
+    dependent metric when its operand is deleted has not been verified.) Requires --yes;
+    --dry-run reports the target and its dependents and writes nothing.
+    """
+    key = getattr(args, "object_id", None) or getattr(args, "name", None)
+    if not key: die("pass --name or --object-id")
+    dry_run = bool(getattr(args, "dry_run", False))
+    if not dry_run and not getattr(args, "yes", False):
+        die("delete-derived-metric requires --yes after you have reviewed the target (try --dry-run first)")
+    m.login(identity=True)
+    mp = f"/api/model/dataModels/{args.model_id}"
+    facts, derived = _list_model_metrics(m, args.model_id)
+    hits = _named(derived, key)
+    if not hits:
+        if _named(facts, key):
+            die(f"'{key}' is a fact metric; delete-derived-metric deletes derived metrics only")
+        die(f"no derived metric matches '{key}'")
+    if len(hits) > 1:
+        die(f"'{key}' matches {len(hits)} derived metrics: {[h.get('objectId') for h in hits]}. Pass --object-id.")
+    target = {"objectId": hits[0]["objectId"], "name": hits[0].get("name") or ""}
+
+    dependents = []
+    for o in derived:
+        info = (o.get("information") or {}) if isinstance(o, dict) else {}
+        oid = info.get("objectId")
+        if not oid or oid.upper() == target["objectId"].upper():
+            continue
+        r = m.get(f"{mp}/metrics/{oid}", params={"showExpressionAs": "tokens", "showAdvancedProperties": "true"})
+        if not r.ok: die(f"read '{info.get('name')}' to check dependents: {format_mstr_error(r)}")
+        if _metric_references(_json_or(r, {}), target):
+            dependents.append({"objectId": oid, "name": info.get("name")})
+    report = {"target": target, "dependents": dependents}
+    if dry_run:
+        print(json.dumps({"ok": True, "dry_run": True, **report}, indent=2))
+        return
+    if dependents and not getattr(args, "force", False):
+        die(f"'{target['name']}' is used by {len(dependents)} derived metric(s): "
+            f"{[d['name'] for d in dependents]}. Delete or rewrite those first, or pass --force.")
+    cs = open_cs(m)
+    try:
+        r = m.delete(f"{mp}/metrics/{target['objectId']}")
+        if not r.ok: die(f"delete metric: {format_mstr_error(r)}")
+        commit_cs(m, cs)
+    except BaseException:
+        discard_cs(m, cs)
+        raise
+    print(json.dumps({"ok": True, "deleted": target, "dependents": dependents}, indent=2))
 
 
 def cmd_patch_fact_metrics(m: MSTR, args):
@@ -6061,27 +6419,70 @@ def build_parser():
     sp.add_argument("--unverified-ok", action="store_true", help="send the unverified request anyway")
 
     sp = sub.add_parser("create-compound-metric",
-                        help="UNVERIFIED: uses operator/metric_reference tokens on /factMetrics; the "
-                             "verified derived-metric shapes are in memory/reference_mosaic_derived_metrics.md")
+        help="Derived metric from arithmetic over existing metrics ('[Sales] - [Returns]', "
+             "'([A] + [B]) / [C]', '[A] * 100'), posted as an expression tree in one changeset "
+             "(see memory/reference_mosaic_derived_metrics.md §0).")
     sp.add_argument("--model-id", required=True)
     sp.add_argument("--name", required=True)
-    sp.add_argument("--formula", required=True, help="space-separated: 'METRIC_ID1 - METRIC_ID2'")
-    sp.add_argument("--unverified-ok", action="store_true", help="send the unverified request anyway")
+    sp.add_argument("--formula", required=True,
+                    help="operands [metric name], [objectId], [fact_metric:name] or [metric:name] (bare "
+                         "objectIds also work); operators + - * / and parentheses; whole-number constants")
+    sp.add_argument("--join", choices=["inner", "outer"],
+                    help="formulaJoinType. outer keeps a group when one operand has no rows for it (the "
+                         "blank operand counts as 0); the default (inner) drops that group from results")
+    sp.add_argument("--format", help=f"number format preset: {', '.join(sorted(METRIC_FORMAT_PRESETS))}")
+    sp.add_argument("--description", default="", help=f"business description (max {DESCRIPTION_MAX} characters)")
+    sp.add_argument("--replace", action="store_true",
+                    help="rewrite the existing derived metric with this name in place (full-body PUT); "
+                         "keeps its description and format unless given again")
+    sp.add_argument("--dry-run", action="store_true", help="print the request; open no changeset")
+    sp.add_argument("--unverified-ok", action="store_true",
+                    help="no longer needed (the tree path is verified); accepted so old scripts still run")
 
     sp = sub.add_parser("create-conditional-metric",
-        help="Derived metric Fn(<fact metric>) scoped to <attribute> IN (<elements>) by an embedded "
-             "filter, in one changeset (see memory/reference_mosaic_derived_metrics.md §0c).")
+        help="Derived metric scoped by a filter embedded in the metric (<attribute> IN (<elements>), "
+             "optionally ANDed with more), with an optional latest/first-period level rule, in one "
+             "changeset (see memory/reference_mosaic_derived_metrics.md §0c, §0d).")
     sp.add_argument("--model-id", required=True)
     sp.add_argument("--name", required=True)
-    sp.add_argument("--source-metric", required=True,
-                    help="fact metric to aggregate: name (case-insensitive) or objectId")
+    what = sp.add_mutually_exclusive_group(required=True)
+    what.add_argument("--source-metric",
+                      help="fact metric to aggregate with --function: name (case-insensitive) or objectId")
+    what.add_argument("--count-attribute",
+                      help="attribute whose distinct elements to count (customers, patients, accounts...): "
+                           "name or objectId")
     sp.add_argument("--attribute", required=True,
                     help="attribute to filter on: name (case-insensitive) or objectId")
     sp.add_argument("--elements", required=True, nargs="+",
                     help="attribute ID-form values to keep (IN list); quote values that contain spaces")
-    sp.add_argument("--function", default="Sum", choices=sorted(AGG_FUNCTION_IDS),
-                    help="aggregation wrapped around the source metric (default Sum, the live-verified path)")
-    sp.add_argument("--description", default="", help="business description for the new metric")
+    sp.add_argument("--and", dest="and_conditions", action="append", nargs="+", metavar="ATTR_OR_VALUE",
+                    help="another condition, ANDed: the attribute (name or objectId) then its ID-form values. "
+                         "Repeatable.")
+    sp.add_argument("--function", choices=list(CONDITIONAL_FUNCTIONS),
+                    help="aggregation around --source-metric (default Sum). Count counts the fact rows and, "
+                         "unlike a distinct count of an attribute, honors --level-rule")
+    sp.add_argument("--level-rule", choices=sorted(LEVEL_RULE_AGGREGATIONS),
+                    help="read only the latest (last) or earliest (first) period's rows, per group, for "
+                         "balances, statuses and other snapshot values that must not be summed over time. "
+                         "*_lookup variants use the attribute's lookup; see §0d before relying on them")
+    sp.add_argument("--level-attribute",
+                    help="the period-type attribute (snapshot date, month, week) for --level-rule")
+    sp.add_argument("--format", help=f"number format preset: {', '.join(sorted(METRIC_FORMAT_PRESETS))} "
+                                     f"(default: the source metric's format; integer for counts)")
+    sp.add_argument("--description", default="", help=f"business description (max {DESCRIPTION_MAX} characters)")
+    sp.add_argument("--dry-run", action="store_true", help="print the three requests; open no changeset")
+
+    sp = sub.add_parser("delete-derived-metric",
+        help="Delete one derived metric (never a fact metric or attribute) in a changeset, after "
+             "checking which other derived metrics refer to it.")
+    sp.add_argument("--model-id", required=True)
+    target = sp.add_mutually_exclusive_group(required=True)
+    target.add_argument("--name", help="derived metric name (case-insensitive)")
+    target.add_argument("--object-id", help="derived metric objectId")
+    sp.add_argument("--yes", action="store_true", help="delete it (required unless --dry-run)")
+    sp.add_argument("--force", action="store_true",
+                    help="delete even when other derived metrics refer to it (they may break)")
+    sp.add_argument("--dry-run", action="store_true", help="show the target and its dependents; delete nothing")
 
     sp = sub.add_parser("patch-fact-metrics",
         help="Set aggregation function and/or number format on many fact metrics in one changeset, "
@@ -6153,6 +6554,7 @@ def main():
             "create-transformation": cmd_create_transformation,
             "create-compound-metric": cmd_create_compound_metric,
             "create-conditional-metric": cmd_create_conditional_metric,
+            "delete-derived-metric": cmd_delete_derived_metric,
             "patch-fact-metrics": cmd_patch_fact_metrics,
             "attach-transformation": cmd_attach_transformation,
         }[args.cmd](m, args)

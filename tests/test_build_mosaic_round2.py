@@ -751,7 +751,6 @@ class PatchModelObjectTests(unittest.TestCase):
     def test_unverified_commands_need_explicit_consent(self):
         m = make_m({}, login=False)
         for fn, extra in ((bm.cmd_create_transformation, {"member": ["A=-1"]}),
-                          (bm.cmd_create_compound_metric, {"formula": "A - B"}),
                           (bm.cmd_attach_transformation, {"source_metric": "S", "transformation": "T"})):
             with self.subTest(fn.__name__), self.assertRaises(SystemExit), quiet():
                 fn(m, types.SimpleNamespace(model_id="M", name="n", unverified_ok=False, **extra))

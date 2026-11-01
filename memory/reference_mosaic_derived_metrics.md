@@ -44,7 +44,7 @@ Worked example — cross-source ratio `MktCap / ((OutputSat/1e8) * Close)`:
  "dimty": null,
  "format": {"header":[],"values":[{"type":"number_category","value":"0"},{"type":"number_format","value":"#,##0.0"},{"type":"number_decimal_places","value":"1"}]}}
 ```
-On GET, the service round-trips `expression.text`, e.g. `{Market Capitalization USD} / (({Output Value Satoshis} / 100000000) * {Closing Price USD})`. The CLI `create-compound-metric` (superseded `{type:operator/metric_reference}` guess, forces identity-on) does NOT produce this shape — POST the tree directly instead.
+On GET, the service round-trips `expression.text`, e.g. `{Market Capitalization USD} / (({Output Value Satoshis} / 100000000) * {Closing Price USD})`. `build_mosaic.py create-compound-metric` posts this shape (`--formula '[A] / ([B] * [C])'`, names or objectIds; `--join outer`, §0d rule 7; `--replace` for the full-body PUT below). It replaced an earlier `{type:operator/metric_reference}` guess on `/factMetrics`.
 
 **Updating a compound metric (verified 2026-07-21):** `PATCH /metrics/{id}` is NOT a registered route (404 8004cc04), and the helper's `patch-model-object --kind metric` used to route to `/factMetrics/{id}` (500 8004d706 subtype mismatch; fixed 2026-10-05: `--kind metric` is now the derived metric's `/metrics/{id}` with PUT, `--kind fact_metric` the fact metric). Use **PUT `/api/model/dataModels/{id}/metrics/{mid}`** with a FULL body `{information, expression:{tree}, dimty: null, format}` in a changeset. GET returns the expression as read-only `text` only — you must supply the `tree` again on PUT (rebuild it; stripping text and sending an empty expression → 400 8004d718 "expression could not be set to empty").
 
@@ -255,6 +255,12 @@ consumers to filter on it. A metric that should always read the latest period ca
 filter (rule 6), e.g. `Avg<UseLookupForAttributes=False>([attribute:<numeric attribute>]) {~+}` filtered to
 `<event flag> = Y AND <latest flag> = Y` averages once per entity. Possible engine defect: classic ending-lookup
 semantics would return the period table's last period for every group.
+
+**Runnable** (`skills/build-mosaic-model/scripts/build_mosaic.py`): `create-conditional-metric --count-attribute <Entity>`
+(rule 3, distinct count), `--source-metric <M> --function Count` (rule 3, counts rows and keeps a level rule),
+`--level-rule last|first --level-attribute <Period>` (rule 4), repeatable `--and <attribute> <values...>` (rules 6
+and 9); `create-compound-metric --join outer` (rule 7); `delete-derived-metric` (rule 8; lists the derived
+metrics that refer to the target and refuses unless `--force`). Each takes `--dry-run`.
 
 ## 1. Compound metric — ratio of two metrics
 
