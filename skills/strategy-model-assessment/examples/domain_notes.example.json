@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "domain": "<industry or business process>",
+  "claims": [
+    {
+      "id": "D0",
+      "claim": "<how the organization defines a key measure, in its own words>",
+      "sources": [
+        {
+          "title": "<the organization's metric definitions document>",
+          "type": "user_document",
+          "location": "<section or page>"
+        }
+      ],
+      "applies_to": [
+        "<metric>"
+      ],
+      "verified_against_data": "yes",
+      "check": "<query showing the model's metric matches the definition>"
+    },
+    {
+      "id": "D1",
+      "claim": "<a standard measure and its exact definition, as the source states it>",
+      "sources": [
+        {
+          "title": "<data provider's field dictionary or user guide>",
+          "url": "<link>",
+          "type": "provider"
+        }
+      ],
+      "applies_to": [
+        "<metric or attribute>"
+      ],
+      "verified_against_data": "yes",
+      "check": "<query or note showing the data agrees>"
+    },
+    {
+      "id": "D2",
+      "claim": "<a code list the provider publishes for a status field>",
+      "sources": [
+        {
+          "title": "<provider dictionary, section>",
+          "url": "<link>",
+          "type": "provider"
+        }
+      ],
+      "applies_to": [
+        "<status attribute>"
+      ],
+      "verified_against_data": "contradicted",
+      "check": "<codes present in the data that the dictionary does not list>"
+    }
+  ],
+  "assumptions": [
+    "<anything believed but not yet sourced, stated as an assumption>"
+  ],
+  "use_cases": [
+    {
+      "id": "U1",
+      "description": "<monthly performance report the model must reproduce>",
+      "audience": "<management>",
+      "priority": "high",
+      "source": "<user document, section>"
+    },
+    {
+      "id": "U2",
+      "description": "<ad hoc analysis analysts run>",
+      "audience": "<analysts>",
+      "priority": "medium",
+      "source": "<user statement>"
+    },
+    {
+      "id": "U3",
+      "description": "<longer-term trend or cohort question>",
+      "audience": "<planning>",
+      "priority": "low",
+      "source": "D1"
+    }
+  ]
+}

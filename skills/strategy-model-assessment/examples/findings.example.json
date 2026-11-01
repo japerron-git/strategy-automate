@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "model": "<model>",
+  "findings": [
+    {
+      "id": "F001",
+      "title": "Ending balance sums every month when no month is on the query",
+      "category": "metric_defect",
+      "impact": "high",
+      "effort": "small",
+      "evidence": {
+        "questions": [
+          "Q002"
+        ],
+        "observed": "<value>",
+        "expected": "<value>"
+      },
+      "recommendation": "Give the balance metric its own latest-period level rule and say so in the description.",
+      "actions": [
+        {
+          "kind": "create_conditional_metric",
+          "args": {
+            "name": "Ending Balance (Active)",
+            "source_metric": "Balance",
+            "attribute": "Customer Status",
+            "elements": [
+              "Active"
+            ],
+            "level_rule": "last",
+            "level_attribute": "Snapshot Month",
+            "description": "Balance of active customers in the latest month of each group."
+          }
+        }
+      ],
+      "risks": [],
+      "depends_on": [],
+      "republish": false,
+      "tests": [
+        "Q002"
+      ],
+      "status": "approved",
+      "decision_note": ""
+    },
+    {
+      "id": "F002",
+      "title": "No governed retention metric",
+      "category": "missing_metric",
+      "impact": "medium",
+      "effort": "medium",
+      "evidence": {
+        "questions": [
+          "Q003"
+        ],
+        "observed": "not answerable",
+        "expected": "a share"
+      },
+      "recommendation": "Add a cohort retention metric once the period lookup has a prior-year flag.",
+      "actions": [
+        {
+          "kind": "manual",
+          "steps": "Add a prior-year flag to the period lookup, then define the metric."
+        }
+      ],
+      "risks": [],
+      "depends_on": [
+        "F001"
+      ],
+      "republish": false,
+      "tests": [
+        "Q003"
+      ],
+      "status": "proposed",
+      "decision_note": ""
+    }
+  ]
+}

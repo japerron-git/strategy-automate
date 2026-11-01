@@ -11,7 +11,7 @@ Validation is always comparative. There is no universal "model is correct" check
 
 ## Scope
 
-Owns the paired-query validator (`skills/build-mosaic-model/scripts/strategy_validate_models.py`) and the Test Center API areas — Baseline Test, Comparison Test, Test Center Settings, Storage Sync File, and the internal Test Center file store and baseline-result files (`python3 skills/strategy-platform/scripts/strategy_api.py ops --tag strategy-validation --internal`). Structural checks are `build_mosaic.py validate-model`; fixing a model is `build-mosaic-model`.
+Owns the paired-query validator (`skills/build-mosaic-model/scripts/strategy_validate_models.py`) and the Test Center API areas — Baseline Test, Comparison Test, Test Center Settings, Storage Sync File, and the internal Test Center file store and baseline-result files (`python3 skills/strategy-platform/scripts/strategy_api.py ops --tag strategy-validation --internal`). Structural checks are `build_mosaic.py validate-model`; fixing a model is `build-mosaic-model`. Question banks written by `skills/strategy-model-assessment/SKILL.md` double as regression suites: until `strategy_validate_models.py --query-suite` reads them, re-run one with `assess_model.py run` + `grade --previous <earlier graded.json>`.
 
 ## When to invoke
 

@@ -65,6 +65,7 @@ strategy-automate/
 │   │       └── strategy_validate.py           # live-tenant runtime-workflow validator
 │   ├── create-unstructured-data/  # upload documents / decks as AI-agent knowledge
 │   ├── strategy-data-modeling/SKILL.md   # Kimball-first planning layer
+│   ├── strategy-model-assessment/        # question-driven assessment of a live model → change plan (assess_model.py)
 │   └── strategy-validation/SKILL.md      # paired-query numeric-correctness validator, Test Center
 ├── tests/                         # hermetic unit tests + REST contract test (run in CI)
 ├── captures/                      # dated tenant transcripts; raw payloads stay local

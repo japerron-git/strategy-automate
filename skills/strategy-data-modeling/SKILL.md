@@ -18,6 +18,10 @@ strategy-automation (classify surface)
 
 Do NOT route back up the chain. This skill calls execution skills; execution skills do not call this one.
 
+To review an existing model **against live data** — business questions run through MCP, graded, and
+turned into an ordered change plan — use the sibling planning skill
+`skills/strategy-model-assessment/SKILL.md` instead; this skill reviews the design.
+
 ## Required memory (load on entry)
 
 Kimball foundations (load first, every time):

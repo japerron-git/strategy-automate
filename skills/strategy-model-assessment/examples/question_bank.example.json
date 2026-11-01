@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "project": "<project>",
+  "model": "<model>",
+  "target_mix": {
+    "1": 20,
+    "2": 25,
+    "3": 25,
+    "4": 20,
+    "5": 10
+  },
+  "questions": [
+    {
+      "id": "Q001",
+      "level": 1,
+      "area": "volume",
+      "question": "How many active customers are there in each region?",
+      "sql": "SELECT \"Region\", SUM(\"Active Customers\") AS active_customers FROM {{MODEL}} GROUP BY \"Region\" ORDER BY 1 LIMIT 100",
+      "expected_path": "governed_metric",
+      "metrics": [
+        "Active Customers"
+      ],
+      "key": [
+        "Region"
+      ],
+      "measures": [
+        "active_customers"
+      ],
+      "expected": {
+        "source": "reference_file",
+        "strength": "reference",
+        "file": "expected/Q001.csv",
+        "tolerance": 1e-06
+      },
+      "domain_claims": [
+        "D0",
+        "D1"
+      ],
+      "use_case": "U1"
+    },
+    {
+      "id": "Q002",
+      "level": 4,
+      "area": "balances",
+      "question": "What is the ending balance by region in the latest month?",
+      "sql": "SELECT \"Region\", SUM(\"Ending Balance\") AS ending_balance FROM {{MODEL}} WHERE \"Latest Period Flag\" = 'Y' GROUP BY \"Region\" LIMIT 100",
+      "expected_path": "simple_sql",
+      "metrics": [
+        "Ending Balance"
+      ],
+      "key": [
+        "Region"
+      ],
+      "measures": [
+        "ending_balance"
+      ],
+      "expected": {
+        "source": "same_model_sql",
+        "strength": "same_model",
+        "sql": "SELECT \"Region\", SUM(\"Balance Column\") AS ending_balance FROM {{MODEL}} WHERE \"Snapshot Month\" = DATE '2026-01-01' GROUP BY \"Region\" LIMIT 100"
+      },
+      "domain_claims": [],
+      "use_case": "U2"
+    },
+    {
+      "id": "Q003",
+      "level": 5,
+      "area": "retention",
+      "question": "Of customers active a year ago, what share are still active?",
+      "sql": "",
+      "expected_path": "not_answerable",
+      "expected": {
+        "source": "none"
+      },
+      "domain_claims": [],
+      "use_case": "U3"
+    }
+  ]
+}

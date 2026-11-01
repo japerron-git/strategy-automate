@@ -33,6 +33,9 @@ User task → which branch?
      → skills/strategy-automation/SKILL.md    (NLQ router)
 3. Validating numbers / checking data correctness?
      → skills/strategy-validation/SKILL.md
+3a. Assessing an existing model with business questions (fitness, gaps, what to fix)?
+     → skills/strategy-model-assessment/SKILL.md (findings + change plan)
+     → skills/build-mosaic-model/SKILL.md → skills/strategy-validation/SKILL.md
 4. Legacy (classic) → Mosaic migration?
      → memory/reference_strategy_legacy_to_mosaic_mining.md (start-here hub)
      → skills/strategy-data-modeling/SKILL.md → skills/build-mosaic-model/SKILL.md
@@ -54,6 +57,7 @@ User task → which branch?
    - `skills/strategy-data-modeling/SKILL.md` — the modeling-planning layer: declare business process, grain, attributes, facts, metrics, relationships, hierarchies, time semantics, and validation before build / migration / review work.
    - `skills/build-mosaic-model/SKILL.md` — the `build-mosaic-model` skill (discovery + build + ACL + security filter + publish + post-build edits).
    - `skills/strategy-validation/SKILL.md` — paired-query data-correctness validation against any reference source; Test Center comparisons.
+   - `skills/strategy-model-assessment/SKILL.md` — planning-layer review of an existing model against live data: sourced domain research, a graded question bank (levels 1-5) run through MCP, findings and an ordered change plan handed to build and validation.
    - `skills/strategy-admin/SKILL.md` — users, groups, security roles, privileges, SCIM, tenants, license, server and project settings.
    - `skills/strategy-distribution/SKILL.md` — subscriptions, schedules, events, contacts, history list, scheduled model refresh.
    - `skills/strategy-content/SKILL.md` — reports, dashboards, documents, objects, folders, search, certification, cubes, datasets, Library.
@@ -94,6 +98,7 @@ For Mosaic work, distinguish the entry path:
 - `skills/strategy-data-modeling/SKILL.md` — modeling-planning layer for grain, dimensions, metrics, relationships, hierarchies, and validation design.
 - `skills/strategy-automation/SKILL.md` — NLQ router.
 - `skills/strategy-validation/SKILL.md` — data-correctness validator.
+- `skills/strategy-model-assessment/` — question-driven model assessment: SKILL.md, `scripts/assess_model.py` (scope, run, grade, plan, check), `examples/`.
 - `skills/create-unstructured-data/` — unstructured-data (nugget) creation for AI grounding: PPTX→Markdown extractor + multipart upload/status scripts.
 - `tests/` — hermetic unit tests (`python3 -m unittest discover -s tests`); run in CI.
 - `captures/` — dated tenant-specific transcripts (raw payload files stay local per `.gitignore`).

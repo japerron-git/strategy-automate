@@ -89,6 +89,7 @@ One fact per file; the filename prefix is the `type`. Grep this index and open o
 
 ## Validation
 - [Strategy model + data validation](reference_strategy_data_validation.md) — 10-check design suite + runnable 5-query paired-query suite; pluggable reference sources (Mosaic, legacy report, flat file, warehouse SQL, REST fixture); tolerance rules; failure triage.
+- [Model assessment](reference_model_assessment.md) — question levels 1-5, grading rubric (verdict, expected-value strength, answer path, discoverability), defect checklist from field assessments, the seven change phases, and the JSON formats used by `skills/strategy-model-assessment`.
 - [Live validation suite](reference_strategy_validation_workflows.md) — non-Mosaic / non-AI validation suite with 10 workflows, runner command, cleanup rules, live-API gotchas.
 
 ## Field captures (capture targeting)
