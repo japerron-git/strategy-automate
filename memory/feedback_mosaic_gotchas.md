@@ -37,6 +37,12 @@ tags: [mosaic, build, payload, error-code]
 - [Canonical pattern: entity-first attribute creation](#canonical-pattern-entity-first-attribute-creation)
 - [Relationships with shared keys need attribute-MERGE during creation, not after (superseded)](#relationships-with-shared-keys-need-attribute-merge-during-creation-not-after-superseded)
 
+**Model edits with silent side effects**
+- [Removing an attribute deletes the derived metrics that filter on it](#removing-an-attribute-deletes-the-derived-metrics-that-filter-on-it)
+- [A new lookup table can leave the fact table as the attribute's lookup](#a-new-lookup-table-can-leave-the-fact-table-as-the-attributes-lookup)
+- [Formula attributes inherit the inner column's data type](#formula-attributes-inherit-the-inner-columns-data-type)
+- [Edits can drop certification, which hides the model from MCP](#edits-can-drop-certification-which-hides-the-model-from-mcp)
+
 **Python-side bite**
 - [Python operator precedence bit me on `or … if isinstance(…) else`](#python-operator-precedence-bit-me-on-or--if-isinstance-else)
 
@@ -151,6 +157,43 @@ Noise columns (present in every table but not real dimensions — e.g., SOURCE_S
 
 > Superseded by `feedback_mosaic_relationship_wiring.md` (six-step conformance recipe). Fix: create shared-key attributes with multi-table expressions on the FIRST POST — the entity-first pattern in `build_mosaic.py` does this; for post-hoc wiring use `build_mosaic.py wire-relationships`.
 > Historical dead ends it replaced: separate per-fact FK attributes → `8004ccc7` "Table cannot be used as the join table…"; naive post-create expression-append PATCH resolves column-reference tokens against MSTR's auto-generated managed attributes in `\Managed Objects\Dataset Schema Folder\` → `8004cd15` "Object (of type: Attribute) not allowed in this place"; DELETE-then-recreate → "cannot be deleted because other objects depend on it", even mid-changeset.
+
+---
+
+## Model edits with silent side effects
+
+Verified 2026-10-30/31 on a Strategy ONE Cloud tenant (in-memory Mosaic model, uploaded file plus mapping
+tables); field notes in `captures/2026-10-31-snapshot-fact-metric-behaviors/`.
+
+### Removing an attribute deletes the derived metrics that filter on it
+Replacing a code attribute with a lookup-backed one (new attribute, new id; the old one removed) deleted every
+derived metric whose embedded filter referenced the old attribute — and every derived metric built on those —
+with no warning (16 metrics in one edit). **How to apply:** before removing or replacing an attribute, export
+the model (`POST /api/model/dataModels/{id}/export`), list the metrics whose embedded filters reference the
+attribute id plus their dependents, and keep the create inputs so they can be rebuilt against the new attribute.
+Back up first.
+
+### A new lookup table can leave the fact table as the attribute's lookup
+After a period table was mapped onto an existing period attribute (forms on both tables), the attribute kept
+`attributeLookupTable` = the fact table with `autoDetectLookupTable: true`; the mapping tables of code
+attributes were picked up correctly. **How to apply:** after adding lookup tables, read each multi-table
+attribute and set `attributeLookupTable` (and the form `lookupTable`) explicitly with `autoDetectLookupTable:
+false` where the lookup must be the dimension table. This did not change how ending/beginning rules resolve on
+in-memory models (`reference_mosaic_derived_metrics.md` §0d rule 9).
+
+### Formula attributes inherit the inner column's data type
+`Year([<date column>])` created without a form `dataType` was stored as `date`, so 2017 rendered as
+`1905-07-09` (day 2017 after 1900) while grouping still worked; `MonthsBetween([<start>], [<end>])` likewise came
+back `date`-typed and rendered blank. `Year()` and `MonthsBetween(start, end)` are accepted function names
+(positive when `end` is later). **How to apply:** set the form `dataType` (`{"type":"integer","precision":4,"scale":0}`)
+on create; to fix an existing one, `PATCH /api/model/dataModels/{mid}/attributes/{id}` with `{"forms":[<form with
+expressions as tokens and the new dataType>]}` in a changeset, then republish.
+
+### Edits can drop certification, which hides the model from MCP
+After structural edits (tables added) and a republish, the model disappeared from MCP `get_models` /
+`get_semantics` (`MOSAIC_MODEL_NOT_FOUND`) until it was certified again (`build_mosaic.py certify --object-id
+<id>`). MCP lists certified content only (`reference_mcp_tools.md`). **How to apply:** re-certify after every
+structural change before running MCP validation.
 
 ---
 

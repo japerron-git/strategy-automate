@@ -39,6 +39,28 @@ Body (partial; the server keeps every field you omit):
 
 **Semi-additive trap.** `last` is correct across time but wrong at an all-products rollup: it picks one cell's value instead of summing. If consumers slice freely, keep the base at `sum` and add a level-metric sibling `Sum(<measure>) {~, Last(<snapshot date>)}` (`reference_mosaic_derived_metrics.md`). Use base `last` only when every report slices by the natural grain.
 
+## Semi-additive rules on periodic-snapshot facts (verified 2026-10-30/31)
+
+The `function` above is one control; the other is a `dimty` attribute unit on the period attribute with
+`aggregation: first_in_fact | last_in_fact | first_in_relationship | last_in_relationship` (the only values a
+fact-metric attribute unit accepts — `reference_strategy_error_codes.md`, `8004d716`). On a snapshot fact
+(one row per entity per period, rows repeated after the entity exits):
+
+- **Republish needed.** A dimty change on a fact metric reached the data only after a republish; function
+  and format changes did not need one.
+- **"First"/"last" resolve per report group, among the rows that qualify** — not per entity, and not over
+  the whole calendar. Taking an entity-level constant (an original amount) with `first_in_fact` is right by
+  pool or by period, but wrong for any grouping that mixes pools starting in different periods: only the
+  entities present in the group's earliest period are counted (one production model understated a segment's
+  original balance by about half). Use the once-per-entity derived metric
+  `Sum(Max([M]){~+,[Entity]+}){~+}` instead (`reference_mosaic_derived_metrics.md` §0d rule 1), and keep the
+  fact metric as a renamed `(raw)` input with a description that says where it is valid.
+- **`last_in_fact` works for amounts that persist** after the event (exit balances, loss components) because
+  every entity still has a row in the last period. It is not a "latest period overall" rule; on in-memory models
+  `last_in_relationship` behaved the same even with a separate period lookup table (§0d rule 9).
+- **Embedded filters drop these rules** when the fact metric is used inside a conditional metric — put the
+  unit on the conditional metric (§0d rule 4).
+
 ## One-changeset bulk protocol
 
 Patching one metric per changeset costs a commit round-trip per metric and opens an interactive session per changeset. That exhausts the iServer session cap (`8004cb0a`) within minutes (`feedback_build_mosaic_session_leak.md`). Instead, use one login, one list, K reads, one changeset with all PATCHes, one commit, then a read-back.
