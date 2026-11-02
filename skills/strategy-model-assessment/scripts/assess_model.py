@@ -73,6 +73,9 @@ ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_d
 COLUMN_TYPES = ("text", "integer", "bigint", "double", "date", "timestamp")   # build_mosaic.py set-column-types
 # Changes made once for the whole plan, at the start of one phase; other phases get a note.
 MERGED_KINDS = {"source_change": 1, "change_column_type": 2, "wire_relationships": 3}
+MERGED_NOTES = {"source_change": "Source change done in the phase {phase} rebuild",
+                "change_column_type": "Column type change done in phase {phase} (set-column-types)",
+                "wire_relationships": "Relationships declared in phase {phase} (wire-relationships)"}
 RELATIONSHIP_TYPES = ("one_to_many", "many_to_many", "one_to_one")
 RELATIONSHIP_HINTS = "specs/relationships.json"   # written into the bundle by plan; scripts run from the repo root
 _DISPLAY_COLUMN = re.compile(r"\b(description|desc|name|label|title|text)$", re.I)
@@ -1208,10 +1211,10 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
     if kind == "wire_relationships":
         rels = a.get("relationships")
         if not isinstance(rels, list) or not rels:
-            problems.append(f"{kind}: args.relationships must list parent_attribute, child_attribute, "
-                            f"relationship_table and type")
+            problems.append(f"{kind}: args.relationships must list parent_attribute, child_attribute, type "
+                            f"and (on a model with several tables) relationship_table")
         for r in rels if isinstance(rels, list) else []:
-            missing = [k for k in ("parent_attribute", "child_attribute", "relationship_table") if not r.get(k)]
+            missing = [k for k in ("parent_attribute", "child_attribute") if not r.get(k)]   # table: optional
             if missing:
                 problems.append(f"{kind}: a relationship is missing {missing}")
             if r.get("type", "one_to_many") not in RELATIONSHIP_TYPES:
@@ -1407,17 +1410,18 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                     target = MERGED_KINDS[kind]
                     if n != target and (f["id"], kind) not in noted:
                         noted.add((f["id"], kind))
-                        what = "Source change done in the phase 1 rebuild" if kind == "source_change" else \
-                            f"Column type change done in phase {target} (set-column-types)"
+                        what = MERGED_NOTES[kind].format(phase=target)
                         steps.append({"finding": f["id"], "title": f.get("title"), "kind": "note", "dry_run": None,
                                       "apply": None, "manual": None, "risks": [],
                                       "note": f"{what}; nothing to do here."})
                     continue
                 c = action_commands(action, mid, python)
                 problems += [f"{f['id']}: {p}" for p in c["problems"]]
+                first = (f["id"], "risks") not in noted          # a finding's risks show on its first step only
+                noted.add((f["id"], "risks"))
                 steps.append({"finding": f["id"], "title": f.get("title"), "kind": action.get("kind"),
                               "dry_run": cmd(c["dry_run"]), "apply": cmd(c["apply"]), "manual": c["manual"],
-                              "risks": f.get("risks") or []})
+                              "risks": (f.get("risks") or []) if first else []})
         before = ["Save a backup copy of the model before applying this phase."]
         if n == 3:
             before.append("For every attribute removed or replaced: list the derived metrics that filter on "

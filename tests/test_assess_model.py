@@ -876,11 +876,25 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         self.assertEqual([r["child_attribute"] for r in plan["files"]["specs/relationships.json"]["relationships"]],
                          ["store", "month"])
         bad = am.build_plan({"findings": [_finding("F1", "relationship", actions=[{"kind": "wire_relationships",
-            "args": {"relationships": [{"parent_attribute": "a", "child_attribute": "b", "type": "many"}]}}])]},
-            model_id="MID")
+            "args": {"relationships": [{"child_attribute": "b", "type": "many"}]}}])]}, model_id="MID")
         text = " | ".join(bad["problems"])
-        self.assertIn("missing ['relationship_table']", text)
+        self.assertIn("missing ['parent_attribute']", text)
         self.assertIn("'many' is not one of", text)
+        ok = am.build_plan({"findings": [_finding("F1", "relationship", actions=[{"kind": "wire_relationships",
+            "args": {"relationships": [{"parent_attribute": "a", "child_attribute": "b"}]}}])]}, model_id="MID")
+        self.assertEqual(ok["problems"], [])                       # the table is optional
+
+    def test_notes_name_their_kind_and_risks_show_once(self):
+        doc = {"findings": [_finding("F5", "data_type", risks=["watch the dates"], actions=[
+            {"kind": "change_column_type", "args": {"column": "D", "type": "date", "date_format": "yyyyMM"}},
+            {"kind": "wire_relationships", "args": {"relationships": [{"parent_attribute": "y", "child_attribute": "d"}]}},
+            {"kind": "manual", "steps": "one"}, {"kind": "manual", "steps": "two"}])]}
+        plan = am.build_plan(doc, model_id="MID")
+        p2 = plan["phases"][0]
+        notes = [st["note"] for st in p2["steps"] if st["kind"] == "note"]
+        self.assertEqual(notes, ["Relationships declared in phase 3 (wire-relationships); nothing to do here."])
+        manual = [st for st in p2["steps"] if st["kind"] == "manual"]
+        self.assertEqual([st["risks"] for st in manual], [["watch the dates"], []])
 
     def test_inline_fact_metric_spec_becomes_a_bundle_file(self):
         doc = {"findings": [_finding("F7", "metric_defect", actions=[{"kind": "patch_fact_metrics", "args": {

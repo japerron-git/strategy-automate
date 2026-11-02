@@ -258,14 +258,18 @@ label column is listed as an attribute that no metric filters on.
   the attribute forms and fact metrics that read it. Use it for codes stored as numbers (lost leading
   zeros, lost letter codes), numbers stored as text, and integer dates. `plan` merges every
   `change_column_type` into **one** command per table at the start of phase 2; the data changes at that
-  phase's republish, so give each finding a test of the values afterwards.
+  phase's republish, so give each finding a test of the values afterwards. `column` may be the attribute or
+  fact metric name the connector shows: the command resolves it to the column it reads. Leave `table` out
+  on a one-table model. After the type phase, questions that compare the column with numbers (`= 1`,
+  `/ 100`) need text or date comparisons.
 - **`source_change`** (`table`, `column`, `change`) is a change the model cannot make: a new column from
   outside the model, sentinels to NULL, values rewritten (padding codes that the source stores without
   their zeros). `plan` gathers every `source_change` into **one** rebuild step at the start of phase 1,
   followed by one republish and re-certify. Each reload costs a re-map of attributes and fact metrics, so
   never plan several. `plan` reports a `source_change` whose text describes a type change.
 - **`wire_relationships`** (`relationships`: a list of `{parent_attribute, child_attribute,
-  relationship_table, type}`, type one_to_many | many_to_many | one_to_one) declares parent-child
+  relationship_table, type}`, type one_to_many | many_to_many | one_to_one; `relationship_table` optional
+  on a one-table model, matched loosely otherwise) declares parent-child
   relationships. `plan` merges them into one `build_mosaic.py wire-relationships` command at the start of
   phase 3 and ships its hints file as `specs/relationships.json`.
 - **Spec files travel with the plan.** `change_plan.json` has a `files` map (relative path → JSON) that

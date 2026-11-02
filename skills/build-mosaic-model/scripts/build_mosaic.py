@@ -4037,7 +4037,7 @@ def cmd_wire_relationships(m: MSTR, args):
       {"relationships": [
          {"parent_attribute": "<name or id>",
           "child_attribute":  "<name or id>",
-          "relationship_table": "<name or id>",
+          "relationship_table": "<name or id>",   # optional on a one-table model
           "type": "one_to_many"|"many_to_many"|"one_to_one"}]}
     """
     m.login(identity=True)
@@ -4094,9 +4094,12 @@ def cmd_wire_relationships(m: MSTR, args):
         return f"{role} attribute {ref!r} not found"
 
     def _resolve_table(ref: str) -> str:
-        if not ref: return None
+        if not ref:   # optional on a one-table model: the relationship lives in that table
+            return next(iter(tables_by_name.values())) if len(tables_by_name) == 1 else None
         if ref in tables_by_name.values(): return ref
-        return tables_by_name.get(ref)
+        if ref in tables_by_name: return tables_by_name[ref]
+        loose = [tid for nm, tid in tables_by_name.items() if _table_key(nm) == _table_key(ref)]
+        return loose[0] if len(loose) == 1 else None
 
     plan = []   # rows ready to PUT
     skips = []  # rows skipped with reason
@@ -4115,7 +4118,9 @@ def cmd_wire_relationships(m: MSTR, args):
             skips.append((label, _attr_problem(h.get("child_attribute"), "child")))
             continue
         if not rtbl_id:
-            skips.append((label, f"relationship_table {h.get('relationship_table')!r} not found in model"))
+            why = (f"relationship_table {h.get('relationship_table')!r} not found in model" if h.get("relationship_table")
+                   else "relationship_table is required when the model has more than one table")
+            skips.append((label, f"{why}; tables: {sorted(tables_by_name)}"))
             continue
 
         # Step-3: forbid self-reference.
@@ -5813,15 +5818,61 @@ def column_type_targets(sets: list[list[str]] | None, spec: str | None) -> dict[
     return out
 
 
+def _table_key(name: str) -> str:
+    """Compare table names loosely: case, spacing and a file extension don't matter."""
+    return _re.sub(r"[^a-z0-9]", "", _re.sub(r"\.(csv|txt|tsv|xlsx?|parquet)$", "", name.strip().lower()))
+
+
 def _pick_table(tables: list[dict], name: str | None) -> dict:
     if name:
-        hit = [t for t in tables if (t.get("information") or {}).get("name", "").casefold() == name.casefold()]
+        hit = [t for t in tables if (t.get("information") or {}).get("name", "").casefold() == name.casefold()] or \
+              [t for t in tables if _table_key((t.get("information") or {}).get("name", "")) == _table_key(name)]
         if not hit:
             die(f"table '{name}' is not in the model: {[(t.get('information') or {}).get('name') for t in tables]}")
         return hit[0]
     if not tables:
         die("the model has no tables")
     return max(tables, key=lambda t: len((t.get("physicalTable") or {}).get("columns") or []))
+
+
+def resolve_column_targets(model: dict, cols: dict[str, tuple[str, str]],
+                           targets: dict[str, tuple[str, str, str]]) -> tuple[dict[str, tuple[str, str, str]], list[str]]:
+    """Let --set name an attribute or a fact metric as well as a column: the connector shows attribute names,
+    not the columns behind them. An attribute resolves through its ID form, a fact metric through its fact;
+    either must read one column directly. -> (targets keyed by column, notes on what was resolved)."""
+    via: dict[str, list[str]] = {}
+    for a in model.get("attributes") or []:
+        name = (a.get("information") or {}).get("name") or ""
+        for f in a.get("forms") or []:
+            if str(f.get("category") or f.get("name") or "").upper() != "ID":
+                continue
+            exprs = f.get("expressions") or []
+            col = _simple_column((exprs[0].get("expression") or {}).get("text")) if len(exprs) == 1 else None
+            if col and col.casefold() in cols:
+                via.setdefault(name.casefold(), []).append(cols[col.casefold()][1])
+    for fm in model.get("factMetrics") or []:
+        name = (fm.get("information") or {}).get("name") or ""
+        exprs = (fm.get("fact") or {}).get("expressions") or []
+        col = _simple_column((exprs[0].get("expression") or {}).get("text")) if len(exprs) == 1 else None
+        if col and col.casefold() in cols:
+            via.setdefault(name.casefold(), []).append(cols[col.casefold()][1])
+    out, notes, unknown = {}, [], []
+    for key, (name, t, fmt) in targets.items():
+        if key in cols:
+            col = cols[key][1]
+        else:
+            hits = sorted(set(via.get(key) or []))
+            if len(hits) != 1:
+                unknown.append(name if not hits else f"{name} (reads {hits})")
+                continue
+            col = hits[0]
+            notes.append(f"'{name}' reads column {col}")
+        if col.casefold() in out and out[col.casefold()][1:] != (t, fmt):
+            die(f"column {col} is given two types: {out[col.casefold()][1]} and {t}")
+        out[col.casefold()] = (col, t, fmt)
+    if unknown:
+        die(f"not a column, attribute or fact metric of this table: {unknown}. Columns: {sorted(c[1] for c in cols.values())}")
+    return out, notes
 
 
 def column_type_table_patch(table: dict, targets: dict[str, tuple[str, str, str]]):
@@ -5970,6 +6021,9 @@ def cmd_set_column_types(m: MSTR, args):
             die(f"GET {path}: {format_mstr_error(g)}")
         return g.json() or {}
 
+    targets, resolved = resolve_column_targets(model, cols, targets)
+    for n in resolved:
+        print(f"  = {n}", file=sys.stderr)
     cur_table = get(f"/api/model/dataModels/{mid}/tables/{tinfo['objectId']}")
     pt, changed, same = column_type_table_patch(cur_table, targets)
     print(f"→ table '{tinfo['name']}': {len(changed)} column type(s) to change, {len(same)} already set",
@@ -5987,7 +6041,8 @@ def cmd_set_column_types(m: MSTR, args):
     print(json.dumps({"ok": True, "dry_run": bool(args.dry_run), "table": tinfo["name"],
                       "changed": [{"column": c, "from": o, "to": n, "date_format": f or None}
                                   for c, o, n, f in changed],
-                      "already_set": same, "aligned": [w[0] for w in writes], "check_by_hand": notes,
+                      "already_set": same, "resolved": resolved, "aligned": [w[0] for w in writes],
+                      "check_by_hand": notes,
                       "next": "republish the model for the data to change" if (changed or writes) else None},
                      indent=2))
 

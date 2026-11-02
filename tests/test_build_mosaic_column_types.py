@@ -142,6 +142,35 @@ class TablePatchTests(unittest.TestCase):
         _dies(bm._pick_table, [small], "other")
 
 
+class NameResolutionTests(unittest.TestCase):
+    """The connector shows attribute names, not columns: --set may name an attribute or a fact metric."""
+
+    def setUp(self):
+        self.model = _model()
+        self.model["attributes"][0]["forms"][0]["category"] = "ID"
+        self.cols = {c["columnName"].casefold(): (c["information"]["objectId"], c["columnName"])
+                     for c in _table()["physicalTable"]["columns"]}
+
+    def test_attribute_and_fact_metric_names_resolve_to_columns(self):
+        targets = bm.column_type_targets([["Status", "text"], ["amount", "double"], ["PERIOD", "date", "yyyyMM"]], None)
+        out, notes = bm.resolve_column_targets(self.model, self.cols, targets)
+        self.assertEqual(out, {"status code": ("STATUS CODE", "text", ""), "amount": ("AMOUNT", "double", ""),
+                               "period": ("PERIOD", "date", "yyyyMM")})
+        self.assertEqual(notes, ["'Status' reads column STATUS CODE"])
+
+    def test_unknown_names_and_conflicts_stop(self):
+        _dies(bm.resolve_column_targets, self.model, self.cols, bm.column_type_targets([["Nothing", "text"]], None))
+        _dies(bm.resolve_column_targets, self.model, self.cols,
+              bm.column_type_targets([["Status", "text"], ["STATUS CODE", "integer"]], None))
+
+    def test_table_names_match_loosely(self):
+        t = _table()
+        t["information"]["name"] = "Sales Data.csv"
+        self.assertIs(bm._pick_table([t], "sales_data"), t)
+        self.assertIs(bm._pick_table([t], "SALES DATA.CSV"), t)
+        self.assertEqual(bm._table_key("My_Table.parquet"), "mytable")
+
+
 class FlowTests(unittest.TestCase):
     def test_apply_writes_table_then_aligns_forms(self):
         fake = _Fake(_routes())
