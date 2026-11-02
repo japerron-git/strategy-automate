@@ -30,6 +30,15 @@ Verified against a Strategy ONE Library Modeling Service in 2026. These rules ca
 - The outer `physicalTable.columns` list is a separate flat array with `{information:{name}, dataType, columnName}` — **no top-level `id`** — while the inner pipeline `rootTable.children[].columns` uses `{id, name, dataType, sourceDataType}`. Both the outer and the inner pipeline `columns` must be present.
 - When the pipeline shape misbehaves on a tenant, the fallback is the object form via clone-and-remap — see `reference_strategy_object_cloning.md`.
 
+## Changing a column's type in an existing model (verified 2026-10-30)
+`PATCH /api/model/dataModels/{mid}/tables/{tid}` with `{"physicalTable": ...}`, inside a changeset: set the new
+`dataType` (and `format`, e.g. `yyyyMM`, for a date read from integers) on the column in BOTH
+`physicalTable.columns` and the pipeline's `rootTable.children[].columns`; leave `sourceDataType` as it is.
+Trim every `information` block to `objectId`, `subType`, `name` before sending. The source is not reloaded:
+the new type applies at the next republish. In the verified run (13 columns: integer → text, integer →
+date, text → double) the service also updated the attribute forms and fact metrics that read those columns,
+so a second pass to align them found nothing to write. `build_mosaic.py set-column-types` does both steps.
+
 ## Column objectIds (the #1 trap)
 - After `POST .../tables`, column objectIds are **visible inside the changeset** but are **ephemeral until commit**. A subsequent attribute/metric that references those IDs in the same uncommitted changeset will fail at commit with `Object with ID '...' and type 26 (Column) is not found in metadata`.
 - Safe ordering: **commit tables first**, then re-`GET /api/model/dataModels/{mid}/tables/{tid}?showColumns=true` to capture the post-commit column objectIds, then open a new changeset for attributes/metrics.

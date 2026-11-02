@@ -228,9 +228,11 @@ python3 assess_model.py plan --findings findings.json --model-id <modelId> --out
 
 Orders approved findings into the seven phases (source data → types and lookups → attributes and
 relationships → fixes to existing objects → new objects → names, descriptions, formats → publish,
-certify, permissions), respecting `depends_on`. Every change to the source data (new columns, types,
-sentinels) should be a `source_change` action: `plan` merges them all into one rebuild at the start of
-phase 1, so the source is reloaded once. Once-per-entity amounts and weighted averages on snapshot facts
+certify, permissions), respecting `depends_on`. Fix things in the model first: a column type or date
+format is a `change_column_type` action (made in the model, no reload; `plan` merges them into one
+`set-column-types` command per table at the start of phase 2). Only changes the model cannot make (new
+data, rewritten values, sentinels) are `source_change` actions: `plan` merges them all into one rebuild at
+the start of phase 1, so the source is reloaded once. Once-per-entity amounts and weighted averages on snapshot facts
 are `create_level_metric` and `create_weighted_average` actions. It writes `build_mosaic.py` commands for each action
 it knows (a `--dry-run` command and an apply command), manual steps otherwise. Each phase lists:
 

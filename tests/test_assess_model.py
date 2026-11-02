@@ -787,9 +787,9 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
             _finding("F1", "source_data", actions=[{"kind": "source_change", "args": {
                 "table": "sales.csv", "column": "ACTIVE FLAG", "change": "add: Y while open"}}]),
             _finding("F2", "data_type", actions=[{"kind": "source_change", "args": {
-                "table": "sales.csv", "column": "STATUS", "change": "load as text, pad to 2"}}]),
+                "table": "sales.csv", "column": "STATUS", "change": "pad to 2 digits (1 -> 01)"}}]),
             _finding("F3", "metric_defect", actions=[
-                {"kind": "source_change", "args": {"table": "sales.csv", "column": "COSTS", "change": "load as number"}},
+                {"kind": "source_change", "args": {"table": "sales.csv", "column": "COSTS", "change": "9999 to NULL"}},
                 {"kind": "create_compound_metric", "args": {"name": "Net", "formula": "[A] - [B]"}}]),
             _finding("F4", "data_type", actions=[{"kind": "source_change", "args": {"column": "X"}}], status="proposed")]}
         plan = am.build_plan(doc, model_id="MID")
@@ -806,6 +806,50 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         self.assertEqual([st["kind"] for st in p2["steps"]], ["note"])
         self.assertNotIn("publish", [a["command"]["argv"][2] for a in p2["after"]])     # nothing left to republish
         self.assertEqual([st["kind"] for st in p4["steps"]], ["note", "create_compound_metric"])
+
+    def test_column_type_changes_merge_into_one_phase_2_command(self):
+        doc = {"findings": [
+            _finding("F1", "data_type", actions=[
+                {"kind": "change_column_type", "args": {"column": "STATUS CODE", "type": "text"}},
+                {"kind": "change_column_type", "args": {"column": "PERIOD", "type": "date", "date_format": "yyyyMM"}}]),
+            _finding("F2", "metric_defect", actions=[
+                {"kind": "change_column_type", "args": {"column": "COSTS", "type": "double"}},
+                {"kind": "change_column_type", "args": {"column": "COSTS2", "type": "double"}},
+                {"kind": "create_compound_metric", "args": {"name": "Net", "formula": "[A] - [B]"}}]),
+            _finding("F3", "lookup", actions=[{"kind": "change_column_type", "args": {
+                "column": "CODE", "type": "text", "table": "codes lookup"}}])]}
+        plan = am.build_plan(doc, model_id="MID")
+        self.assertEqual(plan["problems"], [])
+        p2, p4 = plan["phases"]
+        main, lookup = p2["steps"][:2]
+        self.assertEqual(main["apply"]["argv"][2:], ["set-column-types", "--model-id", "MID", "--set", "STATUS CODE",
+                                                     "text", "--set", "PERIOD", "date", "yyyyMM", "--set", "COSTS",
+                                                     "double", "--set", "COSTS2", "double"])
+        self.assertEqual(main["dry_run"]["argv"][-1], "--dry-run")
+        self.assertEqual(main["finding"], "F1, F2")
+        self.assertEqual(lookup["apply"]["argv"][-2:], ["--table", "codes lookup"])
+        self.assertEqual(len(p2["steps"]), 2)                       # F1 and F3 need nothing else
+        self.assertIn("publish", [a["command"]["argv"][2] for a in p2["after"]])
+        self.assertEqual(set(p2["unit_tests"]), {"Q-F1", "Q-F2", "Q-F3"})
+        notes = [st for st in p4["steps"] if st["kind"] == "note"]
+        self.assertEqual(len(notes), 1)                              # one note per finding, not per action
+        self.assertIn("phase 2", notes[0]["note"])
+
+    def test_column_type_validation_and_type_change_hint(self):
+        plan = am.build_plan({"findings": [
+            _finding("F1", "data_type", actions=[{"kind": "change_column_type", "args": {"column": "D", "type": "date"}},
+                                                 {"kind": "change_column_type", "args": {"column": "X", "type": "varchar"}}]),
+            _finding("F2", "data_type", actions=[{"kind": "change_column_type", "args": {"column": "d", "type": "text"}}]),
+            _finding("F3", "source_data", actions=[{"kind": "source_change", "args": {
+                "column": "CODE", "change": "Load as VARCHAR so RA survives"}}])]}, model_id="MID")
+        text = " | ".join(plan["problems"])
+        self.assertIn("needs args.date_format", text)
+        self.assertIn("'varchar' is not one of", text)
+        self.assertIn("changed twice", text)
+        self.assertIn("looks like a column type change", text)
+        ok = am.build_plan({"findings": [_finding("F1", "source_data", actions=[{"kind": "source_change", "args": {
+            "column": "FLAG", "change": "new column: Y while the account is open"}}])]}, model_id="MID")
+        self.assertEqual(ok["problems"], [])
 
     def test_source_change_needs_a_change(self):
         plan = am.build_plan({"findings": [_finding("F1", "source_data", actions=[

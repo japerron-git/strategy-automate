@@ -67,7 +67,14 @@ CATEGORY_PHASE = {"source_data": 1, "table": 1, "data_type": 2, "lookup": 2, "at
 REPUBLISH_PHASES = (1, 2, 3)
 ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_derived_metric",
                 "create_level_metric", "create_weighted_average", "patch_model_object", "patch_fact_metrics",
-                "add_lookup_table", "source_change", "publish", "certify", "manual")
+                "add_lookup_table", "change_column_type", "source_change", "publish", "certify", "manual")
+COLUMN_TYPES = ("text", "integer", "bigint", "double", "date", "timestamp")   # build_mosaic.py set-column-types
+# Changes made once for the whole plan, at the start of one phase; other phases get a note.
+MERGED_KINDS = {"source_change": 1, "change_column_type": 2}
+# A source_change whose text describes a type change: that is change_column_type, done in the model.
+_TYPE_CHANGE_TEXT = re.compile(r"\b(data ?type|column type|varchar|utf8|retype)\b|\b(load|reload|re-load|read|cast|"
+                               r"convert|change|store)\w*\b[^.;]*\b(as|to|into)\s+(a\s+)?(text|string|varchar|double|"
+                               r"integer|int|bigint|number|numeric|date|timestamp)\b", re.I)
 
 
 # ── small helpers ─────────────────────────────────────────────────────────────────────────────
@@ -960,9 +967,21 @@ def lookup_steps(args: dict) -> str:
     if not attrs and not forms:
         steps.append(f"Add the new columns: as attributes of their own if any metric will filter on them, "
                      f"otherwise as forms of '{key}'.")
-    steps += [f"Check that '{key}' uses the new table as its lookup (auto-detection may keep the fact table).",
-              "Republish and re-certify; then re-run the questions that depend on it."]
+    steps += [f"Give the CSV's key column the same type as '{key}' (codes such as 01 stay text; set-column-types "
+              f"can change it after the table is added).",
+              f"Check that '{key}' uses the new table as its lookup (auto-detection may keep the fact table).",
+              "The phase republishes once at the end; then re-run the questions that depend on this lookup."]
     return " ".join(f"{i}. {t}" for i, t in enumerate(steps, 1))
+
+
+def column_type_set_args(changes: list[dict]) -> list[str]:
+    """--set COLUMN TYPE [DATE_FORMAT] for each change_column_type action."""
+    out: list[str] = []
+    for c in changes:
+        out += ["--set", str(c.get("column") or ""), str(c.get("type") or "").lower()]
+        if c.get("date_format"):
+            out.append(str(c["date_format"]))
+    return out
 
 
 def source_change_text(changes: list[dict]) -> str:
@@ -1163,7 +1182,21 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
     if kind == "source_change":
         if not (a.get("change") or "").strip():
             problems.append(f"{kind}: missing args.change")
+        elif _TYPE_CHANGE_TEXT.search(a.get("change") or ""):
+            problems.append(f"{kind}: '{a.get('column') or a.get('change')}' looks like a column type change: use "
+                            f"change_column_type (made in the model, no reload), or reword the change if the source "
+                            f"values themselves must change")
         return {"dry_run": None, "apply": None, "manual": None, "problems": problems}
+    if kind == "change_column_type":
+        need("column", "type")
+        t = str(a.get("type") or "").lower()
+        if t and t not in COLUMN_TYPES:
+            problems.append(f"{kind}: type '{a.get('type')}' is not one of {', '.join(COLUMN_TYPES)}")
+        if t in ("date", "timestamp") and not a.get("date_format"):
+            problems.append(f"{kind}: {t} needs args.date_format (the source pattern, e.g. yyyyMM)")
+        argv = base + ["set-column-types", "--model-id", model_id] + column_type_set_args([a])
+        opt(argv, "--table", "table")
+        return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "add_lookup_table":
         need("csv", "key_attribute")
         return {"dry_run": None, "apply": None, "manual": lookup_steps(a), "problems": problems}
@@ -1239,19 +1272,40 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
     def cmd(argv: list[str] | None) -> dict[str, Any] | None:
         return None if argv is None else {"argv": argv, "display": render(argv, quoting)}
 
-    # Every source_change in the plan becomes one rebuild step at the start of phase 1.
-    source_changes = []
+    # Merged kinds run once for the whole plan, at the start of their phase: every source_change becomes one
+    # rebuild in phase 1; every change_column_type becomes one set-column-types command per table in phase 2.
+    merged: dict[str, list[dict]] = {k: [] for k in MERGED_KINDS}
     for f in ordered:
         for a in f.get("actions") or []:
-            if a.get("kind") == "source_change":
-                source_changes.append({**(a.get("args") or {}), "finding": f["id"]})
-    rebuild_step = None
-    if source_changes:
-        rebuild_step = {"finding": ", ".join(dict.fromkeys(c["finding"] for c in source_changes)),
-                        "title": "Rebuild the source data once", "kind": "source_change", "dry_run": None,
-                        "apply": None, "manual": source_change_text(source_changes),
-                        "risks": ["Re-map existing attributes and fact metrics to the reloaded columns; deleting "
-                                  "them deletes the derived metrics that reference them."]}
+            if a.get("kind") in MERGED_KINDS:
+                merged[a["kind"]].append({**(a.get("args") or {}), "finding": f["id"]})
+    merged_steps: dict[int, list[dict]] = {}
+    if merged["source_change"]:
+        sc = merged["source_change"]
+        merged_steps.setdefault(MERGED_KINDS["source_change"], []).append(
+            {"finding": ", ".join(dict.fromkeys(c["finding"] for c in sc)),
+             "title": "Rebuild the source data once", "kind": "source_change", "dry_run": None,
+             "apply": None, "manual": source_change_text(sc),
+             "risks": ["Re-map existing attributes and fact metrics to the reloaded columns; deleting "
+                       "them deletes the derived metrics that reference them."]})
+    by_table: dict[str, list[dict]] = {}
+    for c in merged["change_column_type"]:
+        by_table.setdefault(c.get("table") or "", []).append(c)
+    for table, items in by_table.items():
+        dup = _dupes([str(c.get("column") or "").casefold() for c in items])
+        if dup:
+            problems.append(f"change_column_type: column(s) {dup} changed twice; keep one type per column")
+        argv = [python, BUILD_SCRIPT, "set-column-types", "--model-id", mid] + column_type_set_args(items)
+        if table:
+            argv += ["--table", table]
+        merged_steps.setdefault(MERGED_KINDS["change_column_type"], []).append(
+            {"finding": ", ".join(dict.fromkeys(c["finding"] for c in items)),
+             "title": f"Change column types in the model{' (' + table + ')' if table else ''} (no reload)",
+             "kind": "change_column_type", "dry_run": cmd(argv + ["--dry-run"]), "apply": cmd(argv),
+             "manual": None,
+             "risks": ["The data changes only after the republish at the end of this phase; check the values "
+                       "then (codes keep leading zeros, letter codes survive, dates parse)."]})
+    merged_findings = {k: {c["finding"] for c in v} for k, v in merged.items()}
 
     # A metric can filter on an attribute, not on a form: flag filters on columns the plan adds as forms.
     forms_added = {str(x).lower(): f["id"] for f in ordered for a in f.get("actions") or []
@@ -1272,19 +1326,25 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
     grade_cmd = [python, ASSESS_SCRIPT, "grade", "--bank", bank, "--results", "results_after_phase_{n}.json",
                  "--previous", "graded_before.json", "--out", "graded_after_phase_{n}.json"]
     phases = []
-    phase_numbers = sorted({_phase_of(f) for f in ordered} | ({1} if rebuild_step else set()))
+    phase_numbers = sorted({_phase_of(f) for f in ordered} | set(merged_steps))
     for n in phase_numbers:
         items = [f for f in ordered if _phase_of(f) == n]
-        steps = [rebuild_step] if (n == 1 and rebuild_step) else []
+        steps = list(merged_steps.get(n, []))
+        noted: set[tuple[str, str]] = set()
         for f in items:
             for action in f.get("actions") or [{"kind": "manual", "steps": f.get("recommendation")}]:
-                if action.get("kind") == "source_change":
+                kind = action.get("kind")
+                if kind in MERGED_KINDS:
                     c = action_commands(action, mid, python)
                     problems += [f"{f['id']}: {p}" for p in c["problems"]]
-                    if n != 1:
+                    target = MERGED_KINDS[kind]
+                    if n != target and (f["id"], kind) not in noted:
+                        noted.add((f["id"], kind))
+                        what = "Source change done in the phase 1 rebuild" if kind == "source_change" else \
+                            f"Column type change done in phase {target} (set-column-types)"
                         steps.append({"finding": f["id"], "title": f.get("title"), "kind": "note", "dry_run": None,
                                       "apply": None, "manual": None, "risks": [],
-                                      "note": "Source change done in the phase 1 rebuild; nothing to do here."})
+                                      "note": f"{what}; nothing to do here."})
                     continue
                 c = action_commands(action, mid, python)
                 problems += [f"{f['id']}: {p}" for p in c["problems"]]
@@ -1295,11 +1355,11 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         if n == 3:
             before.append("For every attribute removed or replaced: list the derived metrics that filter on "
                           "it (they are deleted with it) and plan to recreate them.")
-        republish = n in REPUBLISH_PHASES or any(f.get("republish") for f in items)
-        if n != 1 and any(a.get("kind") == "source_change" for f in items for a in f.get("actions") or []) and \
-                not any(a.get("kind") != "source_change" for f in items for a in f.get("actions") or []) and \
-                not any(f.get("republish") for f in items):
-            republish = False   # its only work moved into the phase 1 rebuild
+        republish = n in REPUBLISH_PHASES or any(f.get("republish") for f in items) or bool(merged_steps.get(n))
+        own = [a for f in items for a in f.get("actions") or [{"kind": "manual"}]]
+        if not merged_steps.get(n) and own and all(a.get("kind") in MERGED_KINDS and MERGED_KINDS[a["kind"]] != n
+                                                   for a in own) and not any(f.get("republish") for f in items):
+            republish = False   # its only work moved into another phase
         after = []
         if republish:
             after.append({"what": "Republish the model (tables, attributes or fact metrics changed).",
@@ -1307,15 +1367,17 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         after.append({"what": "Re-certify the model (edits drop certification; MCP cannot see an uncertified model).",
                       "command": cmd([python, BUILD_SCRIPT, "certify", "--object-id", mid])})
         tests = sorted({t for f in items for t in f.get("tests") or []})
-        if n == 1 and rebuild_step:
-            tests = sorted(set(tests) | {t for f in ordered for t in f.get("tests") or []
-                                         if any(a.get("kind") == "source_change" for a in f.get("actions") or [])})
+        for kind, target in MERGED_KINDS.items():
+            if n == target and merged[kind]:
+                tests = sorted(set(tests) | {t for f in ordered if f["id"] in merged_findings[kind]
+                                             for t in f.get("tests") or []})
         if not tests:
             warnings.append(f"phase {n}: no unit tests named in its findings")
         names = [f["id"] for f in items]
-        if n == 1 and rebuild_step:
-            names = list(dict.fromkeys(c["finding"] for c in source_changes)) + [x for x in names if x not in
-                                                                                 {c["finding"] for c in source_changes}]
+        for kind, target in MERGED_KINDS.items():
+            if n == target and merged[kind]:
+                first = list(dict.fromkeys(c["finding"] for c in merged[kind]))
+                names = first + [x for x in names if x not in first]
         phases.append({"phase": n, "name": PHASES[n], "findings": names,
                        "before": before, "steps": steps, "unit_tests": tests,
                        "regression": [cmd([a.replace("{n}", str(n)) for a in run_cmd]),

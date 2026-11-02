@@ -229,18 +229,31 @@ Result column names in `key` / `measures` must match the SQL aliases.
 ```
 `phase` defaults from `category` (table above). Action kinds `plan` turns into commands:
 `create_conditional_metric`, `create_compound_metric`, `create_level_metric`,
-`create_weighted_average`, `delete_derived_metric`, `patch_model_object`, `patch_fact_metrics`, `publish`, `certify`, `add_lookup_table` (manual
-steps: add the CSV, map it to the existing attribute, create `new_attributes` as attributes of their own and
-`new_forms` as forms, check the lookup, republish) and `source_change` (see below); anything else is
-`manual` with `steps`.
+`create_weighted_average`, `delete_derived_metric`, `patch_model_object`, `patch_fact_metrics`, `publish`,
+`certify`, `change_column_type` and `source_change` (both below), `add_lookup_table` (manual steps: add the
+CSV, map it to the existing attribute, give its key column the attribute's type, create `new_attributes` as
+attributes of their own and `new_forms` as forms, check the lookup); anything else is `manual` with `steps`.
+
+- **Fix it in the model first; change the source last.** Before proposing a `source_change`, check
+  whether the model can make the fix itself: a column type or date format is `change_column_type`; a
+  value derived from other columns can be an attribute form or a metric formula. Only a change the model
+  cannot express (new data, values that must be rewritten) needs the source changed and reloaded.
 
 - **Anything a metric filters on must be an attribute.** An embedded filter targets an attribute, not a
   form, so lookup columns such as a latest-period flag or an active flag go under `new_attributes`.
   `plan` rejects a conditional metric that filters on a column the plan adds under `new_forms`.
-- **`source_change`** (`table`, `column`, `change`) describes one change to the source data: a new
-  column, a type change, sentinels to NULL, padding. `plan` gathers every `source_change` in the plan,
-  from any phase, into **one** rebuild step at the start of phase 1, followed by one republish and
-  re-certify. Each reload costs a re-map of attributes and fact metrics, so never plan several.
+- **`change_column_type`** (`column`, `type`: text | integer | bigint | double | date | timestamp,
+  `date_format` for dates, e.g. `yyyyMM`, optional `table`) changes a column's type inside the model, with
+  no reload: `build_mosaic.py set-column-types` sets the type in the table and its pipeline, then lines up
+  the attribute forms and fact metrics that read it. Use it for codes stored as numbers (lost leading
+  zeros, lost letter codes), numbers stored as text, and integer dates. `plan` merges every
+  `change_column_type` into **one** command per table at the start of phase 2; the data changes at that
+  phase's republish, so give each finding a test of the values afterwards.
+- **`source_change`** (`table`, `column`, `change`) is a change the model cannot make: a new column from
+  outside the model, sentinels to NULL, values rewritten (padding codes that the source stores without
+  their zeros). `plan` gathers every `source_change` into **one** rebuild step at the start of phase 1,
+  followed by one republish and re-certify. Each reload costs a re-map of attributes and fact metrics, so
+  never plan several. `plan` reports a `source_change` whose text describes a type change.
 - **Once-per-entity amounts and weighted averages** on a periodic-snapshot fact (one row per entity per
   period) are `create_level_metric` and `create_weighted_average`, not hand-written formulas: summing the
   raw fact counts an entity once per period, and a plain average weights by row count.
@@ -248,8 +261,8 @@ steps: add the CSV, map it to the existing attribute, create `new_attributes` as
 `args` use the CLI option names without dashes (`source_metric`, `count_attribute`,
 `attribute`, `elements`, `and` as a list of lists, `level_rule`, `level_attribute`, `formula`,
 `join`, `format`, `description`, `replace`, `kind`, `object_id`, `json_file`, `spec`; for
-`add_lookup_table`: `csv`, `key_attribute`, `new_attributes`, `new_forms`; for `source_change`: `table`,
-`column`, `change`; for `create_level_metric`: `name`, `source_metric`, `entity_attribute`, `inner`, `outer`;
+`add_lookup_table`: `csv`, `key_attribute`, `new_attributes`, `new_forms`; for `change_column_type`:
+`column`, `type`, `date_format`, `table`; for `source_change`: `table`, `column`, `change`; for `create_level_metric`: `name`, `source_metric`, `entity_attribute`, `inner`, `outer`;
 for `create_weighted_average`: `name`, exactly one of `value_attribute` / `value_metric`, `weight_metric`,
 `entity_attribute`, `numerator_name`, `denominator_name`).
 

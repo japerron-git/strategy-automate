@@ -29,6 +29,7 @@ Subcommands:
   delete-derived-metric      Delete one derived metric after a dependents check.
   create-level-metric        Once-per-entity metric: Sum(Max([M]) {~+, [Entity]+}) {~+} (snapshot facts).
   create-weighted-average    Weighted average once per entity: numerator + denominator helpers and the ratio.
+  set-column-types           Change column types in the model (table + pipeline), no reload; republish after.
 
 Authentication
 ~~~~~~~~~~~~~~
@@ -62,7 +63,7 @@ rejects a path with 404, use `discover` to find the current variant on this
 tenant's API and update ENDPOINT_CANDIDATES below.
 """
 from __future__ import annotations
-import argparse, csv, json, os, shutil, subprocess, sys, time, urllib.parse, uuid
+import argparse, copy, csv, json, os, shutil, subprocess, sys, time, urllib.parse, uuid
 from typing import Any
 import requests
 
@@ -5747,6 +5748,250 @@ def cmd_create_weighted_average(m: MSTR, args):
     print(json.dumps({"ok": True, "metric_id": avg_id, "numerator_id": num_id, "denominator_id": den_id}, indent=2))
 
 
+# ── set-column-types: change column types in the model (no reload) ────────────────────────
+# Ported from a run that worked live on a single-table CSV model: the table PATCH carries each type in both
+# physicalTable.columns and the pipeline; the service then carried the type to the attribute forms and fact
+# metrics itself (the alignment pass found nothing left to write). The alignment pass stays as a safety net.
+
+COLUMN_TYPES: dict[str, dict] = {
+    "text":      {"type": "utf8_char",  "precision": 0, "scale": 0},
+    "integer":   {"type": "integer",    "precision": 4, "scale": 0},
+    "bigint":    {"type": "int64",      "precision": 8, "scale": 0},
+    "double":    {"type": "double",     "precision": 0, "scale": 0},
+    "date":      {"type": "date",       "precision": 0, "scale": 0},
+    "timestamp": {"type": "time_stamp", "precision": 0, "scale": 0},
+}
+_FORM_DISPLAY = {"text": "text", "date": "date", "timestamp": "date",
+                 "integer": "number", "bigint": "number", "double": "number"}
+_SIMPLE_COLUMN = _re.compile(r"^\s*[\[{](.+?)[\]}]\s*$")
+
+
+def _simple_column(text: str | None) -> str | None:
+    """'[COL]' / '{COL}' / 'COL' -> 'COL'; a formula with operators or functions -> None."""
+    if not text:
+        return None
+    hit = _SIMPLE_COLUMN.match(text)
+    if hit:
+        return hit.group(1)
+    t = text.strip()
+    return t if _re.fullmatch(r"[A-Za-z0-9_ ]+", t) else None
+
+
+def column_type_targets(sets: list[list[str]] | None, spec: str | None) -> dict[str, tuple[str, str, str]]:
+    """--set COLUMN TYPE [DATE_FORMAT] (repeatable) and/or --spec (CSV: column_name, target_type, date_format,
+    enabled; or JSON {"columns": [{"column", "type", "date_format"}]}) -> {column.casefold(): (column, type, fmt)}."""
+    rows: list[tuple[str, str, str]] = []
+    for v in sets or []:
+        if len(v) not in (2, 3):
+            die(f"--set takes COLUMN TYPE [DATE_FORMAT], got {v}")
+        rows.append((v[0], v[1], v[2] if len(v) == 3 else ""))
+    if spec:
+        if spec.lower().endswith(".csv"):
+            with open(spec, newline="", encoding="utf-8-sig") as f:
+                for r in csv.DictReader(f):
+                    r = {(k or "").strip().lower(): (x or "").strip() for k, x in r.items()}
+                    if r.get("enabled", "y").lower() in ("n", "no", "0", "false"):
+                        continue
+                    rows.append((r.get("column_name", ""), r.get("target_type", ""), r.get("date_format", "")))
+        else:
+            for c in (_load_json_arg(None, spec) or {}).get("columns") or []:
+                rows.append((str(c.get("column") or ""), str(c.get("type") or ""), str(c.get("date_format") or "")))
+    if not rows:
+        die("give at least one --set COLUMN TYPE [DATE_FORMAT] or a --spec file")
+    out: dict[str, tuple[str, str, str]] = {}
+    for col, typ, fmt in rows:
+        t = typ.lower()
+        if not col:
+            die("a column name is empty")
+        if t not in COLUMN_TYPES:
+            die(f"{col}: unknown type '{typ}' (use {', '.join(COLUMN_TYPES)})")
+        if t in ("date", "timestamp") and not fmt:
+            die(f"{col}: {t} needs a date format of the source values, e.g. yyyyMM")
+        if t not in ("date", "timestamp") and fmt:
+            die(f"{col}: a date format only applies to date or timestamp")
+        out[col.casefold()] = (col, t, fmt)
+    return out
+
+
+def _pick_table(tables: list[dict], name: str | None) -> dict:
+    if name:
+        hit = [t for t in tables if (t.get("information") or {}).get("name", "").casefold() == name.casefold()]
+        if not hit:
+            die(f"table '{name}' is not in the model: {[(t.get('information') or {}).get('name') for t in tables]}")
+        return hit[0]
+    if not tables:
+        die("the model has no tables")
+    return max(tables, key=lambda t: len((t.get("physicalTable") or {}).get("columns") or []))
+
+
+def column_type_table_patch(table: dict, targets: dict[str, tuple[str, str, str]]):
+    """-> (physicalTable body for PATCH /tables/{id}, [(column, old type, new type, fmt)], [unchanged columns]).
+    Sets each type in physicalTable.columns AND the pipeline; both must agree."""
+    keep = lambda i: {k: i[k] for k in ("objectId", "subType", "name") if k in (i or {})}  # noqa: E731
+    pt = copy.deepcopy(table["physicalTable"])
+    pt["information"] = keep(pt.get("information"))
+    pipeline = json.loads(pt["pipeline"])
+    pipe_cols = {c["name"].casefold(): c for ch in (pipeline.get("rootTable") or {}).get("children") or []
+                 for c in ch.get("columns") or []}
+    present = {c["columnName"].casefold() for c in pt["columns"]}
+    missing = [v[0] for k, v in targets.items() if k not in present]
+    if missing:
+        die(f"column(s) not in table '{keep(table.get('information')).get('name')}': {missing}")
+    changed, same = [], []
+    for c in pt["columns"]:
+        c["information"] = keep(c.get("information"))
+        key = c["columnName"].casefold()
+        if key not in targets:
+            continue
+        _, t, fmt = targets[key]
+        new = COLUMN_TYPES[t]
+        if c.get("dataType") == new and c.get("format", "") == fmt:
+            same.append(c["columnName"])
+            continue
+        pc = pipe_cols.get(key)
+        if pc is None:
+            die(f"{c['columnName']} is not in the table's pipeline")
+        changed.append((c["columnName"], (c.get("dataType") or {}).get("type"), new["type"], fmt))
+        c["dataType"] = dict(new)
+        if fmt:
+            c["format"] = fmt
+        else:
+            c.pop("format", None)
+        pc["dataType"] = dict(new)
+        pc["format"] = fmt
+    pt["pipeline"] = json.dumps(pipeline, separators=(",", ":"))
+    return pt, changed, same
+
+
+def _colref_token(col_id: str, name: str) -> dict:
+    return {"type": "column_reference", "value": f"[{name}]",
+            "target": {"objectId": col_id, "subType": "column", "name": name}}
+
+
+def _tokenized_exprs(exprs: list[dict], cols: dict[str, tuple[str, str]]) -> list[dict] | None:
+    """Rewrite simple column expressions as tokens (the only shape the service accepts on write); None when an
+    expression is a formula this command does not rewrite."""
+    out = []
+    for e in exprs:
+        col = _simple_column((e.get("expression") or {}).get("text"))
+        if col is None or col.casefold() not in cols:
+            return None
+        cid, name = cols[col.casefold()]
+        out.append({"expression": {"tokens": [_colref_token(cid, name), {"type": "end_of_text", "value": ""}]},
+                    "tables": e.get("tables")})
+    return out
+
+
+def column_type_object_writes(model: dict, mid: str, cols: dict[str, tuple[str, str]],
+                              targets: dict[str, tuple[str, str, str]], get) -> tuple[list[tuple], list[str]]:
+    """Attribute forms and fact metrics that read a target column get the same type. -> (writes, notes);
+    each write is (label, path, body). `get(path)` returns the current object."""
+    writes, notes = [], []
+    for a in model.get("attributes") or []:
+        refs = [_simple_column((e.get("expression") or {}).get("text"))
+                for f in a.get("forms") or [] for e in f.get("expressions") or []]
+        if not any(r and r.casefold() in targets for r in refs):
+            continue
+        aid, aname = a["information"]["objectId"], a["information"]["name"]
+        cur = get(f"/api/model/dataModels/{mid}/attributes/{aid}")
+        forms, need = [], False
+        for f in cur.get("forms") or []:
+            f = {k: v for k, v in f.items() if k != "translations"}
+            if f.get("expressions"):
+                ex = _tokenized_exprs(f["expressions"], cols)
+                if ex is None:
+                    notes.append(f"attribute '{aname}': form '{f.get('name')}' has a formula; check its type by hand")
+                    forms = None
+                    break
+                col = _simple_column(f["expressions"][0]["expression"].get("text"))
+                if col and col.casefold() in targets:
+                    t = targets[col.casefold()][1]
+                    if f.get("dataType") != COLUMN_TYPES[t] or f.get("displayFormat") != _FORM_DISPLAY[t]:
+                        need = True
+                    f["dataType"], f["displayFormat"] = dict(COLUMN_TYPES[t]), _FORM_DISPLAY[t]
+                f["expressions"] = ex
+            forms.append(f)
+        if forms is not None and need:
+            writes.append((f"attribute '{aname}'", f"/api/model/dataModels/{mid}/attributes/{aid}", {"forms": forms}))
+    for fm in model.get("factMetrics") or []:
+        exprs = (fm.get("fact") or {}).get("expressions") or []
+        col = _simple_column((exprs[0].get("expression") or {}).get("text")) if exprs else None
+        if not col or col.casefold() not in targets:
+            continue
+        t = targets[col.casefold()][1]
+        fid, fname = fm["information"]["objectId"], fm["information"]["name"]
+        cur = get(f"/api/model/dataModels/{mid}/factMetrics/{fid}")
+        if (cur.get("fact") or {}).get("dataType") == COLUMN_TYPES[t]:
+            continue
+        ex = _tokenized_exprs(cur["fact"]["expressions"], cols)
+        if ex is None:
+            notes.append(f"fact metric '{fname}' has a formula; check its type by hand")
+            continue
+        fact = {"dataType": dict(COLUMN_TYPES[t]), "expressions": ex,
+                "extensions": cur["fact"].get("extensions", []), "entryLevel": cur["fact"].get("entryLevel", [])}
+        writes.append((f"fact metric '{fname}'", f"/api/model/dataModels/{mid}/factMetrics/{fid}", {"fact": fact}))
+    return writes, notes
+
+
+def _patch_in_changeset(m: MSTR, writes: list[tuple], label: str) -> None:
+    cs = open_cs(m)
+    try:
+        for what, path, body in writes:
+            r = m.patch(path, json=body)
+            if not r.ok:
+                die(f"{label}: PATCH {what}: {format_mstr_error(r)}")
+        commit_cs(m, cs)
+    except BaseException:   # die() raises SystemExit; discard on every failure path
+        discard_cs(m, cs)
+        raise
+
+
+def cmd_set_column_types(m: MSTR, args):
+    """Change column types (and the source date format) inside the model, without reloading the source:
+    1) one changeset: the table, each type in both the column list and the pipeline;
+    2) one changeset: attribute forms and fact metrics that read a changed column get the same type
+       (usually already done by the service; this pass writes only what still differs).
+    Republish afterwards for the data to change."""
+    targets = column_type_targets(args.set, args.spec)
+    m.login(identity=True)
+    mid = args.model_id
+    r = m.post(f"/api/model/dataModels/{mid}/export")
+    if not r.ok:
+        die(f"export model: {format_mstr_error(r)}")
+    model = (r.json().get("model") or [{}])[0]
+    table = _pick_table(model.get("tables") or [], args.table)
+    tinfo = table["information"]
+    cols = {c["columnName"].casefold(): (c["information"]["objectId"], c["columnName"])
+            for c in table["physicalTable"]["columns"]}
+
+    def get(path: str) -> dict:
+        g = m.get(path)
+        if not g.ok:
+            die(f"GET {path}: {format_mstr_error(g)}")
+        return g.json() or {}
+
+    cur_table = get(f"/api/model/dataModels/{mid}/tables/{tinfo['objectId']}")
+    pt, changed, same = column_type_table_patch(cur_table, targets)
+    print(f"→ table '{tinfo['name']}': {len(changed)} column type(s) to change, {len(same)} already set",
+          file=sys.stderr)
+    for col, old, new, fmt in changed:
+        print(f"  ~ {col}: {old} -> {new}{' (' + fmt + ')' if fmt else ''}", file=sys.stderr)
+    if changed and not args.dry_run:
+        _patch_in_changeset(m, [(f"table '{tinfo['name']}'", f"/api/model/dataModels/{mid}/tables/{tinfo['objectId']}",
+                                 {"physicalTable": pt})], "table")
+    writes, notes = column_type_object_writes(model, mid, cols, targets, get)
+    for n in notes:
+        print(f"  ! {n}", file=sys.stderr)
+    if writes and not args.dry_run:
+        _patch_in_changeset(m, writes, "align attributes and fact metrics")
+    print(json.dumps({"ok": True, "dry_run": bool(args.dry_run), "table": tinfo["name"],
+                      "changed": [{"column": c, "from": o, "to": n, "date_format": f or None}
+                                  for c, o, n, f in changed],
+                      "already_set": same, "aligned": [w[0] for w in writes], "check_by_hand": notes,
+                      "next": "republish the model for the data to change" if (changed or writes) else None},
+                     indent=2))
+
+
 def cmd_patch_fact_metrics(m: MSTR, args):
     """Set aggregation function and/or number format on many fact metrics in ONE
     changeset: list → per-metric GET (diff) → PATCH only what differs → commit →
@@ -6694,6 +6939,18 @@ def build_parser():
     sp.add_argument("--description", default="", help=f"business description (max {DESCRIPTION_MAX} characters)")
     sp.add_argument("--dry-run", action="store_true", help="print the three requests; open no changeset")
 
+    sp = sub.add_parser("set-column-types",
+        help="Change column types in the model without reloading the source (table + pipeline, then the "
+             "attribute forms and fact metrics that read them); republish afterwards.")
+    sp.add_argument("--model-id", required=True)
+    sp.add_argument("--set", action="append", nargs="+", metavar="VALUE",
+                    help="COLUMN TYPE [DATE_FORMAT]; TYPE is one of " + ", ".join(COLUMN_TYPES)
+                         + "; date and timestamp need the source pattern, e.g. yyyyMM. Repeatable.")
+    sp.add_argument("--spec", help="CSV (column_name, target_type, date_format, enabled) or JSON "
+                                   "{columns: [{column, type, date_format}]}")
+    sp.add_argument("--table", help="table name (default: the table with the most columns)")
+    sp.add_argument("--dry-run", action="store_true", help="print the changes; open no changeset")
+
     sp = sub.add_parser("patch-fact-metrics",
         help="Set aggregation function and/or number format on many fact metrics in one changeset, "
              "then verify by read-back (see memory/reference_mosaic_fact_metric_aggregation.md).")
@@ -6767,6 +7024,7 @@ def main():
             "delete-derived-metric": cmd_delete_derived_metric,
             "create-level-metric": cmd_create_level_metric,
             "create-weighted-average": cmd_create_weighted_average,
+            "set-column-types": cmd_set_column_types,
             "patch-fact-metrics": cmd_patch_fact_metrics,
             "attach-transformation": cmd_attach_transformation,
         }[args.cmd](m, args)
