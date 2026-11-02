@@ -744,6 +744,57 @@ class EarlyStageSignalTests(unittest.TestCase):
         self.assertEqual(am._period_parts("20200301"), ("2020", "2020-Q1", "03"))
 
 
+class SourceChangeAndLookupStepTests(unittest.TestCase):
+    def test_lookup_steps_make_filtered_columns_attributes(self):
+        text = am.lookup_steps({"csv": "period.csv", "key_attribute": "snapshot month",
+                                "new_attributes": ["latest period flag", "year"], "new_forms": ["month name"]})
+        self.assertIn("Create 'latest period flag', 'year' as attributes of their own (not forms)", text)
+        self.assertIn("Add 'month name' as forms of 'snapshot month'", text)
+        self.assertIn("EXISTING attribute 'snapshot month'", text)
+        self.assertIn("as attributes of their own if any metric will filter on them",
+                      am.lookup_steps({"csv": "c.csv", "key_attribute": "k"}))
+
+    def test_plan_rejects_a_filter_on_a_column_added_as_a_form(self):
+        doc = {"findings": [
+            _finding("F1", "lookup", actions=[{"kind": "add_lookup_table", "args": {
+                "csv": "p.csv", "key_attribute": "snapshot month", "new_forms": ["Latest Period Flag"]}}]),
+            _finding("F2", "missing_metric", depends_on=["F1"], actions=[{"kind": "create_conditional_metric", "args": {
+                "name": "Ending Balance", "source_metric": "Balance", "attribute": "region", "elements": ["East"],
+                "and": [["latest period flag", "Y"]]}}])]}
+        plan = am.build_plan(doc, model_id="MID")
+        self.assertTrue(any("adds as a form" in p for p in plan["problems"]))
+
+    def test_source_changes_are_consolidated_into_one_phase_1_step(self):
+        doc = {"findings": [
+            _finding("F1", "source_data", actions=[{"kind": "source_change", "args": {
+                "table": "sales.csv", "column": "ACTIVE FLAG", "change": "add: Y while open"}}]),
+            _finding("F2", "data_type", actions=[{"kind": "source_change", "args": {
+                "table": "sales.csv", "column": "STATUS", "change": "load as text, pad to 2"}}]),
+            _finding("F3", "metric_defect", actions=[
+                {"kind": "source_change", "args": {"table": "sales.csv", "column": "COSTS", "change": "load as number"}},
+                {"kind": "create_compound_metric", "args": {"name": "Net", "formula": "[A] - [B]"}}]),
+            _finding("F4", "data_type", actions=[{"kind": "source_change", "args": {"column": "X"}}], status="proposed")]}
+        plan = am.build_plan(doc, model_id="MID")
+        self.assertEqual(plan["problems"], [])
+        p1, p2, p4 = plan["phases"]
+        self.assertEqual([p["phase"] for p in plan["phases"]], [1, 2, 4])
+        rebuild = p1["steps"][0]
+        self.assertEqual((rebuild["kind"], rebuild["finding"]), ("source_change", "F1, F2, F3"))
+        self.assertEqual(sum(1 for st in p1["steps"] if st["kind"] == "source_change"), 1)
+        for col in ("ACTIVE FLAG", "STATUS", "COSTS"):
+            self.assertIn(col, rebuild["manual"])
+        self.assertEqual(p1["findings"][:3], ["F1", "F2", "F3"])
+        self.assertEqual(set(p1["unit_tests"]), {"Q-F1", "Q-F2", "Q-F3"})
+        self.assertEqual([st["kind"] for st in p2["steps"]], ["note"])
+        self.assertNotIn("publish", [a["command"]["argv"][2] for a in p2["after"]])     # nothing left to republish
+        self.assertEqual([st["kind"] for st in p4["steps"]], ["note", "create_compound_metric"])
+
+    def test_source_change_needs_a_change(self):
+        plan = am.build_plan({"findings": [_finding("F1", "source_data", actions=[
+            {"kind": "source_change", "args": {"column": "X"}}])]}, model_id="MID")
+        self.assertTrue(any("missing args.change" in p for p in plan["problems"]))
+
+
 class LookupTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="assess-lookups-")

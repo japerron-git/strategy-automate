@@ -66,7 +66,8 @@ CATEGORY_PHASE = {"source_data": 1, "table": 1, "data_type": 2, "lookup": 2, "at
                   "format": 6, "discoverability": 6, "governance": 7, "performance": 7}
 REPUBLISH_PHASES = (1, 2, 3)
 ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_derived_metric",
-                "patch_model_object", "patch_fact_metrics", "add_lookup_table", "publish", "certify", "manual")
+                "patch_model_object", "patch_fact_metrics", "add_lookup_table", "source_change", "publish", "certify",
+                "manual")
 
 
 # ── small helpers ─────────────────────────────────────────────────────────────────────────────
@@ -940,14 +941,46 @@ def _null_artifacts(values: list, prof: dict, scope: dict, attribute: str) -> se
 
 
 def lookup_steps(args: dict) -> str:
+    """Manual steps for adding a lookup table. `new_attributes` become attributes of their own (related
+    to the key attribute): anything a metric filters on, such as a flag, must be an attribute, because
+    an embedded filter targets attributes, not forms. `new_forms` become forms of the key attribute
+    (descriptions, labels)."""
     key = args.get("key_attribute") or "<key attribute>"
-    new = ", ".join(args.get("new_attributes") or []) or "the new columns"
-    return (f"1. Add {args.get('csv') or '<csv file>'} to the model as a new table. "
-            f"2. Map its key column to the EXISTING attribute '{key}' — keep the attribute; deleting or replacing it "
-            f"deletes the derived metrics that filter on it. "
-            f"3. Add {new} as forms of '{key}' or as parent attributes, with business names and descriptions. "
-            f"4. Check that '{key}' uses the new table as its lookup (auto-detection may keep the fact table). "
-            f"5. Republish and re-certify; then re-run the questions that depend on it.")
+    attrs = list(args.get("new_attributes") or [])
+    forms = list(args.get("new_forms") or [])
+    steps = [f"Add {args.get('csv') or '<csv file>'} to the model as a new table.",
+             f"Map its key column to the EXISTING attribute '{key}' — keep the attribute; deleting or replacing it "
+             f"deletes the derived metrics that filter on it."]
+    if attrs:
+        steps.append(f"Create {', '.join(repr(a) for a in attrs)} as attributes of their own (not forms), each "
+                     f"related to '{key}', with business names and descriptions: metrics filter on them, and an "
+                     f"embedded filter can target an attribute but not a form.")
+    if forms:
+        steps.append(f"Add {', '.join(repr(f) for f in forms)} as forms of '{key}' (display only, never filtered on).")
+    if not attrs and not forms:
+        steps.append(f"Add the new columns: as attributes of their own if any metric will filter on them, "
+                     f"otherwise as forms of '{key}'.")
+    steps += [f"Check that '{key}' uses the new table as its lookup (auto-detection may keep the fact table).",
+              "Republish and re-certify; then re-run the questions that depend on it."]
+    return " ".join(f"{i}. {t}" for i, t in enumerate(steps, 1))
+
+
+def source_change_text(changes: list[dict]) -> str:
+    """One consolidated rebuild of the source data for every source_change action in the plan."""
+    by_table: dict[str, list[dict]] = {}
+    for c in changes:
+        by_table.setdefault(c.get("table") or "the source table", []).append(c)
+    lines = ["Rebuild the source data ONCE with every change below, reload it, then re-map the EXISTING "
+             "attributes and fact metrics to the reloaded columns (never delete and recreate them: derived "
+             "metrics that reference them would be deleted)."]
+    for table, items in by_table.items():
+        lines.append(f"In {table}:")
+        for c in items:
+            what = c.get("change") or ""
+            col = c.get("column")
+            lines.append(f"  - [{c.get('finding')}] {col + ': ' if col else ''}{what}")
+    lines.append("Then republish and re-certify (once, at the end of this phase).")
+    return "\n".join(lines)
 
 
 # ── grade ────────────────────────────────────────────────────────────────────────────────────
@@ -1105,6 +1138,10 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         need("spec")
         argv = base + ["patch-fact-metrics", "--model-id", model_id, "--spec", str(a.get("spec", ""))]
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
+    if kind == "source_change":
+        if not (a.get("change") or "").strip():
+            problems.append(f"{kind}: missing args.change")
+        return {"dry_run": None, "apply": None, "manual": None, "problems": problems}
     if kind == "add_lookup_table":
         need("csv", "key_attribute")
         return {"dry_run": None, "apply": None, "manual": lookup_steps(a), "problems": problems}
@@ -1180,16 +1217,53 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
     def cmd(argv: list[str] | None) -> dict[str, Any] | None:
         return None if argv is None else {"argv": argv, "display": render(argv, quoting)}
 
+    # Every source_change in the plan becomes one rebuild step at the start of phase 1.
+    source_changes = []
+    for f in ordered:
+        for a in f.get("actions") or []:
+            if a.get("kind") == "source_change":
+                source_changes.append({**(a.get("args") or {}), "finding": f["id"]})
+    rebuild_step = None
+    if source_changes:
+        rebuild_step = {"finding": ", ".join(dict.fromkeys(c["finding"] for c in source_changes)),
+                        "title": "Rebuild the source data once", "kind": "source_change", "dry_run": None,
+                        "apply": None, "manual": source_change_text(source_changes),
+                        "risks": ["Re-map existing attributes and fact metrics to the reloaded columns; deleting "
+                                  "them deletes the derived metrics that reference them."]}
+
+    # A metric can filter on an attribute, not on a form: flag filters on columns the plan adds as forms.
+    forms_added = {str(x).lower(): f["id"] for f in ordered for a in f.get("actions") or []
+                   if a.get("kind") == "add_lookup_table" for x in (a.get("args") or {}).get("new_forms") or []}
+    for f in ordered:
+        for a in f.get("actions") or []:
+            if a.get("kind") != "create_conditional_metric":
+                continue
+            args = a.get("args") or {}
+            used = [args.get("attribute")] + [c[0] for c in args.get("and") or [] if isinstance(c, list) and c]
+            for u in used:
+                if u and str(u).lower() in forms_added:
+                    problems.append(f"{f['id']}: filters on '{u}', which {forms_added[str(u).lower()]} adds as a form; "
+                                    f"list it under new_attributes instead (filters need an attribute)")
+
     run_cmd = [python, ASSESS_SCRIPT, "run", "--project", project or "<PROJECT>", "--bank", bank,
                "--out", "results_after_phase_{n}.json"]
     grade_cmd = [python, ASSESS_SCRIPT, "grade", "--bank", bank, "--results", "results_after_phase_{n}.json",
                  "--previous", "graded_before.json", "--out", "graded_after_phase_{n}.json"]
     phases = []
-    for n in sorted({_phase_of(f) for f in ordered}):
+    phase_numbers = sorted({_phase_of(f) for f in ordered} | ({1} if rebuild_step else set()))
+    for n in phase_numbers:
         items = [f for f in ordered if _phase_of(f) == n]
-        steps = []
+        steps = [rebuild_step] if (n == 1 and rebuild_step) else []
         for f in items:
             for action in f.get("actions") or [{"kind": "manual", "steps": f.get("recommendation")}]:
+                if action.get("kind") == "source_change":
+                    c = action_commands(action, mid, python)
+                    problems += [f"{f['id']}: {p}" for p in c["problems"]]
+                    if n != 1:
+                        steps.append({"finding": f["id"], "title": f.get("title"), "kind": "note", "dry_run": None,
+                                      "apply": None, "manual": None, "risks": [],
+                                      "note": "Source change done in the phase 1 rebuild; nothing to do here."})
+                    continue
                 c = action_commands(action, mid, python)
                 problems += [f"{f['id']}: {p}" for p in c["problems"]]
                 steps.append({"finding": f["id"], "title": f.get("title"), "kind": action.get("kind"),
@@ -1200,6 +1274,10 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
             before.append("For every attribute removed or replaced: list the derived metrics that filter on "
                           "it (they are deleted with it) and plan to recreate them.")
         republish = n in REPUBLISH_PHASES or any(f.get("republish") for f in items)
+        if n != 1 and any(a.get("kind") == "source_change" for f in items for a in f.get("actions") or []) and \
+                not any(a.get("kind") != "source_change" for f in items for a in f.get("actions") or []) and \
+                not any(f.get("republish") for f in items):
+            republish = False   # its only work moved into the phase 1 rebuild
         after = []
         if republish:
             after.append({"what": "Republish the model (tables, attributes or fact metrics changed).",
@@ -1207,9 +1285,16 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         after.append({"what": "Re-certify the model (edits drop certification; MCP cannot see an uncertified model).",
                       "command": cmd([python, BUILD_SCRIPT, "certify", "--object-id", mid])})
         tests = sorted({t for f in items for t in f.get("tests") or []})
+        if n == 1 and rebuild_step:
+            tests = sorted(set(tests) | {t for f in ordered for t in f.get("tests") or []
+                                         if any(a.get("kind") == "source_change" for a in f.get("actions") or [])})
         if not tests:
             warnings.append(f"phase {n}: no unit tests named in its findings")
-        phases.append({"phase": n, "name": PHASES[n], "findings": [f["id"] for f in items],
+        names = [f["id"] for f in items]
+        if n == 1 and rebuild_step:
+            names = list(dict.fromkeys(c["finding"] for c in source_changes)) + [x for x in names if x not in
+                                                                                 {c["finding"] for c in source_changes}]
+        phases.append({"phase": n, "name": PHASES[n], "findings": names,
                        "before": before, "steps": steps, "unit_tests": tests,
                        "regression": [cmd([a.replace("{n}", str(n)) for a in run_cmd]),
                                       cmd([a.replace("{n}", str(n)) for a in grade_cmd])],

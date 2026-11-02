@@ -118,7 +118,8 @@ with the key values taken from the data; fill the description columns only from 
 user's documents or the provider's dictionary, step 2) and name the source in the `source` column —
 or leave them blank for the user. A lookup becomes a finding with an `add_lookup_table` action; the
 change plan turns it into the steps to add and map the table (map it to the **existing** attribute:
-replacing an attribute deletes the derived metrics that filter on it).
+replacing an attribute deletes the derived metrics that filter on it). List lookup columns that metrics
+will filter on (flags) under `new_attributes`: a filter can target an attribute but not a form.
 
 From the scope, write down: fact grain (one row per what, per when?), snapshot vs transaction facts,
 the entity key, the period attribute, entity status / exit fields, metrics that look additive but
@@ -227,7 +228,9 @@ python3 assess_model.py plan --findings findings.json --model-id <modelId> --out
 
 Orders approved findings into the seven phases (source data → types and lookups → attributes and
 relationships → fixes to existing objects → new objects → names, descriptions, formats → publish,
-certify, permissions), respecting `depends_on`, and writes `build_mosaic.py` commands for each action
+certify, permissions), respecting `depends_on`. Every change to the source data (new columns, types,
+sentinels) should be a `source_change` action: `plan` merges them all into one rebuild at the start of
+phase 1, so the source is reloaded once. It writes `build_mosaic.py` commands for each action
 it knows (a `--dry-run` command and an apply command), manual steps otherwise. Each phase lists:
 
 - **Before:** a backup copy of the model; for any attribute removal or replacement, the derived
