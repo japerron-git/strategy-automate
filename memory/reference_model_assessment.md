@@ -1,12 +1,78 @@
 ---
-name: Model assessment — question levels, grading, defect checklist, change phases, file formats
-description: Reference for skills/strategy-model-assessment — the 1-5 question levels, the grading rubric (correctness, answer path, discoverability), a defect checklist distilled from field assessments, the seven change phases, and the JSON formats for domain notes, question banks, results, findings and change plans.
+name: Model assessment — maturity, relationships, lookups, question levels, grading, defect checklist, change phases, file formats
+description: Reference for skills/strategy-model-assessment — maturity levels, relationship review, lookup tables, replay mode, the 1-5 question levels, the grading rubric (correctness, answer path, discoverability), a defect checklist distilled from field assessments, the seven change phases, and the JSON formats for domain notes, question banks, results, findings and change plans.
 type: reference
 ---
 
 Companion to `skills/strategy-model-assessment/SKILL.md` and its script
 `skills/strategy-model-assessment/scripts/assess_model.py`. Domain-neutral: industry knowledge comes
 from sourced research per assessment, never from this file.
+
+## Maturity levels
+
+`assess_model.py scope` estimates the level from names, descriptions, formulas and profiles; confirm it.
+
+| Level | Typical signals | Emphasis |
+|---|---|---|
+| M0 Raw build | default names (`Total X (Table)`), every numeric summed, IDs or codes as metrics, no descriptions, no derived metrics | grain, aggregation, naming, lookups, relationships; group repeated defects into one finding per pattern; mostly level 1-2 questions |
+| M1 Cleaned | business names, formats and aggregations fixed, some descriptions | snapshot semantics, codes, counts |
+| M2 Decoded | lookups or forms decode codes; a few derived metrics | governed core measures, conditional metrics |
+| M3 Governed | derived and conditional metrics for the main measures | edge semantics (per-group "latest", dropped rows, filters dropping level rules), discoverability |
+| M4 Analyst-ready | helpers labeled, latest-period flag, descriptions throughout, certified | level 4-5 questions, cross-period analysis, performance |
+
+## Relationship review
+
+`assess_model.py relationships` tests functional dependencies in the data: child → parent holds when
+`COUNT(DISTINCT child) = COUNT(DISTINCT child || parent)` (NULL kept as a value).
+
+| Result | Meaning | Typical recommendation |
+|---|---|---|
+| `many_to_one` | each child value has one parent | parent-child relationship / hierarchy if it makes business sense |
+| `one_to_one` | the two attributes identify each other | make them forms of one attribute (code + description) or drop one |
+| `entity_level` | fixed per entity | count or sum once per entity; entity-table candidate |
+| `varies_within_entity` | changes across rows of one entity (periods) | belongs to the snapshot; needs period rules |
+| `…_with_exceptions` | holds except ≤ 1% of values (50+ child values) | data-quality finding, or a relationship with dirty data |
+
+Evidence is `weak` below 30 child values, `moderate` from 30 and `strong` from 100 — coincidental
+dependencies are common in small samples. The entity tests run first; candidate pairs are then
+tested only between attributes on the same side (both fixed per entity, or both varying), ranked
+by name affinity and hierarchy families (geography, calendar, organization).
+Relationships matter for drill paths, rollups across attributes, level metrics (the level attribute
+must be an ancestor of the report rows, `reference_mosaic_derived_metrics.md` §0b) and lookup tables.
+
+## Lookup tables
+
+`assess_model.py lookups` recommends: **code lookups** (coded text attributes with no description
+form or attribute), a **period lookup** (calendar parents + latest-period flag, when no flag exists)
+and, optionally, an **entity table** (many attributes fixed per entity). It writes CSV templates with
+the key values from the data; description columns are filled only from cited sources (user documents,
+provider dictionary), with the source named per row, or left for the user. Add a lookup by mapping its
+key column to the **existing** attribute — replacing the attribute deletes the derived metrics that
+filter on it (`feedback_mosaic_gotchas.md`). Then check the attribute's lookup table, republish and
+re-certify.
+
+## Replay mode
+
+Where the script cannot sign in (a cloud session with the Mosaic connector), pass `--replies <folder>`:
+missing calls are listed in `<folder>/pending.json` (`tool`, `arguments`, `file`); the agent calls each
+tool, saves the reply text to the file (`ERROR:` prefix for a failed call), and re-runs the command until
+it exits 0 (3 = replies still needed). Query files are named by a hash of the SQL, so a reply can be
+reused across runs. Save multi-block replies as one file (the connector can split a table across text
+blocks; the parser joins them).
+
+## Connector behaviors seen in assessments (verified 2026-11-01, Mosaic MCP `query`)
+
+- Numbers come back formatted with thousands separators (`202,003`, `9,999`). Values that will be reused
+  as keys (codes, YYYYMM periods) are read with `CAST(<col> AS VARCHAR)`, which returns plain digits.
+- A NULL in a numeric column came back as `0` from `CAST(... AS VARCHAR)` in `SELECT DISTINCT`, while
+  `MIN` and `COUNT(DISTINCT)` ignored it and `= 0` matched nothing — test with `IS NULL`. The lookup
+  command drops such below-minimum values from numeric code CSVs and says so.
+- `COUNT(DISTINCT …)` over no matching rows returned a blank cell, not 0.
+- `UNION ALL` of `SELECT DISTINCT` branches works; the scripts batch value samples that way (and
+  profiles as several `COUNT(DISTINCT)` / `MIN` / `MAX` columns per query), cutting connector calls about
+  tenfold for agent-driven runs.
+- Sentinels such as `9999` ("not available") inside scores and ratios inflate averages; check the
+  profile `max` against the documented range.
 
 ## Question levels
 
@@ -163,10 +229,12 @@ Result column names in `key` / `measures` must match the SQL aliases.
 ```
 `phase` defaults from `category` (table above). Action kinds `plan` turns into commands:
 `create_conditional_metric`, `create_compound_metric`, `delete_derived_metric`,
-`patch_model_object`, `patch_fact_metrics`, `publish`, `certify`; anything else is `manual` with
-`steps`. `args` use the CLI option names without dashes (`source_metric`, `count_attribute`,
+`patch_model_object`, `patch_fact_metrics`, `publish`, `certify`, and `add_lookup_table` (manual
+steps: add the CSV, map it to the existing attribute, check the lookup, republish); anything else is
+`manual` with `steps`. `args` use the CLI option names without dashes (`source_metric`, `count_attribute`,
 `attribute`, `elements`, `and` as a list of lists, `level_rule`, `level_attribute`, `formula`,
-`join`, `format`, `description`, `replace`, `kind`, `object_id`, `json_file`, `spec`).
+`join`, `format`, `description`, `replace`, `kind`, `object_id`, `json_file`, `spec`; for
+`add_lookup_table`: `csv`, `key_attribute`, `new_attributes`).
 
 **change_plan.json** (written by `plan`): phases in order, each with its steps (finding id, action,
 dry-run command, apply command), `before`, `unit_tests`, `regression` and `after` lists.

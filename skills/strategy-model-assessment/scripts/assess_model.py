@@ -3,6 +3,8 @@
 Mosaic MCP connector, grade the answers, and turn approved findings into an ordered change plan.
 
   assess_model.py scope --project P --model M --out scope.json        # inventory + bounded profiling
+  assess_model.py relationships --project P --scope scope.json --out relationships.json
+  assess_model.py lookups --project P --scope scope.json --csv-dir lookups/ --out lookups.json
   assess_model.py run   --project P --bank question_bank.json --out results.json
   assess_model.py grade --bank question_bank.json --results results.json --out graded.json
   assess_model.py plan  --findings findings.json --model-id <id> --out change_plan.json
@@ -10,7 +12,10 @@ Mosaic MCP connector, grade the answers, and turn approved findings into an orde
 
 scope and run sign in to the tenant's Mosaic MCP server the way the MCP connector does
 (skills/strategy-platform/scripts/strategy_mcp.py: browser single sign-on, tokens in the OS secret
-store). grade, plan and check work offline on the JSON files. File formats, levels and phases:
+store). Where the script cannot sign in (a cloud session with the Mosaic connector attached), add
+--replies <folder>: the agent calls the connector tools itself, saves each reply in the folder, and
+the script reads them (missing replies are listed in <folder>/pending.json). grade, plan and check
+work offline on the JSON files. File formats, levels and phases:
 memory/reference_model_assessment.md. Workflow: skills/strategy-model-assessment/SKILL.md.
 
 Output files hold tenant data (rows, names); they are written owner-only and belong outside the
@@ -19,6 +24,8 @@ repo. Nothing here writes to the model: plan only prints build_mosaic.py command
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import json
 import os
 import re
@@ -59,7 +66,7 @@ CATEGORY_PHASE = {"source_data": 1, "table": 1, "data_type": 2, "lookup": 2, "at
                   "format": 6, "discoverability": 6, "governance": 7, "performance": 7}
 REPUBLISH_PHASES = (1, 2, 3)
 ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_derived_metric",
-                "patch_model_object", "patch_fact_metrics", "publish", "certify", "manual")
+                "patch_model_object", "patch_fact_metrics", "add_lookup_table", "publish", "certify", "manual")
 
 
 # ── small helpers ─────────────────────────────────────────────────────────────────────────────
@@ -126,7 +133,13 @@ def parse_markdown_table(text: str) -> tuple[list[str], list[dict[str, Any]]]:
         return [], []
     columns = _split_md_row(lines[start])
     rows: list[dict[str, Any]] = []
-    for ln in lines[start + 1:]:
+    rest = lines[start + 1:]
+    for k, ln in enumerate(rest):
+        if not ln.strip():
+            nxt = next((x for x in rest[k + 1:] if x.strip()), "")
+            if nxt.strip().startswith("|"):
+                continue   # the connector can split one table across several text blocks
+            break
         if not ln.strip().startswith("|"):
             break
         cells = _split_md_row(ln)
@@ -238,6 +251,65 @@ class McpRunner:
 Runner = Any   # anything with call(tool, arguments) -> MCP tools/call result
 
 
+class PendingReply(Exception):
+    """Replay mode: the reply to this call has not been saved yet."""
+
+
+def query_id(sql: str) -> str:
+    """Stable file name stem for a query's saved reply."""
+    return hashlib.sha256(sql.encode("utf-8")).hexdigest()[:12]
+
+
+class ReplayRunner:
+    """Answers MCP calls from replies an agent saved after calling the connector tools itself — for
+    sessions where this script cannot sign in (a cloud workspace with the Mosaic connector attached).
+
+    Folder layout: `semantics.txt` holds the get_semantics reply; `<query id>.txt` holds each query
+    reply, as the tool returned it (start the file with `ERROR:` when the tool reported an error).
+    Calls with no saved reply are collected in `pending` and written to `pending.json`; save those
+    replies and run the same command again until nothing is pending."""
+
+    def __init__(self, folder: str):
+        self.folder = folder
+        self.pending: dict[str, dict[str, Any]] = {}
+
+    def _read(self, name: str) -> dict | None:
+        path = os.path.join(self.folder, name)
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        stripped = text.strip()
+        if stripped.startswith("{"):
+            try:
+                payload = json.loads(stripped)
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict) and ({"content", "structuredContent", "isError"} & set(payload)):
+                return payload
+        if stripped.upper().startswith("ERROR:"):
+            return {"isError": True, "content": [{"type": "text", "text": stripped[6:].strip()}]}
+        return {"content": [{"type": "text", "text": text}]}
+
+    def call(self, tool: str, arguments: dict) -> dict:
+        key = "semantics" if tool == "get_semantics" else query_id(str(arguments.get("query", "")))
+        name = f"{key}.txt"
+        reply = self._read(name)
+        if reply is None:
+            self.pending[key] = {"id": key, "file": name, "tool": tool, "arguments": arguments}
+            raise PendingReply(key)
+        return reply
+
+    def write_pending(self) -> str:
+        path = os.path.join(self.folder, "pending.json")
+        _write_json(path, {"folder": self.folder, "count": len(self.pending),
+                           "instructions": "Call each tool with its arguments; save the reply text to "
+                                           "<folder>/<file> (start it with ERROR: if the tool failed); "
+                                           "then run the same command again.",
+                           "calls": list(self.pending.values())})
+        return path
+
+
 # ── scope ────────────────────────────────────────────────────────────────────────────────────
 
 def profile_sql(model: str, attribute: str, where: str = "") -> str:
@@ -248,13 +320,99 @@ def profile_sql(model: str, attribute: str, where: str = "") -> str:
 
 
 def sample_sql(model: str, attribute: str, limit: int, where: str = "") -> str:
+    """Distinct values as text: the CAST keeps the connector from formatting numbers (202,003)."""
     col = quote_ident(attribute)
     clause = f" WHERE {where}" if where else ""
-    return f"SELECT DISTINCT {col} AS value FROM {quote_model(model)}{clause} ORDER BY 1 LIMIT {int(limit)}"  # nosec B608  # identifiers are quoted; the connector is read-only
+    return (f"SELECT DISTINCT CAST({col} AS VARCHAR) AS value FROM {quote_model(model)}{clause} "  # nosec B608  # identifiers are quoted; the connector is read-only
+            f"ORDER BY 1 LIMIT {int(limit)}")
+
+
+def sample_batch_sql(model: str, attributes: list[str], limit: int, where: str = "") -> str:
+    clause = f" WHERE {where}" if where else ""
+    parts = [f"SELECT DISTINCT '{a.replace(chr(39), chr(39) * 2)}' AS attribute, "  # nosec B608  # literal escaped, identifiers quoted
+             f"CAST({quote_ident(a)} AS VARCHAR) AS value FROM {quote_model(model)}{clause}" for a in attributes]
+    return " UNION ALL ".join(parts) + f" ORDER BY 1, 2 LIMIT {int(limit)}"  # nosec B608  # identifiers are quoted; the connector is read-only
+
+
+def _sample_values(runner: Runner, project: str, model: str, wanted: dict[str, float], where: str,
+                   batch: int) -> dict[str, Any]:
+    """name → list of values | "pending" | None (failed). Batches attributes with UNION ALL; a failed
+    batch falls back to one query per attribute."""
+    out: dict[str, Any] = {}
+    names = list(wanted)
+    for start in range(0, len(names), max(batch, 1)):
+        chunk = names[start:start + max(batch, 1)]
+        if len(chunk) > 1:
+            limit = int(sum(wanted[n] for n in chunk)) + len(chunk) + 10
+            try:
+                parsed = parse_query_result(runner.call("query", {"project": project,
+                                                                  "query": sample_batch_sql(model, chunk, limit, where)}))
+            except PendingReply:
+                out.update({n: "pending" for n in chunk})
+                continue
+            if parsed["ok"]:
+                for n in chunk:
+                    out[n] = [r.get("value") for r in parsed["rows"] if r.get("attribute") == n]
+                continue
+        for n in chunk:
+            try:
+                parsed = parse_query_result(runner.call("query", {"project": project,
+                                                                  "query": sample_sql(model, n, int(wanted[n]) + 1,
+                                                                                      where)}))
+            except PendingReply:
+                out[n] = "pending"
+                continue
+            out[n] = [r.get("value") for r in parsed["rows"]] if parsed["ok"] else None
+    return out
+
+
+def profile_batch_sql(model: str, attributes: list[str], where: str = "") -> str:
+    cols = []
+    for i, a in enumerate(attributes):
+        c = quote_ident(a)
+        cols += [f"COUNT(DISTINCT {c}) AS d{i}", f"MIN({c}) AS n{i}", f"MAX({c}) AS x{i}"]
+    clause = f" WHERE {where}" if where else ""
+    return f"SELECT {', '.join(cols)} FROM {quote_model(model)}{clause}"  # nosec B608  # identifiers are quoted; the connector is read-only
+
+
+def _profile_rows(runner: Runner, project: str, model: str, names: list[str], where: str,
+                  batch: int) -> dict[str, dict[str, Any]]:
+    """name → {"distinct_values", "min", "max"} | {"error"} | {"pending"}. Batches several attributes
+    per query; a failed batch falls back to one query per attribute."""
+    out: dict[str, dict[str, Any]] = {}
+    for start in range(0, len(names), max(batch, 1)):
+        chunk = names[start:start + max(batch, 1)]
+        if len(chunk) > 1:
+            try:
+                parsed = parse_query_result(runner.call("query", {"project": project,
+                                                                  "query": profile_batch_sql(model, chunk, where)}))
+            except PendingReply:
+                out.update({n: {"pending": True} for n in chunk})
+                continue
+            if parsed["ok"] and parsed["rows"]:
+                row = parsed["rows"][0]
+                for i, n in enumerate(chunk):
+                    out[n] = {"distinct_values": svm.number(row.get(f"d{i}")), "min": row.get(f"n{i}"),
+                              "max": row.get(f"x{i}")}
+                continue
+        for n in chunk:
+            try:
+                parsed = parse_query_result(runner.call("query", {"project": project,
+                                                                  "query": profile_sql(model, n, where)}))
+            except PendingReply:
+                out[n] = {"pending": True}
+                continue
+            if not parsed["ok"] or not parsed["rows"]:
+                out[n] = {"error": parsed["error"] or "no rows"}
+                continue
+            row = parsed["rows"][0]
+            out[n] = {"distinct_values": svm.number(row.get("distinct_values")), "min": row.get("min_value"),
+                      "max": row.get("max_value")}
+    return out
 
 
 def scope_model(runner: Runner, project: str, model: str, *, profile: bool = True, where: str = "",
-                sample_max: int = 30, max_attributes: int = 200,
+                sample_max: int = 30, max_attributes: int = 200, profile_batch: int = 8,
                 log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
     sem_result = runner.call("get_semantics", {"project": project, "model": model})
     if sem_result.get("isError"):
@@ -270,28 +428,91 @@ def scope_model(runner: Runner, project: str, model: str, *, profile: bool = Tru
                                      "undescribed_metrics": [m["name"] for m in semantics["metrics"]
                                                              if not m["description"]]}}
     if not profile:
+        out["maturity"] = maturity_signals(out)
         return out
-    for i, attr in enumerate(semantics["attributes"][:max_attributes]):
-        log(f"profile {i + 1}/{min(len(semantics['attributes']), max_attributes)}: {attr['name']}")
-        parsed = parse_query_result(runner.call("query", {"project": project,
-                                                          "query": profile_sql(model, attr["name"], where)}))
-        if not parsed["ok"] or not parsed["rows"]:
-            attr["profile"] = {"error": parsed["error"] or "no rows"}
-            continue
-        row = parsed["rows"][0]
-        prof: dict[str, Any] = {"distinct_values": svm.number(row.get("distinct_values")),
-                                "min": row.get("min_value"), "max": row.get("max_value")}
-        distinct = prof["distinct_values"]
-        if distinct is not None and 0 < distinct <= sample_max:
-            sample = parse_query_result(runner.call("query", {"project": project,
-                                                              "query": sample_sql(model, attr["name"], sample_max,
-                                                                                  where)}))
-            prof["values"] = [r.get("value") for r in sample["rows"]] if sample["ok"] else None
+    todo = semantics["attributes"][:max_attributes]
+    log(f"profile {len(todo)} attributes, {profile_batch} per query")
+    profiles = _profile_rows(runner, project, model, [a["name"] for a in todo], where, profile_batch)
+    wanted = {a["name"]: (profiles.get(a["name"]) or {}).get("distinct_values") for a in todo}
+    wanted = {n: d for n, d in wanted.items() if d is not None and 0 < d <= sample_max}
+    samples = _sample_values(runner, project, model, wanted, where, profile_batch)
+    for attr in todo:
+        prof = profiles.get(attr["name"]) or {"error": "not profiled"}
+        if attr["name"] in samples:
+            if samples[attr["name"]] == "pending":
+                prof["values_pending"] = True
+            else:
+                prof["values"] = samples[attr["name"]]
         attr["profile"] = prof
     skipped = len(semantics["attributes"]) - max_attributes
     if skipped > 0:
         out["notes"]["unprofiled_attributes"] = skipped
+    out["maturity"] = maturity_signals(out)
     return out
+
+
+_RAW_METRIC = re.compile(r"^(sum|avg|min|max|count)\(\s*[^(){}]*\{[^{}]+\}\s*\)$", re.I)
+_DEFAULT_NAME = re.compile(r"^(total|sum of|average|avg|count of|count)\b.*\(.*\)$|^[a-z0-9]+(_[a-z0-9]+)+$", re.I)
+_ATTRIBUTE_LIKE = re.compile(r"\b(id|code|key|number|zip|postal|year|month|flag|indicator|status|type)\b", re.I)
+_NUMERIC = ("bigint", "integer", "int", "double", "decimal", "real", "float", "smallint", "tinyint")
+_SUMMED_NONADDITIVE = re.compile(r"\b(rate|ratio|score|percent|percentage|pct|age|months|term|price|index|"
+                                 r"average|avg|mean|latitude|longitude)\b", re.I)
+
+
+def _plain_number(value: Any) -> str:
+    return str(value or "").replace(",", "").strip()
+
+
+def looks_like_integer_date(attr: dict) -> bool:
+    """A numeric attribute holding YYYYMM or YYYYMMDD values (from profile min / max or description)."""
+    if attr.get("type", "").lower() not in _NUMERIC:
+        return False
+    if re.search(r"\bYYYY-?MM", attr.get("description") or ""):
+        return True
+    prof = attr.get("profile") or {}
+    lo, hi = _plain_number(prof.get("min")), _plain_number(prof.get("max"))
+    def ok(v):
+        return (len(v) == 6 and v.isdigit() and 1900 <= int(v[:4]) <= 2199 and 1 <= int(v[4:]) <= 12) or \
+               (len(v) == 8 and v.isdigit() and 1900 <= int(v[:4]) <= 2199 and 1 <= int(v[4:6]) <= 12)
+    return bool(lo and hi and ok(lo) and ok(hi))
+
+
+def maturity_signals(scope: dict) -> dict[str, Any]:
+    """Signals from the scope and an estimated maturity level (memory/reference_model_assessment.md
+    "Maturity levels"). An estimate to confirm during the assessment, not a grade."""
+    attrs = scope.get("attributes") or []
+    metrics = scope.get("metrics") or []
+    names = [a["name"].lower() for a in attrs]
+    described = sum(1 for o in attrs + metrics if (o.get("description") or "").strip())
+    total = len(attrs) + len(metrics) or 1
+    derived = [m["name"] for m in metrics if m.get("formula") and not _RAW_METRIC.match(m["formula"].strip())]
+    default_named = [o["name"] for o in attrs + metrics if _DEFAULT_NAME.match(o["name"].strip())]
+    attribute_like_metrics = [m["name"] for m in metrics if _ATTRIBUTE_LIKE.search(_words(m["name"]))
+                              and m.get("formula") and _RAW_METRIC.match(m["formula"].strip())]
+    numeric_attributes = [a["name"] for a in attrs if a.get("type", "").lower() in _NUMERIC]
+    decoded = any(re.search(r"(__|\b)(description|desc|label)\b", n) for n in names)
+    latest_flag = any(("latest" in n or "current period" in n or "is current" in n) for n in names)
+    constants = [a["name"] for a in attrs if (a.get("profile") or {}).get("distinct_values") == 1]
+    integer_dates = [a["name"] for a in attrs if looks_like_integer_date(a)]
+    summed_nonadditive = [m["name"] for m in metrics if m.get("formula") and
+                          re.match(r"^sum\(", m["formula"].strip(), re.I) and _SUMMED_NONADDITIVE.search(_words(m["name"]))]
+    text_metrics = [m["name"] for m in metrics if m.get("type", "").lower() in ("varchar", "char", "string", "text")]
+    share = round(described / total, 3)
+    structural = len(summed_nonadditive) >= 3 or len(integer_dates) >= 2 or bool(text_metrics)
+    if not derived:
+        level = "M0" if share < 0.5 or structural else "M1"
+    elif len(derived) < 5:
+        level = "M2" if decoded else "M1"
+    else:
+        level = "M4" if (share >= 0.9 and latest_flag and decoded) else "M3"
+    return {"estimated_level": level, "described_share": share, "derived_metrics": len(derived),
+            "raw_metrics": len(metrics) - len(derived), "default_named_objects": default_named,
+            "metrics_that_look_like_attributes": attribute_like_metrics,
+            "numeric_attributes": numeric_attributes, "decoded_codes": decoded,
+            "latest_period_flag": latest_flag, "single_value_attributes": constants,
+            "dates_stored_as_numbers": integer_dates, "summed_rates_scores_or_ages": summed_nonadditive,
+            "metrics_stored_as_text": text_metrics,
+            "note": "estimate from names, descriptions and formulas; confirm during the assessment"}
 
 
 # ── run ──────────────────────────────────────────────────────────────────────────────────────
@@ -306,6 +527,9 @@ def _execute(runner: Runner, project: str, sql: str, max_rows: int) -> dict[str,
     t0 = time.monotonic()
     try:
         parsed = parse_query_result(runner.call("query", {"project": project, "query": sql}))
+    except PendingReply:
+        return {"ok": False, "pending": True, "error": "reply not saved yet", "columns": [], "rows": [],
+                "row_count": 0, "truncated": False, "seconds": None}
     except Exception as e:  # network or MCP errors: record and keep going
         parsed = {"ok": False, "columns": [], "rows": [], "error": f"{type(e).__name__}: {e}"}
     rows = parsed["rows"]
@@ -338,6 +562,392 @@ def run_bank(runner: Runner, project: str, bank: dict, *, only: str = "", levels
     return {"version": 1, "project": project, "model": model, "generated": time.strftime("%Y-%m-%d %H:%M"),
             "summary": {"questions": len(results), "ok": ok, "errors": len(results) - ok},
             "results": results}
+
+
+# ── relationships ────────────────────────────────────────────────────────────────────────────
+# A child attribute determines a parent when every child value occurs with exactly one parent value:
+# COUNT(DISTINCT child) = COUNT(DISTINCT child || parent). NULL is kept as its own value. Several
+# pairs share one query (one COUNT(DISTINCT …) per attribute and per pair).
+
+_STOP = {"of", "the", "a", "an", "at", "to", "in", "on", "for", "and", "or", "by", "id", "code"}
+_PARENT_HINT = re.compile(r"\b(group|type|category|class|bucket|segment|region|state|country|year|quarter|"
+                          r"description|name|channel|program|flag|tier|level|family|division|brand)\b", re.I)
+_CHILD_HINT = re.compile(r"\b(code|id|zip|postal|msa|city|county|date|month|week|day|number|key|sku|item)\b", re.I)
+_ENTITY_HINT = re.compile(r"\b(id|identifier|number|key|account|customer|loan|patient|member|policy|order|item|"
+                          r"product|store|device|entity)\b", re.I)
+_SKIP_TYPES = ("double", "real", "float")
+# Hierarchy families: a child and parent from the same family are worth testing first.
+_FAMILIES = {
+    "geography": (re.compile(r"\b(postal|zip|msa|metro\w*|city|county|tract|census|store|branch|site|address)\b", re.I),
+                  re.compile(r"\b(state|region|country|territory|district|province|market|area|zone)\b", re.I)),
+    "calendar": (re.compile(r"\b(date|day|week|month|period|timestamp)\b", re.I),
+                 re.compile(r"\b(year|quarter|month|season|fiscal|half|vintage)\b", re.I)),
+    "organization": (re.compile(r"\b(loan|account|customer|patient|member|policy|order|item|sku|product|employee|"
+                                r"device|seller|servicer|provider|vendor|supplier)\b", re.I),
+                     re.compile(r"\b(pool|deal|portfolio|group|segment|category|family|brand|division|department|"
+                                r"plan|program|network|tier|class)\b", re.I)),
+}
+
+
+def _key_expr(attribute: str) -> str:
+    return f"COALESCE(CAST({quote_ident(attribute)} AS VARCHAR), '<null>')"
+
+
+def _words(name: str) -> str:
+    """Name with underscores and punctuation as spaces, so word patterns match 'state__id'."""
+    return re.sub(r"[_\W]+", " ", name).strip()
+
+
+def _tokens(name: str) -> set[str]:
+    return {t for t in re.split(r"[^a-z0-9]+", name.lower()) if t and t not in _STOP}
+
+
+def _form_base(name: str) -> str:
+    return name.split("__", 1)[0] if "__" in name else name
+
+
+def _distinct(attr: dict) -> float | None:
+    return (attr.get("profile") or {}).get("distinct_values")
+
+
+def guess_entity(scope: dict) -> str:
+    """The attribute most likely to be the entity key: the most distinct values, preferring names
+    or descriptions that look like an identifier."""
+    attrs = [a for a in scope.get("attributes") or [] if _distinct(a)]
+    if not attrs:
+        return ""
+    def rank(a):
+        hint = bool(_ENTITY_HINT.search(_words(a["name"]))) or "identifier" in (a.get("description") or "").lower()
+        return (hint and a.get("type", "").lower() not in _SKIP_TYPES, _distinct(a) or 0)
+    return max(attrs, key=rank)["name"]
+
+
+def entity_pairs(scope: dict, entity: str) -> list[dict[str, Any]]:
+    attrs = [a["name"] for a in scope.get("attributes") or [] if (_distinct(a) or 0) >= 2]
+    return [{"child": entity, "parent": n, "kind": "entity"} for n in attrs if n != entity] if entity in attrs else []
+
+
+def candidate_pairs(scope: dict, *, entity: str = "", levels: dict[str, str] | None = None, max_pairs: int = 120,
+                    max_parent_values: int = 1000) -> list[dict[str, Any]]:
+    """child → parent candidates, ranked by name affinity. With `levels` (attribute → "entity" or
+    "varying", from the entity tests), only attributes on the same side are paired: a dependency
+    between a per-entity attribute and a per-period one is almost always coincidence."""
+    attrs = {a["name"]: a for a in scope.get("attributes") or [] if (_distinct(a) or 0) >= 2}
+    names = [n for n in attrs if n != entity and attrs[n].get("type", "").lower() not in _SKIP_TYPES]
+    scored = []
+    for child in names:
+        for parent in names:
+            if child == parent or _form_base(child) == _form_base(parent):
+                continue
+            if levels and levels.get(child) and levels.get(parent) and levels[child] != levels[parent]:
+                continue
+            dc, dp = _distinct(attrs[child]) or 0, _distinct(attrs[parent]) or 0
+            if dp > dc or dp > max_parent_values or (dp == dc and child > parent):
+                continue
+            overlap = len(_tokens(child) & _tokens(parent)) / max(len(_tokens(child) | _tokens(parent)), 1)
+            if dp < 3 and not overlap:
+                continue   # two-value flags as parents are coincidence unless the names relate
+            cw, pw = _words(child), _words(parent)
+            family = sum(2.0 for c_re, p_re in _FAMILIES.values() if c_re.search(cw) and p_re.search(pw))
+            time_child = bool(_FAMILIES["calendar"][0].search(cw))
+            time_parent = bool(_FAMILIES["calendar"][1].search(pw) or _FAMILIES["calendar"][0].search(pw))
+            score = 3.0 * overlap + family + (0.5 if _PARENT_HINT.search(pw) else 0.0) + \
+                (0.25 if _CHILD_HINT.search(cw) else 0.0) - (1.5 if time_child and not time_parent else 0.0)
+            scored.append((score, child, parent))
+    scored.sort(key=lambda t: (-t[0], t[1], t[2]))
+    return [{"child": c, "parent": p, "kind": "pair"} for _, c, p in scored[:max(max_pairs, 0)]]
+
+
+def relationship_pairs(scope: dict, *, entity: str = "", levels: dict[str, str] | None = None,
+                       max_pairs: int = 120, max_parent_values: int = 1000) -> list[dict[str, Any]]:
+    """Entity tests (the entity key against every attribute), then ranked child → parent candidates."""
+    entity = entity or guess_entity(scope)
+    return entity_pairs(scope, entity) + candidate_pairs(scope, entity=entity, levels=levels, max_pairs=max_pairs,
+                                                         max_parent_values=max_parent_values)
+
+
+def relationship_queries(model: str, pairs: list[dict], *, where: str = "", batch: int = 10) -> list[dict[str, Any]]:
+    clause = f" WHERE {where}" if where else ""
+    queries = []
+    for start in range(0, len(pairs), max(batch, 1)):
+        chunk = pairs[start:start + max(batch, 1)]
+        attrs: list[str] = []
+        for pr in chunk:
+            for n in (pr["child"], pr["parent"]):
+                if n not in attrs:
+                    attrs.append(n)
+        cols = [f"COUNT(DISTINCT {_key_expr(n)}) AS a{i}" for i, n in enumerate(attrs)]
+        cols += [f"COUNT(DISTINCT {_key_expr(pr['child'])} || '|' || {_key_expr(pr['parent'])}) AS p{j}"
+                 for j, pr in enumerate(chunk)]
+        sql = f"SELECT {', '.join(cols)} FROM {quote_model(model)}{clause}"  # nosec B608  # identifiers are quoted; the connector is read-only
+        queries.append({"sql": sql, "attributes": attrs, "pairs": chunk})
+    return queries
+
+
+def classify_pair(child_values: float, parent_values: float, pair_values: float, kind: str) -> dict[str, Any]:
+    exceptions = int(pair_values - child_values)
+    holds = exceptions == 0
+    near = not holds and child_values >= 50 and exceptions <= 0.01 * child_values
+    if kind == "entity":
+        verdict = "entity_level" if holds else ("entity_level_with_exceptions" if near else "varies_within_entity")
+    elif holds:
+        verdict = "one_to_one" if child_values == parent_values else "many_to_one"
+    else:
+        verdict = "many_to_one_with_exceptions" if near else "no_dependency"
+    return {"verdict": verdict, "child_values": child_values, "parent_values": parent_values,
+            "pairs": pair_values, "exceptions": max(exceptions, 0),
+            "evidence": "strong" if child_values >= 100 else ("moderate" if child_values >= 30 else "weak")}
+
+
+def _reduce(edges: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Drop a→c when a→b and b→c are also present (keep direct parents only)."""
+    s = set(edges)
+    return [(a, c) for a, c in edges if not any((a, b) in s and (b, c) in s for b in {x for _, x in edges} if b not in (a, c))]
+
+
+def review_relationships(runner: Runner, project: str, scope: dict, *, entity: str = "", where: str = "",
+                         max_pairs: int = 120, batch: int = 10, declared: list[dict] | None = None,
+                         log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
+    model = scope["model"]
+    entity = entity or guess_entity(scope)
+    tests: list[dict[str, Any]] = []
+    pending = 0
+
+    def run(pairs: list[dict]) -> None:
+        nonlocal pending
+        queries = relationship_queries(model, pairs, where=where, batch=batch)
+        for i, q in enumerate(queries):
+            log(f"relationships {i + 1}/{len(queries)}")
+            try:
+                parsed = parse_query_result(runner.call("query", {"project": project, "query": q["sql"]}))
+            except PendingReply:
+                pending += 1
+                continue
+            if not parsed["ok"] or not parsed["rows"]:
+                tests.extend({**pr, "verdict": "error", "error": parsed["error"] or "no rows"} for pr in q["pairs"])
+                continue
+            row = parsed["rows"][0]
+            counts = {n: svm.number(row.get(f"a{k}")) for k, n in enumerate(q["attributes"])}
+            for j, pr in enumerate(q["pairs"]):
+                pv = svm.number(row.get(f"p{j}"))
+                if counts.get(pr["child"]) is None or pv is None:
+                    tests.append({**pr, "verdict": "error", "error": "missing counts in reply"})
+                    continue
+                tests.append({**pr, **classify_pair(counts[pr["child"]], counts[pr["parent"]] or 0, pv, pr["kind"])})
+
+    # Phase 1: the entity key against every attribute; phase 2: same-level candidate pairs.
+    run(entity_pairs(scope, entity))
+    pairs_tested = len(tests)
+    if not pending:
+        levels = {t["parent"]: ("entity" if t["verdict"].startswith("entity_level") else "varying")
+                  for t in tests if t["kind"] == "entity" and t["verdict"] != "error"}
+        candidates = candidate_pairs(scope, entity=entity, levels=levels, max_pairs=max_pairs)
+        run(candidates)
+        pairs_tested += len(candidates)
+
+    entity_level = [t["parent"] for t in tests if t["kind"] == "entity" and t["verdict"].startswith("entity_level")]
+    varying = [t["parent"] for t in tests if t["kind"] == "entity" and t["verdict"] == "varies_within_entity"]
+    one_to_one = [{"a": t["child"], "b": t["parent"], "evidence": t["evidence"]} for t in tests
+                  if t["kind"] == "pair" and t["verdict"] == "one_to_one"]
+    m2o = [(t["child"], t["parent"]) for t in tests if t["kind"] == "pair" and t["verdict"] == "many_to_one"]
+    evidence = {(t["child"], t["parent"]): t["evidence"] for t in tests if t["kind"] == "pair"}
+    direct = [{"child": c, "parent": p, "evidence": evidence[(c, p)]} for c, p in _reduce(m2o)]
+    out: dict[str, Any] = {"version": 1, "model": model, "entity": entity, "generated": time.strftime("%Y-%m-%d"),
+                           "tested_pairs": pairs_tested, "pending_queries": pending, "tests": tests,
+                           "suggestions": {"parent_child": direct, "same_entity_one_to_one": one_to_one,
+                                           "entity_level_attributes": entity_level,
+                                           "attributes_varying_within_entity": varying},
+                           "notes": ["A dependency in the data is evidence, not proof: recommend a relationship "
+                                     "only when it also makes business sense (domain notes). Evidence: 'weak' "
+                                     "below 30 child values (often coincidence in small samples), 'moderate' "
+                                     "30-99, 'strong' from 100.",
+                                     "One-to-one pairs are usually forms of one attribute (code + description) or "
+                                     "a redundant attribute."]}
+    if declared is not None:
+        found = {(t["child"].lower(), t["parent"].lower()): t["verdict"] for t in tests}
+        checks = []
+        for d in declared:
+            key = (str(d.get("child", "")).lower(), str(d.get("parent", "")).lower())
+            checks.append({"child": d.get("child"), "parent": d.get("parent"),
+                           "data": found.get(key, "not_tested")})
+        declared_keys = {(str(d.get("child", "")).lower(), str(d.get("parent", "")).lower()) for d in declared}
+        out["declared"] = {"checks": checks,
+                           "contradicted": [c for c in checks if c["data"] == "no_dependency"],
+                           "supported_but_undeclared": [d for d in direct
+                                                        if (d["child"].lower(), d["parent"].lower()) not in declared_keys]}
+    return out
+
+
+# ── lookup tables ────────────────────────────────────────────────────────────────────────────
+
+_CODE_NAME = re.compile(r"\b(code|status|type|indicator|flag|channel|method|purpose|program|class|category|"
+                        r"reason|plan|source|grade|tier|segment)\b", re.I)
+_PERIOD_NAME = re.compile(r"\b(month|period|date|week|quarter|snapshot|as of)\b", re.I)
+_YES_NO = {"y", "n", "yes", "no", "true", "false", "0", "1", "u", "unknown", ""}
+
+
+def _slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "lookup"
+
+
+def _has_description_sibling(name: str, names: list[str]) -> bool:
+    base = _form_base(name).lower()
+    stem = re.sub(r"\b(code|id|indicator|flag)\b", "", base).strip()
+    for other in names:
+        o = other.lower()
+        if o == name.lower():
+            continue
+        if _form_base(o) == base and any(w in o for w in ("description", "desc", "name", "label")):
+            return True
+        if stem and stem in o and any(w in o for w in ("description", "desc", " name", "label")):
+            return True
+    return False
+
+
+def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 200,
+                       relationships: dict | None = None) -> list[dict[str, Any]]:
+    attrs = scope.get("attributes") or []
+    names = [a["name"] for a in attrs]
+    out: list[dict[str, Any]] = []
+    for a in attrs:
+        prof = a.get("profile") or {}
+        d = prof.get("distinct_values")
+        is_text = a.get("type", "").lower() in ("varchar", "char", "string", "text")
+        is_numeric_code = a.get("type", "").lower() in _NUMERIC and bool(_CODE_NAME.search(_words(a["name"]))) \
+            and not looks_like_integer_date(a)
+        if not (is_text or is_numeric_code) or not d or d < 2:
+            continue
+        if d > max_code_values or "__" in a["name"] or _has_description_sibling(a["name"], names):
+            continue
+        if re.search(r"\b(description|desc|name|label|text)\b", a["name"], re.I):
+            continue   # already the readable side
+        values = [str(v) for v in prof.get("values") or [] if v is not None]
+        if values and {v.lower() for v in values} <= _YES_NO:
+            continue   # readable as it is
+        short_codes = bool(values) and all(len(v) <= 4 for v in values)
+        if not (_CODE_NAME.search(_words(a["name"])) or short_codes):
+            continue
+        desc = (a.get("description") or "").lower()
+        out.append({"id": f"L-{_slug(a['name'])}", "kind": "code_lookup", "attribute": a["name"],
+                    "distinct_values": d,
+                    "reason": "coded values with no description form or attribute"
+                              + ("; the codes are explained only in the description text" if "=" in desc or ":" in desc
+                                 else ""),
+                    "columns": [a["name"], f"{a['name']} description", "source"]})
+    period_attr = period
+    if not period_attr:
+        dated = [a for a in attrs if (a.get("type", "").lower() in ("date", "timestamp") or looks_like_integer_date(a))
+                 and _PERIOD_NAME.search(_words(a["name"])) and (_distinct(a) or 0) >= 2]
+        if dated:
+            preferred = re.compile(r"\b(period|reporting|snapshot|as of|activity|month)\b", re.I)
+            period_attr = max(dated, key=lambda a: (bool(preferred.search(_words(a["name"]))),
+                                                    _distinct(a) or 0))["name"]
+    latest = any("latest" in n.lower() or "current period" in n.lower() for n in names)
+    if period_attr and not latest:
+        out.append({"id": f"L-{_slug(period_attr)}", "kind": "period_lookup", "attribute": period_attr,
+                    "reason": "no latest-period flag: point-in-time metrics resolve 'latest' per group without one, "
+                              "and calendar parents (year, quarter) need a period table",
+                    "columns": [period_attr, "year", "quarter", "month", "latest period flag"]})
+    if relationships:
+        static = (relationships.get("suggestions") or {}).get("entity_level_attributes") or []
+        if len(static) >= 5:
+            out.append({"id": "L-entity", "kind": "entity_table", "attribute": relationships.get("entity"),
+                        "reason": f"{len(static)} attributes are fixed per entity but repeat on every fact row; "
+                                  "an entity table is optional — recommend it only if it fixes a question "
+                                  "(counts, once-per-entity amounts) or the fact is large",
+                        "columns": [relationships.get("entity")] + static[:50]})
+    return out
+
+
+def _period_parts(value: str) -> tuple[str, str, str]:
+    m = re.match(r"^(\d{4})-?(\d{2})", _plain_number(value))
+    if not m:
+        return "", "", ""
+    year, month = m.group(1), int(m.group(2))
+    return year, f"{year}-Q{(month - 1) // 3 + 1}", f"{month:02d}"
+
+
+def _write_csv(path: str, header: list[str], rows: list[list[Any]]) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[dict], csv_dir: str, *,
+                  where: str = "", max_values: int = 1000, batch: int = 8) -> list[dict[str, Any]]:
+    """Write a CSV template per suggestion: key values from the data (reusing the scope's samples,
+    querying the rest in batches); description columns left blank for the agent to fill from cited
+    sources (or the user to fill)."""
+    os.makedirs(csv_dir, exist_ok=True)
+    model = scope["model"]
+    profiles = {a["name"]: a.get("profile") or {} for a in scope.get("attributes") or []}
+    known: dict[str, Any] = {}
+    wanted: dict[str, float] = {}
+    for sug in suggestions:
+        if sug["kind"] == "entity_table":
+            continue
+        prof = profiles.get(sug["attribute"], {})
+        if prof.get("values") is not None and prof.get("distinct_values") is not None \
+                and len([v for v in prof["values"] if v is not None]) >= prof["distinct_values"]:
+            known[sug["attribute"]] = prof["values"]
+        else:
+            wanted[sug["attribute"]] = min(prof.get("distinct_values") or max_values, max_values)
+    known.update(_sample_values(runner, project, model, wanted, where, batch))
+    done = []
+    for sug in suggestions:
+        if sug["kind"] == "entity_table":
+            done.append({**sug, "csv": None, "note": "not generated: build it from the source extract if approved"})
+            continue
+        got = known.get(sug["attribute"])
+        if got == "pending":
+            done.append({**sug, "csv": None, "pending": True})
+            continue
+        if got is None:
+            done.append({**sug, "csv": None, "error": "values could not be read"})
+            continue
+        values = [_plain_number(v) if sug["kind"] == "period_lookup" else v for v in got if v not in (None, "")]
+        dropped = _null_artifacts(values, profiles.get(sug["attribute"], {}), scope, sug["attribute"])
+        values = [v for v in values if v not in dropped]
+        path = os.path.join(csv_dir, f"{_slug(sug['attribute'])}_lookup.csv")
+        if sug["kind"] == "code_lookup":
+            _write_csv(path, sug["columns"], [[v, "", ""] for v in values])
+        else:
+            latest = max(values) if values else None
+            _write_csv(path, sug["columns"], [[v, *_period_parts(v), "Y" if v == latest else "N"] for v in values])
+        entry = {**sug, "csv": path, "rows": len(values)}
+        if dropped:
+            entry["note"] = (f"dropped {sorted(dropped)}: outside the attribute's min/max, so a NULL rendered as a "
+                             f"number by CAST — represent 'no value' explicitly if users need it")
+        done.append(entry)
+    return done
+
+
+def _null_artifacts(values: list, prof: dict, scope: dict, attribute: str) -> set:
+    """Values of a numeric attribute below its profiled MIN: seen live, a NULL in a numeric column comes
+    back as '0' from CAST(... AS VARCHAR) while MIN / COUNT(DISTINCT) ignore it."""
+    attr = next((a for a in scope.get("attributes") or [] if a["name"] == attribute), {})
+    lo = _plain_number(prof.get("min"))
+    if attr.get("type", "").lower() not in _NUMERIC or not re.fullmatch(r"-?\d+(\.\d+)?", lo or ""):
+        return set()
+    out = set()
+    for v in values:
+        pv = _plain_number(v)
+        if re.fullmatch(r"-?\d+(\.\d+)?", pv) and float(pv) < float(lo):
+            out.add(v)
+    return out
+
+
+def lookup_steps(args: dict) -> str:
+    key = args.get("key_attribute") or "<key attribute>"
+    new = ", ".join(args.get("new_attributes") or []) or "the new columns"
+    return (f"1. Add {args.get('csv') or '<csv file>'} to the model as a new table. "
+            f"2. Map its key column to the EXISTING attribute '{key}' — keep the attribute; deleting or replacing it "
+            f"deletes the derived metrics that filter on it. "
+            f"3. Add {new} as forms of '{key}' or as parent attributes, with business names and descriptions. "
+            f"4. Check that '{key}' uses the new table as its lookup (auto-detection may keep the fact table). "
+            f"5. Republish and re-certify; then re-run the questions that depend on it.")
 
 
 # ── grade ────────────────────────────────────────────────────────────────────────────────────
@@ -495,6 +1105,9 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         need("spec")
         argv = base + ["patch-fact-metrics", "--model-id", model_id, "--spec", str(a.get("spec", ""))]
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
+    if kind == "add_lookup_table":
+        need("csv", "key_attribute")
+        return {"dry_run": None, "apply": None, "manual": lookup_steps(a), "problems": problems}
     if kind == "publish":
         return {"dry_run": None, "apply": base + ["publish", "--model-id", model_id], "manual": None,
                 "problems": problems}
@@ -823,6 +1436,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--base", default="", help="Library URL used to find the MCP server (env MSTR_BASE)")
     ap.add_argument("--mcp-url", default=os.environ.get("MSTR_MCP_URL", ""), help="MCP endpoint (env MSTR_MCP_URL)")
     ap.add_argument("--server", default="mosaic", help="which tenant MCP server (default mosaic)")
+    ap.add_argument("--replies", default="",
+                    help="replay mode: read MCP replies saved in this folder instead of signing in; missing ones "
+                         "are listed in <folder>/pending.json (for sessions that call the connector tools directly)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("scope", help="list attributes and metrics and profile each attribute")
@@ -834,6 +1450,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sample-max", type=int, default=30,
                     help="list the values of attributes with at most this many distinct values (default 30)")
     sp.add_argument("--max-attributes", type=int, default=200, help="profile at most this many attributes")
+    sp.add_argument("--profile-batch", type=int, default=8, help="attributes profiled per query (default 8)")
 
     sp = sub.add_parser("run", help="run a question bank through the MCP query tool")
     sp.add_argument("--project", required=True)
@@ -842,6 +1459,27 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--only", default="", help="comma-separated question ids")
     sp.add_argument("--levels", default="", help="comma-separated levels, e.g. 1,2")
     sp.add_argument("--max-rows", type=int, default=1000, help="rows kept per question (default 1000)")
+
+    sp = sub.add_parser("relationships", help="test parent-child dependencies between attributes in the data")
+    sp.add_argument("--project", required=True)
+    sp.add_argument("--scope", required=True, help="scope.json from the scope command (with profiles)")
+    sp.add_argument("--out", required=True)
+    sp.add_argument("--entity", default="", help="entity key attribute (default: guessed from the profiles)")
+    sp.add_argument("--where", default="", help="SQL condition that scopes the tests on large models")
+    sp.add_argument("--max-pairs", type=int, default=120, help="child-parent pairs to test besides the entity tests")
+    sp.add_argument("--batch", type=int, default=10, help="pairs per query (default 10)")
+    sp.add_argument("--declared", help="JSON list of the model's declared relationships: [{child, parent}]")
+
+    sp = sub.add_parser("lookups", help="recommend lookup tables and write CSV templates for them")
+    sp.add_argument("--project", required=True)
+    sp.add_argument("--scope", required=True)
+    sp.add_argument("--out", required=True)
+    sp.add_argument("--csv-dir", required=True, help="folder for the CSV templates")
+    sp.add_argument("--relationships", help="relationships.json, to consider an entity table")
+    sp.add_argument("--period", default="", help="period attribute (default: guessed)")
+    sp.add_argument("--where", default="")
+    sp.add_argument("--max-code-values", type=int, default=200,
+                    help="treat text attributes with at most this many values as codes (default 200)")
 
     sp = sub.add_parser("grade", help="compare results with expected values; summarize by level and path")
     sp.add_argument("--bank", required=True)
@@ -877,14 +1515,35 @@ def main(argv: list[str] | None = None, runner_factory: Callable[[argparse.Names
     def log(msg: str) -> None:
         print(f"[assess] {msg}", file=sys.stderr)
 
+    made: list[Runner] = []
+
     def runner() -> Runner:
         if runner_factory is not None:
-            return runner_factory(args)
-        return McpRunner(args.base, args.mcp_url, args.server)
+            r = runner_factory(args)
+        elif args.replies:
+            r = ReplayRunner(args.replies)
+        else:
+            r = McpRunner(args.base, args.mcp_url, args.server)
+        made.append(r)
+        return r
+    runner.made = made  # type: ignore[attr-defined]
 
-    if args.cmd in ("scope", "run"):
+    if args.cmd in ("scope", "run", "relationships", "lookups"):
         try:
-            return _live(args, runner, log)
+            code = _live(args, runner, log)
+            pending = [r for r in made if getattr(r, "pending", None)]
+            if pending and hasattr(pending[0], "write_pending"):
+                path = pending[0].write_pending()
+                print(json.dumps({"ok": False, "pending": len(pending[0].pending), "pending_file": path,
+                                  "next": "save the replies listed there, then run the same command again"},
+                                 indent=2))
+                return 3
+            return code
+        except PendingReply:
+            r = made[-1]
+            print(json.dumps({"ok": False, "pending": len(r.pending), "pending_file": r.write_pending(),
+                              "next": "save the replies listed there, then run the same command again"}, indent=2))
+            return 3
         except Exception as e:  # sign-in, MCP and network failures: one line, no traceback
             if type(e).__name__ in ("McpError", "AuthError") or isinstance(e, OSError) or \
                     type(e).__module__.startswith(("requests", "urllib3")):
@@ -897,10 +1556,37 @@ def main(argv: list[str] | None = None, runner_factory: Callable[[argparse.Names
 def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[[str], None]) -> int:
     if args.cmd == "scope":
         out = scope_model(runner(), args.project, args.model, profile=not args.no_profile, where=args.where,
-                          sample_max=args.sample_max, max_attributes=args.max_attributes, log=log)
+                          sample_max=args.sample_max, max_attributes=args.max_attributes,
+                          profile_batch=args.profile_batch, log=log)
         _write_json(args.out, out)
+        if _pending(runner):
+            return 3
         print(json.dumps({"ok": True, "out": args.out, "attributes": len(out["attributes"]),
-                          "metrics": len(out["metrics"]), **out["notes"]}, indent=2))
+                          "metrics": len(out["metrics"]), "maturity": out["maturity"]["estimated_level"],
+                          **out["notes"]}, indent=2))
+        return 0
+    if args.cmd == "relationships":
+        declared = _load_json(args.declared) if args.declared else None
+        out = review_relationships(runner(), args.project, _load_json(args.scope), entity=args.entity,
+                                   where=args.where, max_pairs=args.max_pairs, batch=args.batch,
+                                   declared=declared, log=log)
+        _write_json(args.out, out)
+        if _pending(runner):
+            return 3
+        print(json.dumps({"ok": True, "out": args.out, "entity": out["entity"], "tested_pairs": out["tested_pairs"],
+                          "parent_child": len(out["suggestions"]["parent_child"]),
+                          "one_to_one": len(out["suggestions"]["same_entity_one_to_one"])}, indent=2))
+        return 0
+    if args.cmd == "lookups":
+        scope = _load_json(args.scope)
+        rel = _load_json(args.relationships) if args.relationships else None
+        sugg = lookup_suggestions(scope, period=args.period, max_code_values=args.max_code_values, relationships=rel)
+        built = build_lookups(runner(), args.project, scope, sugg, args.csv_dir, where=args.where)
+        _write_json(args.out, {"version": 1, "model": scope.get("model"), "lookups": built})
+        if _pending(runner):
+            return 3
+        print(json.dumps({"ok": True, "out": args.out, "suggestions": len(built),
+                          "csv_files": [b["csv"] for b in built if b.get("csv")]}, indent=2))
         return 0
     if args.cmd == "run":
         bank = _load_json(args.bank)
@@ -911,9 +1597,17 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
         out = run_bank(runner(), args.project, bank, only=args.only, levels=args.levels,
                        max_rows=args.max_rows, log=log)
         _write_json(args.out, out)
+        if _pending(runner):
+            return 3
         print(json.dumps({"ok": True, "out": args.out, **out["summary"]}, indent=2))
         return 0
     return 2
+
+
+def _pending(runner: Callable[[], Runner]) -> bool:
+    """True when the runner made for this command is a replay runner with replies still missing."""
+    made = getattr(runner, "made", [])
+    return any(getattr(r, "pending", None) for r in made)
 
 
 def _offline(args: argparse.Namespace) -> int:

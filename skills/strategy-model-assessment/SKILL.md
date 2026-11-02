@@ -52,6 +52,15 @@ All files go in one working folder per assessment (outside the repo, or under a 
 folder kept local — they hold tenant data). Script: `skills/strategy-model-assessment/scripts/assess_model.py`
 (signs in to MCP like the connector does; see `skills/strategy-platform/scripts/strategy_mcp.py`).
 
+**Any model, any stage.** The same workflow serves a raw automated build and a curated, governed model;
+the maturity estimate from step 1 sets the emphasis (see "Maturity levels" in the memory note).
+
+**Sessions where the script cannot sign in** (a cloud workspace with the Mosaic connector attached):
+add `--replies <folder>` to `scope`, `relationships`, `lookups` and `run`. The script then lists the
+calls it needs in `<folder>/pending.json`; call each connector tool with the listed arguments, save
+the reply text to the listed file (start it with `ERROR:` if the tool failed), and run the same
+command again until nothing is pending (exit code 3 means "replies still needed").
+
 ### 1. Scope the model → `scope.json`
 
 ```bash
@@ -61,9 +70,55 @@ python3 $REPO/skills/strategy-model-assessment/scripts/assess_model.py scope \
 
 Records every attribute and metric (type, description, formula) from `get_semantics`, and profiles
 each attribute with bounded queries: distinct count, min / max, sample values for low-cardinality
-columns. On large models pass `--where` to scope profiling, or `--no-profile`. For relationships,
-lookup tables and derived-metric definitions, add the REST view:
+columns. On large models pass `--where` to scope profiling, or `--no-profile`. For the declared
+relationships, lookup tables and derived-metric definitions, add the REST view where it can run:
 `build_mosaic.py get-model-object --kind data_model --model-id <id>` and `validate-topology`.
+
+`scope` also writes a **maturity estimate** (M0 raw build → M4 analyst-ready) from names,
+descriptions, formulas and profiles: default names, metrics that look like attributes (IDs or codes
+summed), numeric attributes, decoded codes, a latest-period flag, constant attributes. Confirm it,
+then set the emphasis: an M0-M1 model needs grain, aggregation, naming, lookups and relationships
+first (group repeated defects into one finding per pattern); an M3-M4 model needs edge semantics,
+discoverability and level 4-5 questions.
+
+### 1b. Relationships → `relationships.json`
+
+```bash
+python3 assess_model.py relationships --project "<project>" --scope scope.json --out relationships.json \
+  [--entity "<entity key>"] [--declared declared.json]
+```
+
+Tests, in the data, whether each child value maps to exactly one parent value. The entity key is
+tested against every attribute (**fixed per entity** vs **varies within the entity** — e.g. over
+periods); other pairs are ranked by name affinity and cardinality and tested in batches. Results:
+- **parent-child** candidates (direct parents only), for drill paths, hierarchies and level metrics
+  (a level attribute must be an ancestor of the report rows);
+- **one-to-one** pairs — usually a code and its description that should be forms of one attribute,
+  or a redundant attribute;
+- **entity-level** attributes — candidates for an entity table, and the attributes that must be
+  counted or summed once per entity.
+
+With `--declared` (a list of the model's relationships as `[{child, parent}]`, from the REST view),
+it reports declared relationships the data contradicts and supported ones not declared. A dependency
+in the data is evidence, not proof: recommend a relationship only when the domain notes say it makes
+business sense — "weak" evidence (fewer than 30 child values) is often coincidence in small samples.
+
+### 1c. Lookup tables → `lookups.json` and CSV templates
+
+```bash
+python3 assess_model.py lookups --project "<project>" --scope scope.json \
+  --relationships relationships.json --csv-dir lookups/ --out lookups.json
+```
+
+Recommends lookup tables where the model needs them: coded attributes with no description form
+(codes explained only in a description, or not at all), a period table with calendar parents and a
+latest-period flag when there is none (point-in-time metrics otherwise resolve "latest" per group),
+and an optional entity table. **Offer the user the CSVs**: the script writes a template per lookup
+with the key values taken from the data; fill the description columns only from cited sources (the
+user's documents or the provider's dictionary, step 2) and name the source in the `source` column —
+or leave them blank for the user. A lookup becomes a finding with an `add_lookup_table` action; the
+change plan turns it into the steps to add and map the table (map it to the **existing** attribute:
+replacing an attribute deletes the derived metrics that filter on it).
 
 From the scope, write down: fact grain (one row per what, per when?), snapshot vs transaction facts,
 the entity key, the period attribute, entity status / exit fields, metrics that look additive but
@@ -151,7 +206,8 @@ questions using only the connector, and compare its answers with the graded ones
 
 ### 5. Findings → `findings.json`
 
-Group what failed or was hard into findings, each with category, impact, effort, evidence (question
+Include the structural findings from steps 1-1c (maturity, relationships, lookups) as well as the
+question results. Group what failed or was hard into findings, each with category, impact, effort, evidence (question
 ids, observed vs expected), recommendation, proposed actions, risks, dependencies and the questions
 that will test the fix. Walk the defect checklist in `memory/reference_model_assessment.md` even for
 questions that passed — several defects (per-group "latest" periods, rows dropping from results)
@@ -204,7 +260,8 @@ re-run exposed. The updated `findings.json` is the record for the next round.
 
 ## Final answer format
 
-- Scope summary (grain, entities, periods, notable gaps)
+- Scope summary (grain, entities, periods, maturity estimate, notable gaps)
+- Relationships and lookup tables recommended (with the CSVs offered)
 - Domain summary with sources (user documents first) and the use cases with their coverage
 - Score: pass / fail / ungraded by level; answer paths (governed / simple / expert / not answerable)
 - Findings by impact, with the decision needed from the user

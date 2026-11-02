@@ -9,9 +9,11 @@ import _hermetic  # noqa: E402,F401  (scrub MSTR_*/proxy env, private secret sto
 
 import contextlib
 import copy
+import csv
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -79,6 +81,11 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(cols, ["a", "b"])
         self.assertEqual(rows, [{"a": "x", "b": "1"}, {"a": "y|z", "b": None}])
 
+    def test_table_split_across_text_blocks(self):
+        reply = {"content": [{"type": "text", "text": "| v |\n| --- |\n| a |\n| b |\n"},
+                             {"type": "text", "text": "\n| c |\n"}, {"type": "text", "text": "\n*Query returned 3 rows*"}]}
+        self.assertEqual([r["v"] for r in am.parse_query_result(reply)["rows"]], ["a", "b", "c"])
+
     def test_query_result_shapes(self):
         md = am.parse_query_result(_text(_md(["region", "sales"], [["East", 10]])))
         self.assertEqual((md["ok"], md["rows"]), (True, [{"region": "East", "sales": "10"}]))
@@ -114,11 +121,12 @@ class ScopeTests(unittest.TestCase):
     def test_profiles_each_attribute_and_samples_low_cardinality_ones(self):
         runner = FakeRunner({
             'COUNT(DISTINCT "region")': _text(_md(["distinct_values", "min_value", "max_value"], [[3, "East", "West"]])),
-            'SELECT DISTINCT "region"': _text(_md(["value"], [["East"], ["North"], ["West"]])),
+            'SELECT DISTINCT CAST("region"': _text(_md(["value"], [["East"], ["North"], ["West"]])),
             'COUNT(DISTINCT "snapshot month")': _text(_md(["distinct_values", "min_value", "max_value"],
                                                           [[38, "2023-01-01", "2026-02-01"]])),
         })
-        out = am.scope_model(runner, "retail", "Store Sales", sample_max=5, where="\"region\" <> 'Test'")
+        out = am.scope_model(runner, "retail", "Store Sales", sample_max=5, where="\"region\" <> 'Test'",
+                             profile_batch=1)
 
         region, month, active = out["attributes"]
         self.assertEqual(region["profile"], {"distinct_values": 3.0, "min": "East", "max": "West",
@@ -484,6 +492,326 @@ class UseCaseAndDocumentTests(unittest.TestCase):
         report = json.loads(out.getvalue())
         self.assertEqual(code, 0)
         self.assertEqual(report["coverage"]["questions_per_use_case"], {"U1": 1, "U2": 1, "U3": 1})
+
+
+# ── replay mode, maturity, relationships, lookups ──────────────────────────────────────────
+
+class ReplayTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="assess-replay-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def _save(self, name, text):
+        with open(os.path.join(self.dir, name), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_scope_collects_pending_calls_then_completes(self):
+        out_path = os.path.join(self.dir, "scope.json")
+        argv = ["--replies", self.dir, "scope", "--project", "retail", "--model", "Store Sales", "--out", out_path,
+                "--sample-max", "5", "--profile-batch", "1"]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(am.main(argv), 3)                             # nothing saved yet
+        with open(os.path.join(self.dir, "pending.json"), encoding="utf-8") as f:
+            self.assertEqual([c["tool"] for c in json.load(f)["calls"]], ["get_semantics"])
+
+        self._save("semantics.txt", SEMANTICS)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(am.main(argv), 3)                             # now the profiling queries
+        with open(os.path.join(self.dir, "pending.json"), encoding="utf-8") as f:
+            calls = json.load(f)["calls"]
+        self.assertEqual(len(calls), 3)
+        for c in calls:
+            sql = c["arguments"]["query"]
+            self.assertEqual(c["file"], am.query_id(sql) + ".txt")
+            if '"region"' in sql:
+                self._save(c["file"], _md(["distinct_values", "min_value", "max_value"], [[2, "East", "West"]]))
+            elif '"months active"' in sql:
+                self._save(c["file"], "ERROR: column cannot be profiled")
+            else:
+                self._save(c["file"], json.dumps({"content": [{"type": "text", "text": _md(
+                    ["distinct_values", "min_value", "max_value"], [[38, "2023-01-01", "2026-02-01"]])}]}))
+        with contextlib.redirect_stdout(io.StringIO()) as printed, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(am.main(argv), 3)                             # the region sample query
+        self.assertNotIn('"ok": true', printed.getvalue())
+        with open(os.path.join(self.dir, "pending.json"), encoding="utf-8") as f:
+            (sample,) = json.load(f)["calls"]
+        self.assertIn('SELECT DISTINCT CAST("region" AS VARCHAR)', sample["arguments"]["query"])
+        self._save(sample["file"], _md(["value"], [["East"], ["West"]]))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(am.main(argv), 0)
+        with open(out_path, encoding="utf-8") as f:
+            scope = json.load(f)
+        prof = {a["name"]: a["profile"] for a in scope["attributes"]}
+        self.assertEqual(prof["region"]["values"], ["East", "West"])
+        self.assertEqual(prof["snapshot month"]["distinct_values"], 38.0)
+        self.assertIn("cannot be profiled", prof["months active"]["error"])
+
+    def test_run_marks_unanswered_questions_pending(self):
+        runner = am.ReplayRunner(self.dir)
+        out = am.run_bank(runner, "retail", _bank(), only="Q1")
+        self.assertTrue(out["results"][0]["pending"])
+        self.assertEqual(len(runner.pending), 1)
+
+
+class MaturityTests(unittest.TestCase):
+    def test_raw_build_is_m0(self):
+        scope = {"attributes": [{"name": "CUSTOMER_ID", "type": "bigint", "description": ""},
+                                {"name": "region", "type": "varchar", "description": "",
+                                 "profile": {"distinct_values": 1}}],
+                 "metrics": [{"name": "Total NET_SALES (sales)", "type": "double", "description": "",
+                              "formula": "sum(sales.csv.{NET_SALES})"},
+                             {"name": "Total STORE_ID (sales)", "type": "double", "description": "",
+                              "formula": "sum(sales.csv.{STORE_ID})"}]}
+        m = am.maturity_signals(scope)
+        self.assertEqual(m["estimated_level"], "M0")
+        self.assertEqual(m["derived_metrics"], 0)
+        self.assertIn("Total STORE_ID (sales)", m["metrics_that_look_like_attributes"])
+        self.assertEqual(m["single_value_attributes"], ["region"])
+        self.assertIn("CUSTOMER_ID", m["numeric_attributes"])
+
+    def test_governed_model_is_m3_or_m4(self):
+        attrs = [{"name": "status__code", "type": "varchar", "description": "d"},
+                 {"name": "status__description", "type": "varchar", "description": "d"},
+                 {"name": "latest period flag", "type": "varchar", "description": "d"}]
+        metrics = [{"name": f"m{i}", "type": "double", "description": "d", "formula": "{A} / {B}"} for i in range(6)]
+        self.assertEqual(am.maturity_signals({"attributes": attrs, "metrics": metrics})["estimated_level"], "M4")
+        attrs[2]["name"] = "snapshot month"
+        self.assertEqual(am.maturity_signals({"attributes": attrs, "metrics": metrics})["estimated_level"], "M3")
+        self.assertEqual(am.maturity_signals({"attributes": attrs, "metrics": metrics[:2]})["estimated_level"], "M2")
+
+
+def _snapshot_rows():
+    rows = []
+    for cid in range(40):
+        store = f"S{cid % 8}"
+        region = ["North", "South", "West"][(cid % 8) % 3]
+        for month in (1, 2, 3):
+            rows.append({"customer": f"C{cid:02d}", "store": store, "region": region,
+                         "region code": region[0], "segment": "ABC"[(cid + month) % 3],
+                         "snapshot month": f"2026-0{month}-01", "balance": cid * 10.0 + month})
+    return rows
+
+
+def _table_scope(rows):
+    types = {"balance": "double", "snapshot month": "date"}
+    attrs = []
+    for name in rows[0]:
+        attrs.append({"name": name, "type": types.get(name, "varchar"), "description": "",
+                      "profile": {"distinct_values": float(len({r[name] for r in rows}))}})
+    return {"model": "Store Sales", "attributes": attrs, "metrics": []}
+
+
+class TableRunner:
+    """Evaluates the COUNT(DISTINCT …) relationship queries and DISTINCT samples on in-memory rows."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = 0
+
+    def call(self, tool, arguments):
+        self.calls += 1
+        sql = arguments["query"]
+        sample = re.match(r'SELECT DISTINCT CAST\("([^"]+)" AS VARCHAR\) AS value', sql)
+        if sample:
+            values = sorted({str(r[sample.group(1)]) for r in self.rows})
+            return _text(_md(["value"], [[v] for v in values]))
+        if " UNION ALL " in sql or sql.startswith("SELECT DISTINCT '"):
+            out = []
+            for label, name in re.findall(r"SELECT DISTINCT '([^']+)' AS attribute, CAST\(\"([^\"]+)\" AS VARCHAR\)", sql):
+                out += [[label, v] for v in sorted({str(r[name]) for r in self.rows})]
+            return _text(_md(["attribute", "value"], out))
+        cols, row = [], []
+        for fn, name, alias in re.findall(r'(COUNT\(DISTINCT |MIN\(|MAX\()"([^"]+)"\) AS (d\d+|n\d+|x\d+|'
+                                          r'distinct_values|min_value|max_value)', sql):
+            vals = [r[name] for r in self.rows if r[name] is not None]
+            cols.append(alias)
+            row.append(len(set(vals)) if fn.startswith("COUNT") else (min(vals) if fn == "MIN(" else max(vals)))
+        for expr, alias in re.findall(r"COUNT\(DISTINCT (.+?)\) AS ([ap]\d+)", sql):
+            names = re.findall(r'CAST\("([^"]+)" AS VARCHAR\)', expr)
+            keys = {tuple("<null>" if r[n] is None else str(r[n]) for n in names) for r in self.rows}
+            cols.append(alias)
+            row.append(len(keys))
+        return _text(_md(cols, [row]))
+
+
+class RelationshipTests(unittest.TestCase):
+    def setUp(self):
+        self.rows = _snapshot_rows()
+        self.scope = _table_scope(self.rows)
+
+    def test_entity_guess_and_pairs(self):
+        self.assertEqual(am.guess_entity(self.scope), "customer")
+        pairs = am.relationship_pairs(self.scope)
+        entity = [p for p in pairs if p["kind"] == "entity"]
+        self.assertEqual({p["parent"] for p in entity}, {"store", "region", "region code", "segment",
+                                                         "snapshot month", "balance"})
+        others = [p for p in pairs if p["kind"] == "pair"]
+        self.assertIn({"child": "store", "parent": "region", "kind": "pair"}, others)
+        self.assertFalse(any("balance" in (p["child"], p["parent"]) for p in others))   # measure-like doubles skipped
+        self.assertEqual(len(am.relationship_pairs(self.scope, max_pairs=2)), len(entity) + 2)
+
+    def test_queries_are_batched_and_quoted(self):
+        pairs = am.relationship_pairs(self.scope)
+        queries = am.relationship_queries("Store Sales", pairs, batch=4, where="\"region\" <> 'X'")
+        self.assertEqual(len(queries), -(-len(pairs) // 4))
+        self.assertIn("COUNT(DISTINCT COALESCE(CAST(\"customer\" AS VARCHAR), '<null>') || '|' || "
+                      "COALESCE(CAST(\"store\" AS VARCHAR), '<null>')) AS p0", queries[0]["sql"])
+        self.assertTrue(queries[0]["sql"].endswith("FROM \"store sales\" WHERE \"region\" <> 'X'"))
+
+    def test_review_classifies_and_reduces(self):
+        declared = [{"child": "store", "parent": "region"}, {"child": "segment", "parent": "snapshot month"},
+                    {"child": "nothing", "parent": "else"}]
+        out = am.review_relationships(TableRunner(self.rows), "retail", self.scope, batch=5, declared=declared)
+        sug = out["suggestions"]
+        self.assertEqual(out["entity"], "customer")
+        self.assertEqual(set(sug["entity_level_attributes"]), {"store", "region", "region code"})
+        self.assertEqual(set(sug["attributes_varying_within_entity"]), {"segment", "snapshot month", "balance"})
+        self.assertIn({"child": "store", "parent": "region", "evidence": "weak"}, sug["parent_child"])
+        self.assertIn(("region", "region code"), {tuple(sorted((o["a"], o["b"]))) for o in sug["same_entity_one_to_one"]})
+        checks = {(c["child"], c["parent"]): c["data"] for c in out["declared"]["checks"]}
+        self.assertEqual(checks[("store", "region")], "many_to_one")
+        self.assertEqual(checks[("segment", "snapshot month")], "no_dependency")
+        self.assertEqual(checks[("nothing", "else")], "not_tested")
+        self.assertEqual([c["child"] for c in out["declared"]["contradicted"]], ["segment"])
+
+    def test_scope_profiles_in_batches_and_falls_back_on_a_failed_batch(self):
+        class Semantics(TableRunner):
+            def call(self, tool, arguments):
+                if tool == "get_semantics":
+                    lines = ["### Attributes(Dimensions)"] + [f"- **{n}** (varchar): x" for n in self.rows[0]]
+                    return _text("\n".join(lines))
+                return super().call(tool, arguments)
+
+        runner = Semantics(self.rows)
+        out = am.scope_model(runner, "retail", "Store Sales", profile_batch=4, sample_max=3)
+        prof = {a["name"]: a["profile"] for a in out["attributes"]}
+        self.assertEqual(prof["store"]["distinct_values"], 8.0)
+        self.assertEqual(prof["region"]["values"], ["North", "South", "West"])
+        self.assertEqual(prof["snapshot month"]["min"], "2026-01-01")
+        self.assertEqual(runner.calls, 2 + 1)              # 2 profile batches + 1 UNION ALL sample batch (4 attributes)
+
+        class FailingBatch(Semantics):
+            def call(self, tool, arguments):
+                if tool == "query" and " AS d1" in arguments["query"]:
+                    return _text("Query failed", error=True)
+                return super().call(tool, arguments)
+
+        runner = FailingBatch(self.rows)
+        out = am.scope_model(runner, "retail", "Store Sales", profile_batch=4, sample_max=3)
+        self.assertEqual({a["name"]: a["profile"]["distinct_values"] for a in out["attributes"]}["segment"], 3.0)
+        self.assertEqual(runner.calls, 7 + 1)              # both batches fail (not counted), 7 single queries + 1 sample batch
+
+    def test_classify_and_reduce_helpers(self):
+        self.assertEqual(am.classify_pair(100, 10, 101, "pair")["verdict"], "many_to_one_with_exceptions")
+        self.assertEqual(am.classify_pair(100, 10, 150, "pair")["verdict"], "no_dependency")
+        self.assertEqual(am.classify_pair(10, 10, 10, "pair")["verdict"], "one_to_one")
+        self.assertEqual(am.classify_pair(500, 5, 500, "entity")["evidence"], "strong")
+        self.assertEqual(am.classify_pair(40, 5, 40, "pair")["evidence"], "moderate")
+        self.assertEqual(am.classify_pair(6, 3, 8, "pair")["verdict"], "no_dependency")    # 2 of 6 is not "near"
+        self.assertEqual(sorted(am._reduce([("a", "b"), ("b", "c"), ("a", "c")])), [("a", "b"), ("b", "c")])
+
+    def test_pending_replies_are_counted(self):
+        runner = am.ReplayRunner(tempfile.mkdtemp(prefix="assess-rel-"))
+        self.addCleanup(shutil.rmtree, runner.folder, True)
+        out = am.review_relationships(runner, "retail", self.scope, batch=100)
+        self.assertEqual((out["pending_queries"], len(runner.pending)), (1, 1))
+
+
+class EarlyStageSignalTests(unittest.TestCase):
+    SCOPE = {"model": "Store Sales", "attributes": [
+        {"name": "reporting period", "type": "bigint", "description": "Period as YYYYMM integer",
+         "profile": {"distinct_values": 37, "min": "201,901", "max": "202,201"}},
+        {"name": "close date", "type": "bigint", "description": "",
+         "profile": {"distinct_values": 14, "min": "20200301", "max": "20211201"}},
+        {"name": "status code", "type": "bigint", "description": "", "profile": {"distinct_values": 4,
+                                                                                "values": ["1", "2", "3", "9"]}},
+        {"name": "units", "type": "bigint", "description": "", "profile": {"distinct_values": 3}}],
+        "metrics": [{"name": "interest rate", "type": "double", "description": "", "formula": "sum(t.{RATE})"},
+                    {"name": "customer age", "type": "bigint", "description": "", "formula": "sum(t.{AGE})"},
+                    {"name": "net sales", "type": "double", "description": "", "formula": "sum(t.{SALES})"},
+                    {"name": "cumulative costs", "type": "varchar", "description": "", "formula": "max(t.{COSTS})"}]}
+
+    def test_signals(self):
+        m = am.maturity_signals(self.SCOPE)
+        self.assertEqual(m["dates_stored_as_numbers"], ["reporting period", "close date"])
+        self.assertEqual(m["summed_rates_scores_or_ages"], ["interest rate", "customer age"])
+        self.assertEqual(m["metrics_stored_as_text"], ["cumulative costs"])
+
+    def test_numeric_codes_and_integer_periods_get_lookups(self):
+        sugg = {s["attribute"]: s["kind"] for s in am.lookup_suggestions(self.SCOPE)}
+        self.assertEqual(sugg, {"status code": "code_lookup", "reporting period": "period_lookup"})
+        self.assertEqual(am._period_parts("201,912"), ("2019", "2019-Q4", "12"))
+        self.assertEqual(am._period_parts("20200301"), ("2020", "2020-Q1", "03"))
+
+
+class LookupTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="assess-lookups-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.scope = {"model": "Store Sales", "attributes": [
+            {"name": "status code", "type": "varchar", "description": "Account status: 01 = open, 09 = closed",
+             "profile": {"distinct_values": 4, "values": ["01", "02", "03", "09"]}},
+            {"name": "channel", "type": "varchar", "description": "", "profile": {"distinct_values": 3}},
+            {"name": "channel description", "type": "varchar", "description": "", "profile": {"distinct_values": 3}},
+            {"name": "active flag", "type": "varchar", "description": "",
+             "profile": {"distinct_values": 2, "values": ["N", "Y"]}},
+            {"name": "event__code", "type": "varchar", "description": "", "profile": {"distinct_values": 5}},
+            {"name": "customer", "type": "varchar", "description": "", "profile": {"distinct_values": 4000}},
+            {"name": "snapshot month", "type": "date", "description": "", "profile": {"distinct_values": 3}}],
+            "metrics": []}
+
+    def test_suggestions(self):
+        sugg = {s["attribute"]: s for s in am.lookup_suggestions(self.scope)}
+        self.assertEqual(set(sugg), {"status code", "snapshot month"})
+        self.assertIn("explained only in the description", sugg["status code"]["reason"])
+        self.assertEqual(sugg["snapshot month"]["kind"], "period_lookup")
+
+        self.scope["attributes"].append({"name": "latest period flag", "type": "varchar", "description": "",
+                                         "profile": {"distinct_values": 2, "values": ["N", "Y"]}})
+        self.assertNotIn("snapshot month", {s["attribute"] for s in am.lookup_suggestions(self.scope)})
+        rel = {"entity": "customer", "suggestions": {"entity_level_attributes": list("abcdef")}}
+        kinds = [s["kind"] for s in am.lookup_suggestions(self.scope, relationships=rel)]
+        self.assertIn("entity_table", kinds)
+
+    def test_csv_templates(self):
+        rows = [{"status code": c, "snapshot month": m} for c in ("01", "02", "09") for m in
+                ("2025-12-01", "2026-01-01", "2026-02-01")]
+        sugg = am.lookup_suggestions(self.scope) + [{"id": "L-entity", "kind": "entity_table", "attribute": "customer",
+                                                     "columns": ["customer"]}]
+        runner = TableRunner(rows)
+        built = {b["attribute"]: b for b in am.build_lookups(runner, "retail", self.scope, sugg, self.dir)}
+
+        # status code reuses the scope's complete sample (4 values); only the period is queried
+        self.assertEqual(runner.calls, 1)
+        with open(built["status code"]["csv"], encoding="utf-8", newline="") as f:
+            self.assertEqual(list(csv.reader(f)), [["status code", "status code description", "source"],
+                                                   ["01", "", ""], ["02", "", ""], ["03", "", ""], ["09", "", ""]])
+        with open(built["snapshot month"]["csv"], encoding="utf-8", newline="") as f:
+            period = list(csv.reader(f))
+        self.assertEqual(period[0], ["snapshot month", "year", "quarter", "month", "latest period flag"])
+        self.assertEqual(period[1], ["2025-12-01", "2025", "2025-Q4", "12", "N"])
+        self.assertEqual(period[-1], ["2026-02-01", "2026", "2026-Q1", "02", "Y"])
+        self.assertIsNone(built["customer"]["csv"])
+
+    def test_null_rendered_as_zero_is_dropped_from_numeric_code_lookups(self):
+        scope = {"model": "Store Sales", "attributes": [
+            {"name": "exit code", "type": "bigint", "description": "",
+             "profile": {"distinct_values": 3, "min": "1", "max": "9", "values": ["0", "1", "2", "9"]}}], "metrics": []}
+        sugg = am.lookup_suggestions(scope)
+        built = am.build_lookups(TableRunner([{"exit code": 1}]), "retail", scope, sugg, self.dir)
+        with open(built[0]["csv"], encoding="utf-8", newline="") as f:
+            self.assertEqual([r[0] for r in csv.reader(f)][1:], ["1", "2", "9"])
+        self.assertIn("dropped ['0']", built[0]["note"])
+
+    def test_plan_turns_add_lookup_table_into_manual_steps(self):
+        ok = am.action_commands({"kind": "add_lookup_table", "args": {"csv": "status_code_lookup.csv",
+                                                                     "key_attribute": "status code",
+                                                                     "new_attributes": ["status description"]}}, "MID")
+        self.assertEqual(ok["problems"], [])
+        self.assertIn("EXISTING attribute 'status code'", ok["manual"])
+        self.assertIn("status description", ok["manual"])
+        bad = am.action_commands({"kind": "add_lookup_table", "args": {}}, "MID")
+        self.assertEqual(len(bad["problems"]), 2)
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────────────────────
