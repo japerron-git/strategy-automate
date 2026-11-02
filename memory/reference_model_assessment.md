@@ -230,14 +230,24 @@ Result column names in `key` / `measures` must match the SQL aliases.
 `phase` defaults from `category` (table above). Action kinds `plan` turns into commands:
 `create_conditional_metric`, `create_compound_metric`, `create_level_metric`,
 `create_weighted_average`, `delete_derived_metric`, `patch_model_object`, `patch_fact_metrics`, `publish`,
-`certify`, `change_column_type` and `source_change` (both below), `add_lookup_table` (manual steps: add the
-CSV, map it to the existing attribute, give its key column the attribute's type, create `new_attributes` as
-attributes of their own and `new_forms` as forms, check the lookup); anything else is `manual` with `steps`.
+`certify`, `change_column_type`, `source_change` and `wire_relationships` (below), `add_lookup_table` (manual
+steps: add the CSV, map it to the existing attribute, give its key column the attribute's type, create
+`new_attributes` as attributes of their own and `new_forms` as forms, leave out the CSV's `source` column,
+check the lookup); anything else is `manual` with `steps`. Lookup suggestions say which columns are forms
+(descriptions) and which are attributes (flags, calendar parents); `plan` warns when a description, name or
+label column is listed as an attribute that no metric filters on.
 
 - **Fix it in the model first; change the source last.** Before proposing a `source_change`, check
   whether the model can make the fix itself: a column type or date format is `change_column_type`; a
   value derived from other columns can be an attribute form or a metric formula. Only a change the model
   cannot express (new data, values that must be rewritten) needs the source changed and reloaded.
+- **Change the type first, test, then decide on the source.** A column read with the wrong type often
+  comes back right once the type changes (leading zeros, letter codes), because the source still holds the
+  original text. `plan` reports a column that has both a `change_column_type` and a `source_change`: keep
+  the type change, add a test of the values, and plan the source change only if that test fails.
+- **An empty column is a finding, not something to fill.** Don't write values calculated from other
+  columns into a provider field. Give it the right type so it is ready for full data, say in its
+  description that it is empty in this data, and compute anything derived (a running total) in a metric.
 
 - **Anything a metric filters on must be an attribute.** An embedded filter targets an attribute, not a
   form, so lookup columns such as a latest-period flag or an active flag go under `new_attributes`.
@@ -254,6 +264,13 @@ attributes of their own and `new_forms` as forms, check the lookup); anything el
   their zeros). `plan` gathers every `source_change` into **one** rebuild step at the start of phase 1,
   followed by one republish and re-certify. Each reload costs a re-map of attributes and fact metrics, so
   never plan several. `plan` reports a `source_change` whose text describes a type change.
+- **`wire_relationships`** (`relationships`: a list of `{parent_attribute, child_attribute,
+  relationship_table, type}`, type one_to_many | many_to_many | one_to_one) declares parent-child
+  relationships. `plan` merges them into one `build_mosaic.py wire-relationships` command at the start of
+  phase 3 and ships its hints file as `specs/relationships.json`.
+- **Spec files travel with the plan.** `change_plan.json` has a `files` map (relative path → JSON) that
+  `plan` also writes next to it: the relationship hints, and the spec of any `patch_fact_metrics` action
+  given inline as `args.metrics` (with optional `args.presets`) instead of `args.spec`.
 - **Once-per-entity amounts and weighted averages** on a periodic-snapshot fact (one row per entity per
   period) are `create_level_metric` and `create_weighted_average`, not hand-written formulas: summing the
   raw fact counts an entity once per period, and a plain average weights by row count.
@@ -262,7 +279,8 @@ attributes of their own and `new_forms` as forms, check the lookup); anything el
 `attribute`, `elements`, `and` as a list of lists, `level_rule`, `level_attribute`, `formula`,
 `join`, `format`, `description`, `replace`, `kind`, `object_id`, `json_file`, `spec`; for
 `add_lookup_table`: `csv`, `key_attribute`, `new_attributes`, `new_forms`; for `change_column_type`:
-`column`, `type`, `date_format`, `table`; for `source_change`: `table`, `column`, `change`; for `create_level_metric`: `name`, `source_metric`, `entity_attribute`, `inner`, `outer`;
+`column`, `type`, `date_format`, `table`; for `source_change`: `table`, `column`, `change`; for
+`wire_relationships`: `relationships`; for `patch_fact_metrics`: `spec` or inline `metrics` / `presets`; for `create_level_metric`: `name`, `source_metric`, `entity_attribute`, `inner`, `outer`;
 for `create_weighted_average`: `name`, exactly one of `value_attribute` / `value_metric`, `weight_metric`,
 `entity_attribute`, `numerator_name`, `denominator_name`).
 

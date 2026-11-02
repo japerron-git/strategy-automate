@@ -851,6 +851,67 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
             "column": "FLAG", "change": "new column: Y while the account is open"}}])]}, model_id="MID")
         self.assertEqual(ok["problems"], [])
 
+    def test_source_change_on_a_retyped_column_is_a_problem(self):
+        plan = am.build_plan({"findings": [_finding("F1", "data_type", actions=[
+            {"kind": "change_column_type", "args": {"column": "STATUS CODE", "type": "text"}},
+            {"kind": "source_change", "args": {"column": "status code, REGION", "change": "pad to 2 digits"}}])]},
+            model_id="MID")
+        self.assertTrue(any("'status code' has a source change and a type change" in p for p in plan["problems"]))
+        self.assertFalse(any("REGION" in p for p in plan["problems"]))
+
+    def test_relationships_ship_their_hints_file(self):
+        doc = {"findings": [
+            _finding("F1", "relationship", actions=[{"kind": "wire_relationships", "args": {"relationships": [
+                {"parent_attribute": "region", "child_attribute": "store", "relationship_table": "sales",
+                 "type": "one_to_many"}]}}]),
+            _finding("F2", "attribute", actions=[{"kind": "wire_relationships", "args": {"relationships": [
+                {"parent_attribute": "year", "child_attribute": "month", "relationship_table": "calendar"}]}}])]}
+        plan = am.build_plan(doc, model_id="MID")
+        self.assertEqual(plan["problems"], [])
+        (p3,) = plan["phases"]
+        (step,) = p3["steps"]
+        self.assertEqual(step["apply"]["argv"][2:], ["wire-relationships", "--model-id", "MID", "--hints",
+                                                     "specs/relationships.json"])
+        self.assertEqual(step["dry_run"]["argv"][-1], "--dry-run")
+        self.assertEqual([r["child_attribute"] for r in plan["files"]["specs/relationships.json"]["relationships"]],
+                         ["store", "month"])
+        bad = am.build_plan({"findings": [_finding("F1", "relationship", actions=[{"kind": "wire_relationships",
+            "args": {"relationships": [{"parent_attribute": "a", "child_attribute": "b", "type": "many"}]}}])]},
+            model_id="MID")
+        text = " | ".join(bad["problems"])
+        self.assertIn("missing ['relationship_table']", text)
+        self.assertIn("'many' is not one of", text)
+
+    def test_inline_fact_metric_spec_becomes_a_bundle_file(self):
+        doc = {"findings": [_finding("F7", "metric_defect", actions=[{"kind": "patch_fact_metrics", "args": {
+            "metrics": [{"name": "rate", "function": "avg"}]}}])]}
+        plan = am.build_plan(doc, model_id="MID")
+        (step,) = plan["phases"][0]["steps"]
+        self.assertEqual(step["apply"]["argv"][-2:], ["--spec", "specs/F7_fact_metrics.json"])
+        self.assertEqual(plan["files"]["specs/F7_fact_metrics.json"], {"metrics": [{"name": "rate", "function": "avg"}]})
+        self.assertNotIn("spec", doc["findings"][0]["actions"][0]["args"])       # the input is left alone
+
+    def test_display_column_as_attribute_is_a_warning(self):
+        lk = {"kind": "add_lookup_table", "args": {"csv": "c.csv", "key_attribute": "status",
+                                                    "new_attributes": ["status description", "group"]}}
+        plan = am.build_plan({"findings": [_finding("F1", "lookup", actions=[lk])]}, model_id="MID")
+        self.assertEqual([w for w in plan["warnings"] if "display column" in w],
+                         ["F1: 'status description' looks like a display column; list it under new_forms unless a "
+                          "metric will filter on it"])
+        self.assertIn("Leave out the CSV's source column", plan["phases"][0]["steps"][0]["manual"])
+
+    def test_plan_cli_writes_spec_files(self):
+        d = tempfile.mkdtemp(prefix="assess-plan-")
+        self.addCleanup(shutil.rmtree, d, True)
+        fp = os.path.join(d, "findings.json")
+        with open(fp, "w", encoding="utf-8") as f:
+            json.dump({"findings": [_finding("F7", "metric_defect", actions=[{"kind": "patch_fact_metrics", "args": {
+                "metrics": [{"name": "rate", "function": "avg"}]}}])]}, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            am.main(["plan", "--findings", fp, "--model-id", "MID", "--out", os.path.join(d, "change_plan.json")])
+        with open(os.path.join(d, "specs", "F7_fact_metrics.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["metrics"][0]["function"], "avg")
+
     def test_source_change_needs_a_change(self):
         plan = am.build_plan({"findings": [_finding("F1", "source_data", actions=[
             {"kind": "source_change", "args": {"column": "X"}}])]}, model_id="MID")
@@ -878,6 +939,9 @@ class LookupTests(unittest.TestCase):
         self.assertEqual(set(sugg), {"status code", "snapshot month"})
         self.assertIn("explained only in the description", sugg["status code"]["reason"])
         self.assertEqual(sugg["snapshot month"]["kind"], "period_lookup")
+        self.assertEqual((sugg["status code"]["new_forms"], sugg["status code"]["new_attributes"]),
+                         (["status code description"], []))                  # descriptions are display forms
+        self.assertIn("latest period flag", sugg["snapshot month"]["new_attributes"])   # filtered on
 
         self.scope["attributes"].append({"name": "latest period flag", "type": "varchar", "description": "",
                                          "profile": {"distinct_values": 2, "values": ["N", "Y"]}})

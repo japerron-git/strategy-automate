@@ -24,6 +24,7 @@ repo. Nothing here writes to the model: plan only prints build_mosaic.py command
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import json
@@ -67,10 +68,14 @@ CATEGORY_PHASE = {"source_data": 1, "table": 1, "data_type": 2, "lookup": 2, "at
 REPUBLISH_PHASES = (1, 2, 3)
 ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_derived_metric",
                 "create_level_metric", "create_weighted_average", "patch_model_object", "patch_fact_metrics",
-                "add_lookup_table", "change_column_type", "source_change", "publish", "certify", "manual")
+                "add_lookup_table", "change_column_type", "source_change", "wire_relationships", "publish",
+                "certify", "manual")
 COLUMN_TYPES = ("text", "integer", "bigint", "double", "date", "timestamp")   # build_mosaic.py set-column-types
 # Changes made once for the whole plan, at the start of one phase; other phases get a note.
-MERGED_KINDS = {"source_change": 1, "change_column_type": 2}
+MERGED_KINDS = {"source_change": 1, "change_column_type": 2, "wire_relationships": 3}
+RELATIONSHIP_TYPES = ("one_to_many", "many_to_many", "one_to_one")
+RELATIONSHIP_HINTS = "specs/relationships.json"   # written into the bundle by plan; scripts run from the repo root
+_DISPLAY_COLUMN = re.compile(r"\b(description|desc|name|label|title|text)$", re.I)
 # A source_change whose text describes a type change: that is change_column_type, done in the model.
 _TYPE_CHANGE_TEXT = re.compile(r"\b(data ?type|column type|varchar|utf8|retype)\b|\b(load|reload|re-load|read|cast|"
                                r"convert|change|store)\w*\b[^.;]*\b(as|to|into)\s+(a\s+)?(text|string|varchar|double|"
@@ -841,7 +846,8 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                     "reason": "coded values with no description form or attribute"
                               + ("; the codes are explained only in the description text" if "=" in desc or ":" in desc
                                  else ""),
-                    "columns": [a["name"], f"{a['name']} description", "source"]})
+                    "columns": [a["name"], f"{a['name']} description", "source"],
+                    "new_forms": [f"{a['name']} description"], "new_attributes": []})
     period_attr = period
     if not period_attr:
         dated = [a for a in attrs if (a.get("type", "").lower() in ("date", "timestamp") or looks_like_integer_date(a))
@@ -855,7 +861,8 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
         out.append({"id": f"L-{_slug(period_attr)}", "kind": "period_lookup", "attribute": period_attr,
                     "reason": "no latest-period flag: point-in-time metrics resolve 'latest' per group without one, "
                               "and calendar parents (year, quarter) need a period table",
-                    "columns": [period_attr, "year", "quarter", "month", "latest period flag"]})
+                    "columns": [period_attr, "year", "quarter", "month", "latest period flag"],
+                    "new_forms": ["month"], "new_attributes": ["year", "quarter", "latest period flag"]})
     if relationships:
         static = (relationships.get("suggestions") or {}).get("entity_level_attributes") or []
         if len(static) >= 5:
@@ -970,6 +977,7 @@ def lookup_steps(args: dict) -> str:
     steps += [f"Give the CSV's key column the same type as '{key}' (codes such as 01 stay text; set-column-types "
               f"can change it after the table is added).",
               f"Check that '{key}' uses the new table as its lookup (auto-detection may keep the fact table).",
+              "Leave out the CSV's source column, if it has one: it records where each value came from.",
               "The phase republishes once at the end; then re-run the questions that depend on this lookup."]
     return " ".join(f"{i}. {t}" for i, t in enumerate(steps, 1))
 
@@ -1197,6 +1205,19 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         argv = base + ["set-column-types", "--model-id", model_id] + column_type_set_args([a])
         opt(argv, "--table", "table")
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
+    if kind == "wire_relationships":
+        rels = a.get("relationships")
+        if not isinstance(rels, list) or not rels:
+            problems.append(f"{kind}: args.relationships must list parent_attribute, child_attribute, "
+                            f"relationship_table and type")
+        for r in rels if isinstance(rels, list) else []:
+            missing = [k for k in ("parent_attribute", "child_attribute", "relationship_table") if not r.get(k)]
+            if missing:
+                problems.append(f"{kind}: a relationship is missing {missing}")
+            if r.get("type", "one_to_many") not in RELATIONSHIP_TYPES:
+                problems.append(f"{kind}: type '{r.get('type')}' is not one of {', '.join(RELATIONSHIP_TYPES)}")
+        argv = base + ["wire-relationships", "--model-id", model_id, "--hints", RELATIONSHIP_HINTS]
+        return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "add_lookup_table":
         need("csv", "key_attribute")
         return {"dry_run": None, "apply": None, "manual": lookup_steps(a), "problems": problems}
@@ -1249,6 +1270,7 @@ def _order(findings: list[dict], problems: list[str]) -> list[dict]:
 def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, ...] = PLANNED_STATUSES,
                python: str = "python3", quoting: str = "posix", project: str = "",
                bank: str = "question_bank.json") -> dict[str, Any]:
+    findings_doc = copy.deepcopy(findings_doc)    # inline specs become file paths below; leave the input alone
     problems: list[str] = list(check_findings(findings_doc)["problems"])
     warnings: list[str] = []
     every = findings_doc.get("findings") or []
@@ -1305,7 +1327,52 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
              "manual": None,
              "risks": ["The data changes only after the republish at the end of this phase; check the values "
                        "then (codes keep leading zeros, letter codes survive, dates parse)."]})
+    rels = [dict(r) for c in merged["wire_relationships"] for r in c.get("relationships") or []
+            if isinstance(r, dict)]
+    files: dict[str, Any] = {}
+    if merged["wire_relationships"]:
+        files[RELATIONSHIP_HINTS] = {"relationships": rels}
+        argv = [python, BUILD_SCRIPT, "wire-relationships", "--model-id", mid, "--hints", RELATIONSHIP_HINTS]
+        merged_steps.setdefault(MERGED_KINDS["wire_relationships"], []).append(
+            {"finding": ", ".join(dict.fromkeys(c["finding"] for c in merged["wire_relationships"])),
+             "title": "Declare attribute relationships", "kind": "wire_relationships",
+             "dry_run": cmd(argv + ["--dry-run"]), "apply": cmd(argv), "manual": None,
+             "risks": ["The dry run lists any relationship it cannot wire (unknown attribute or table) and why."]})
     merged_findings = {k: {c["finding"] for c in v} for k, v in merged.items()}
+
+    # A type change can already restore what a source change would rewrite (leading zeros, letter codes):
+    # test the values after the type change, and change the source only if they are still wrong.
+    retyped = {str(c.get("column") or "").casefold(): c["finding"] for c in merged["change_column_type"]}
+    for c in merged["source_change"]:
+        for col in [x.strip() for x in str(c.get("column") or "").split(",") if x.strip()]:
+            if col.casefold() in retyped:
+                problems.append(f"{c['finding']}: '{col}' has a source change and a type change "
+                                f"({retyped[col.casefold()]}); the type change may already restore it. Keep the type "
+                                f"change, add a test of the values after phase 2, and change the source only if "
+                                f"that test fails")
+
+    # Display columns (descriptions, names, labels) are forms unless a metric filters on them.
+    filtered = {str(u).lower() for f in ordered for a in f.get("actions") or []
+                if a.get("kind") == "create_conditional_metric"
+                for u in [(a.get("args") or {}).get("attribute")] + [c[0] for c in (a.get("args") or {}).get("and") or []
+                                                                    if isinstance(c, list) and c]}
+    for f in ordered:
+        for a in f.get("actions") or []:
+            if a.get("kind") != "add_lookup_table":
+                continue
+            for col in (a.get("args") or {}).get("new_attributes") or []:
+                if _DISPLAY_COLUMN.search(str(col)) and str(col).lower() not in filtered:
+                    warnings.append(f"{f['id']}: '{col}' looks like a display column; list it under new_forms "
+                                    f"unless a metric will filter on it")
+
+    # patch_fact_metrics may carry its spec inline (args.metrics): plan writes the file into the bundle.
+    for f in ordered:
+        for i, a in enumerate(f.get("actions") or []):
+            args = a.get("args") or {}
+            if a.get("kind") == "patch_fact_metrics" and isinstance(args.get("metrics"), list) and not args.get("spec"):
+                path = f"specs/{f['id']}_fact_metrics{'_' + str(i + 1) if i else ''}.json"
+                files[path] = {k: args[k] for k in ("presets", "metrics") if k in args}
+                a["args"] = {**args, "spec": path}
 
     # A metric can filter on an attribute, not on a form: flag filters on columns the plan adds as forms.
     forms_added = {str(x).lower(): f["id"] for f in ordered for a in f.get("actions") or []
@@ -1386,7 +1453,8 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
     skipped = [{"id": f.get("id"), "status": f.get("status")} for f in every if f not in chosen]
     return {"version": 1, "model": findings_doc.get("model"), "model_id": model_id or None,
             "generated": time.strftime("%Y-%m-%d"), "statuses_planned": list(statuses),
-            "phases": phases, "not_planned": skipped, "problems": problems, "warnings": warnings}
+            "phases": phases, "files": files, "not_planned": skipped, "problems": problems,
+            "warnings": warnings}
 
 
 # ── check ────────────────────────────────────────────────────────────────────────────────────
@@ -1799,8 +1867,15 @@ def _offline(args: argparse.Namespace) -> int:
         out = build_plan(_load_json(args.findings), model_id=args.model_id, statuses=statuses,
                          python=args.python, quoting=args.quoting, project=args.project, bank=args.bank)
         _write_json(args.out, out)
+        base = os.path.dirname(os.path.abspath(args.out))
+        for rel, content in (out.get("files") or {}).items():   # spec files the commands read (relative paths)
+            dest = os.path.normpath(os.path.join(base, rel))
+            if not dest.startswith(base + os.sep):
+                continue
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            _write_json(dest, content)
         print(json.dumps({"ok": not out["problems"], "out": args.out, "phases": [p["phase"] for p in out["phases"]],
-                          "steps": sum(len(p["steps"]) for p in out["phases"]),
+                          "steps": sum(len(p["steps"]) for p in out["phases"]), "files": sorted(out.get("files") or {}),
                           "problems": out["problems"], "warnings": out["warnings"]}, indent=2))
         return 1 if out["problems"] else 0
     # check
