@@ -27,6 +27,8 @@ Subcommands:
   create-conditional-metric  Filtered derived metric: Sum/Avg/Count of a fact metric or a distinct count
                              of an attribute, ANDed conditions, optional latest/first-period rule.
   delete-derived-metric      Delete one derived metric after a dependents check.
+  create-level-metric        Once-per-entity metric: Sum(Max([M]) {~+, [Entity]+}) {~+} (snapshot facts).
+  create-weighted-average    Weighted average once per entity: numerator + denominator helpers and the ratio.
 
 Authentication
 ~~~~~~~~~~~~~~
@@ -5571,6 +5573,180 @@ def cmd_delete_derived_metric(m: MSTR, args):
     print(json.dumps({"ok": True, "deleted": target, "dependents": dependents}, indent=2))
 
 
+# ── Once-per-entity (level) metrics and weighted averages on snapshot facts ────────────────────
+# Verified shapes: memory/reference_mosaic_derived_metrics.md §0d rules 1 and 2. Tokens with a
+# report_base_level dimty; functions go by name (as the service resolves them).
+
+LEVEL_FUNCTIONS = ("Avg", "Max", "Min", "Sum")
+_RBL_UNIT = {"dimtyUnitType": "report_base_level", "aggregation": "normal", "filtering": "apply", "groupBy": True}
+
+
+def _tok(kind: str, value: str, target: dict | None = None) -> dict:
+    t: dict = {"type": kind, "value": value}
+    if target is not None:
+        t["target"] = dict(target)
+    return t
+
+
+def _chars(text: str) -> list[dict]:
+    return [_tok("character", c) for c in text]
+
+
+def _per_entity(function: str, ref: dict, entity: dict) -> list[dict]:
+    """`Fn([ref]) {~+, [entity]+}`: the value per entity, at report grain."""
+    return ([_tok("function", function), _tok("character", "("), _tok("object_reference", f"[{ref['name']}]", ref),
+             _tok("character", ")")] + _chars("{~+,")
+            + [_tok("object_reference", f"[{entity['name']}]", entity)] + _chars("+}"))
+
+
+def _outer(function: str, inner: list[dict]) -> list[dict]:
+    """`Fn(<inner>) {~+}` closed with end_of_text."""
+    return ([_tok("function", function), _tok("character", "(")] + inner + [_tok("character", ")")]
+            + _chars("{~+}") + [_tok("end_of_text", "")])
+
+
+def level_metric_tokens(source: dict, entity: dict, inner: str = "Max", outer: str = "Sum") -> list[dict]:
+    """`Sum(Max([M]) {~+, [Entity]+}) {~+}`: one value per entity, then added across entities (§0d rule 1).
+    Right at any grouping, unlike a first/last-value rule on the period."""
+    return _outer(outer, _per_entity(inner, source, entity))
+
+
+def weighted_average_tokens(value: dict, weight: dict, entity: dict) -> tuple[list[dict], list[dict]]:
+    """Numerator `Sum(Max([A]){E} * Max([W]){E}){~+}` and denominator `Sum(Max([W]){E} * Max([A]){E} /
+    Max([A]){E}){~+}` (§0d rule 2): `A/A` is NULL for entities with no value, so they drop out of the
+    denominator as they do from the numerator."""
+    num = _outer("Sum", _per_entity("Max", value, entity) + [_tok("character", "*")] + _per_entity("Max", weight, entity))
+    den = _outer("Sum", _per_entity("Max", weight, entity) + [_tok("character", "*")] + _per_entity("Max", value, entity)
+                 + [_tok("character", "/")] + _per_entity("Max", value, entity))
+    return num, den
+
+
+def level_metric_body(name: str, tokens: list[dict], *, description: str = "", fmt_values: list | None = None) -> dict:
+    info = {"name": name, "subType": "metric"}
+    if description:
+        info["description"] = description
+    body: dict = {"information": info, "expression": {"tokens": tokens},
+                  "dimty": {"dimtyUnits": [dict(_RBL_UNIT)], "excludeAttribute": False, "allowAddingUnit": True}}
+    if fmt_values:
+        body["format"] = {"header": [], "values": list(fmt_values)}
+    return body
+
+
+def _source_format(m: MSTR, model_id: str, ref: dict) -> list | None:
+    if ref.get("subType") != "fact_metric":
+        return None
+    r = m.get(f"/api/model/dataModels/{model_id}/factMetrics/{ref['objectId']}")
+    return ((_json_or(r, {}) or {}).get("format") or {}).get("values") if r.ok else None
+
+
+def _require_new_names(derived: list, names: list[str]) -> None:
+    taken = [n for n in names if any((i.get("name") or "").lower() == n.lower() for i in _named(derived, n))]
+    if taken:
+        die(f"derived metric(s) already exist: {taken}. Delete them first (delete-derived-metric) or pick other names.")
+
+
+def _create_metric(m: MSTR, model_id: str, body: dict, label: str) -> str:
+    """POST one derived metric in its own changeset; returns its objectId."""
+    mp = f"/api/model/dataModels/{model_id}"
+    cs = open_cs(m)
+    try:
+        r = m.post(f"{mp}/metrics", params={"showAdvancedProperties": "true"}, json=body)
+        if not r.ok: die(f"create {label}: {format_mstr_error(r)}")
+        metric_id = (_json_or(r, {}).get("information") or {}).get("objectId")
+        if not metric_id: die(f"create {label}: no objectId in response {r.text[:200]}")
+        commit_cs(m, cs)
+    except BaseException:
+        discard_cs(m, cs)
+        raise
+    return metric_id
+
+
+def cmd_create_level_metric(m: MSTR, args):
+    """Create a once-per-entity metric: `Outer(Inner([source]) {~+, [entity]+}) {~+}` — by default
+    Sum(Max(...)): the value is taken once per entity (customer, account, loan...) and added across
+    entities. Use it for amounts repeated on every row of a periodic-snapshot fact (an original amount, a
+    limit, a characteristic), which a plain sum would multiply by the number of periods. Verified shape:
+    memory/reference_mosaic_derived_metrics.md §0d rule 1. One changeset.
+    """
+    description = _check_description(getattr(args, "description", "") or "")
+    m.login(identity=True)
+    facts, derived = _list_model_metrics(m, args.model_id)
+    source = _resolve_metric_operand(_metric_operand_index(facts, derived), args.source_metric)
+    entity = resolve_model_object_ref(m, args.model_id, "attributes", "attribute", args.entity_attribute)
+    _require_new_names(derived, [args.name])
+    fmt = _resolve_metric_format(args.format) if getattr(args, "format", None) else \
+        _source_format(m, args.model_id, source)
+    body = level_metric_body(args.name, level_metric_tokens(source, entity, args.inner, args.outer),
+                             description=description, fmt_values=fmt)
+    if getattr(args, "dry_run", False):
+        print(json.dumps({"ok": True, "dry_run": True, "plan": [
+            {"method": "POST", "path": f"/api/model/dataModels/{args.model_id}/metrics", "body": body}]}, indent=2))
+        return
+    metric_id = _create_metric(m, args.model_id, body, args.name)
+    print(json.dumps({"ok": True, "metric_id": metric_id}, indent=2))
+
+
+def cmd_create_weighted_average(m: MSTR, args):
+    """Create a weighted average taken once per entity, as three derived metrics: a numerator helper
+    (value x weight per entity, summed), a denominator helper (weight of entities that have a value,
+    summed) and the average (numerator / denominator, outer join). The value can be an attribute (a
+    score or ratio stored per entity) or a metric; the weight is a metric (an amount). Verified shape:
+    memory/reference_mosaic_derived_metrics.md §0d rule 2. Each metric goes in its own changeset; if a
+    later step fails, the helpers already created are listed for cleanup with delete-derived-metric.
+    """
+    description = _check_description(getattr(args, "description", "") or "")
+    if bool(getattr(args, "value_attribute", None)) == bool(getattr(args, "value_metric", None)):
+        die("pass exactly one of --value-attribute or --value-metric")
+    m.login(identity=True)
+    facts, derived = _list_model_metrics(m, args.model_id)
+    index = _metric_operand_index(facts, derived)
+    if args.value_attribute:
+        value = resolve_model_object_ref(m, args.model_id, "attributes", "attribute", args.value_attribute)
+    else:
+        value = _resolve_metric_operand(index, args.value_metric)
+    weight = _resolve_metric_operand(index, args.weight_metric)
+    entity = resolve_model_object_ref(m, args.model_id, "attributes", "attribute", args.entity_attribute)
+    num_name = args.numerator_name or f"{args.name} numerator"
+    den_name = args.denominator_name or f"{args.name} denominator"
+    _require_new_names(derived, [args.name, num_name, den_name])
+    num_tokens, den_tokens = weighted_average_tokens(value, weight, entity)
+    helper = f"Helper for {args.name}"
+    num_body = level_metric_body(num_name, num_tokens, fmt_values=_resolve_metric_format("fixed2"),
+                                 description=_check_description(
+                                     f"{helper}: {value['name']} x {weight['name']} per {entity['name']}, summed."))
+    den_body = level_metric_body(den_name, den_tokens, fmt_values=_source_format(m, args.model_id, weight),
+                                 description=_check_description(
+                                     f"{helper}: {weight['name']} of each {entity['name']} that has a "
+                                     f"{value['name']}, summed."))
+    fmt = _resolve_metric_format(args.format) if getattr(args, "format", None) else None
+
+    def avg_body(num_id: str, den_id: str) -> dict:
+        tree = {"type": "operator", "function": "divide", "children": [
+            {"type": "object_reference", "target": {"objectId": num_id, "subType": "metric", "name": num_name}},
+            {"type": "object_reference", "target": {"objectId": den_id, "subType": "metric", "name": den_name}}]}
+        return compound_metric_body(args.name, tree, description=description, join="outer", fmt_values=fmt)
+
+    if getattr(args, "dry_run", False):
+        mp = f"/api/model/dataModels/{args.model_id}/metrics"
+        print(json.dumps({"ok": True, "dry_run": True, "plan": [
+            {"method": "POST", "path": mp, "body": num_body}, {"method": "POST", "path": mp, "body": den_body},
+            {"method": "POST", "path": mp, "body": avg_body("<numerator id>", "<denominator id>")}]}, indent=2))
+        return
+    created: list[dict] = []
+    try:
+        num_id = _create_metric(m, args.model_id, num_body, num_name)
+        created.append({"name": num_name, "objectId": num_id})
+        den_id = _create_metric(m, args.model_id, den_body, den_name)
+        created.append({"name": den_name, "objectId": den_id})
+        avg_id = _create_metric(m, args.model_id, avg_body(num_id, den_id), args.name)
+    except SystemExit:
+        if created:
+            print(f"[cleanup] created before the failure: {created} — remove with delete-derived-metric "
+                  f"--object-id <id> --yes, or rerun after fixing", file=sys.stderr)
+        raise
+    print(json.dumps({"ok": True, "metric_id": avg_id, "numerator_id": num_id, "denominator_id": den_id}, indent=2))
+
+
 def cmd_patch_fact_metrics(m: MSTR, args):
     """Set aggregation function and/or number format on many fact metrics in ONE
     changeset: list → per-metric GET (diff) → PATCH only what differs → commit →
@@ -6484,6 +6660,40 @@ def build_parser():
                     help="delete even when other derived metrics refer to it (they may break)")
     sp.add_argument("--dry-run", action="store_true", help="show the target and its dependents; delete nothing")
 
+    sp = sub.add_parser("create-level-metric",
+        help="Once-per-entity metric Sum(Max([M]) {~+, [Entity]+}) {~+}: for amounts repeated on every row of a "
+             "periodic-snapshot fact (see memory/reference_mosaic_derived_metrics.md §0d rule 1).")
+    sp.add_argument("--model-id", required=True)
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--source-metric", required=True,
+                    help="fact or derived metric: [name], objectId, or fact_metric:/metric: prefix when ambiguous")
+    sp.add_argument("--entity-attribute", required=True,
+                    help="the entity the value belongs to (customer, account, loan...): name or objectId")
+    sp.add_argument("--inner", choices=list(LEVEL_FUNCTIONS), default="Max",
+                    help="per-entity function (default Max: the value repeated on the entity's rows)")
+    sp.add_argument("--outer", choices=list(LEVEL_FUNCTIONS), default="Sum",
+                    help="function across entities (default Sum; Avg for a simple per-entity average)")
+    sp.add_argument("--format", help=f"number format preset: {', '.join(sorted(METRIC_FORMAT_PRESETS))} "
+                                     f"(default: the source fact metric's format)")
+    sp.add_argument("--description", default="", help=f"business description (max {DESCRIPTION_MAX} characters)")
+    sp.add_argument("--dry-run", action="store_true", help="print the request; open no changeset")
+
+    sp = sub.add_parser("create-weighted-average",
+        help="Weighted average taken once per entity, as numerator and denominator helpers plus the ratio "
+             "(see memory/reference_mosaic_derived_metrics.md §0d rule 2).")
+    sp.add_argument("--model-id", required=True)
+    sp.add_argument("--name", required=True, help="name of the average metric")
+    value = sp.add_mutually_exclusive_group(required=True)
+    value.add_argument("--value-attribute", help="attribute holding the value per entity (score, ratio, rate)")
+    value.add_argument("--value-metric", help="metric holding the value per entity")
+    sp.add_argument("--weight-metric", required=True, help="metric to weight by (an amount per entity)")
+    sp.add_argument("--entity-attribute", required=True, help="the entity: name or objectId")
+    sp.add_argument("--numerator-name", help="default: '<name> numerator'")
+    sp.add_argument("--denominator-name", help="default: '<name> denominator'")
+    sp.add_argument("--format", help=f"number format preset for the average: {', '.join(sorted(METRIC_FORMAT_PRESETS))}")
+    sp.add_argument("--description", default="", help=f"business description (max {DESCRIPTION_MAX} characters)")
+    sp.add_argument("--dry-run", action="store_true", help="print the three requests; open no changeset")
+
     sp = sub.add_parser("patch-fact-metrics",
         help="Set aggregation function and/or number format on many fact metrics in one changeset, "
              "then verify by read-back (see memory/reference_mosaic_fact_metric_aggregation.md).")
@@ -6555,6 +6765,8 @@ def main():
             "create-compound-metric": cmd_create_compound_metric,
             "create-conditional-metric": cmd_create_conditional_metric,
             "delete-derived-metric": cmd_delete_derived_metric,
+            "create-level-metric": cmd_create_level_metric,
+            "create-weighted-average": cmd_create_weighted_average,
             "patch-fact-metrics": cmd_patch_fact_metrics,
             "attach-transformation": cmd_attach_transformation,
         }[args.cmd](m, args)

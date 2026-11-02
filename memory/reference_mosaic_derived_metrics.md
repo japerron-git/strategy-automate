@@ -260,7 +260,12 @@ semantics would return the period table's last period for every group.
 (rule 3, distinct count), `--source-metric <M> --function Count` (rule 3, counts rows and keeps a level rule),
 `--level-rule last|first --level-attribute <Period>` (rule 4), repeatable `--and <attribute> <values...>` (rules 6
 and 9); `create-compound-metric --join outer` (rule 7); `delete-derived-metric` (rule 8; lists the derived
-metrics that refer to the target and refuses unless `--force`). Each takes `--dry-run`.
+metrics that refer to the target and refuses unless `--force`); `create-level-metric --source-metric <M>
+--entity-attribute <Entity>` (rule 1, once-per-entity amount; `--inner`/`--outer` default `Max`/`Sum`, format
+defaults to the fact metric's); `create-weighted-average --value-attribute <A> | --value-metric <V>
+--weight-metric <W> --entity-attribute <Entity>` (rule 2: creates the numerator and denominator helpers, then
+their ratio with an outer join, one changeset each, and names any helpers already created if a later step
+fails). Each takes `--dry-run`.
 
 ## 1. Compound metric — ratio of two metrics
 

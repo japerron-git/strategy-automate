@@ -336,6 +336,24 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(am.action_commands({"kind": "publish"}, mid)["apply"][2:], ["publish", "--model-id", mid])
         self.assertIsNone(am.action_commands({"kind": "certify"}, mid)["dry_run"])
 
+    def test_level_metric_and_weighted_average_commands(self):
+        lvl = am.action_commands({"kind": "create_level_metric", "args": {
+            "name": "Original Amount", "source_metric": "Original Amount (raw)", "entity_attribute": "Account",
+            "format": "currency"}}, "MID")
+        self.assertEqual(lvl["apply"][2:], ["create-level-metric", "--model-id", "MID", "--name", "Original Amount",
+                                            "--source-metric", "Original Amount (raw)", "--entity-attribute",
+                                            "Account", "--format", "currency"])
+        wa = am.action_commands({"kind": "create_weighted_average", "args": {
+            "name": "Weighted Avg Score", "value_attribute": "Score", "weight_metric": "Original Amount (raw)",
+            "entity_attribute": "Account"}}, "MID")
+        self.assertEqual(wa["problems"], [])
+        self.assertEqual(wa["dry_run"][-1], "--dry-run")
+        self.assertIn("--value-attribute", wa["apply"])
+        both = am.action_commands({"kind": "create_weighted_average", "args": {
+            "name": "x", "value_attribute": "a", "value_metric": "b", "weight_metric": "w", "entity_attribute": "e"}},
+            "MID")
+        self.assertTrue(any("exactly one" in p for p in both["problems"]))
+
     def test_bad_actions_are_problems(self):
         bad = [
             ({"kind": "create_conditional_metric", "args": {"name": "x", "attribute": "a", "elements": ["1"]}},

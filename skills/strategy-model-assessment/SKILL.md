@@ -230,7 +230,8 @@ Orders approved findings into the seven phases (source data → types and lookup
 relationships → fixes to existing objects → new objects → names, descriptions, formats → publish,
 certify, permissions), respecting `depends_on`. Every change to the source data (new columns, types,
 sentinels) should be a `source_change` action: `plan` merges them all into one rebuild at the start of
-phase 1, so the source is reloaded once. It writes `build_mosaic.py` commands for each action
+phase 1, so the source is reloaded once. Once-per-entity amounts and weighted averages on snapshot facts
+are `create_level_metric` and `create_weighted_average` actions. It writes `build_mosaic.py` commands for each action
 it knows (a `--dry-run` command and an apply command), manual steps otherwise. Each phase lists:
 
 - **Before:** a backup copy of the model; for any attribute removal or replacement, the derived

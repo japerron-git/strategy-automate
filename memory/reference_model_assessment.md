@@ -228,8 +228,8 @@ Result column names in `key` / `measures` must match the SQL aliases.
                "decision_note": ""}]}
 ```
 `phase` defaults from `category` (table above). Action kinds `plan` turns into commands:
-`create_conditional_metric`, `create_compound_metric`, `delete_derived_metric`,
-`patch_model_object`, `patch_fact_metrics`, `publish`, `certify`, `add_lookup_table` (manual
+`create_conditional_metric`, `create_compound_metric`, `create_level_metric`,
+`create_weighted_average`, `delete_derived_metric`, `patch_model_object`, `patch_fact_metrics`, `publish`, `certify`, `add_lookup_table` (manual
 steps: add the CSV, map it to the existing attribute, create `new_attributes` as attributes of their own and
 `new_forms` as forms, check the lookup, republish) and `source_change` (see below); anything else is
 `manual` with `steps`.
@@ -240,11 +240,18 @@ steps: add the CSV, map it to the existing attribute, create `new_attributes` as
 - **`source_change`** (`table`, `column`, `change`) describes one change to the source data: a new
   column, a type change, sentinels to NULL, padding. `plan` gathers every `source_change` in the plan,
   from any phase, into **one** rebuild step at the start of phase 1, followed by one republish and
-  re-certify. Each reload costs a re-map of attributes and fact metrics, so never plan several. `args` use the CLI option names without dashes (`source_metric`, `count_attribute`,
+  re-certify. Each reload costs a re-map of attributes and fact metrics, so never plan several.
+- **Once-per-entity amounts and weighted averages** on a periodic-snapshot fact (one row per entity per
+  period) are `create_level_metric` and `create_weighted_average`, not hand-written formulas: summing the
+  raw fact counts an entity once per period, and a plain average weights by row count.
+
+`args` use the CLI option names without dashes (`source_metric`, `count_attribute`,
 `attribute`, `elements`, `and` as a list of lists, `level_rule`, `level_attribute`, `formula`,
 `join`, `format`, `description`, `replace`, `kind`, `object_id`, `json_file`, `spec`; for
 `add_lookup_table`: `csv`, `key_attribute`, `new_attributes`, `new_forms`; for `source_change`: `table`,
-`column`, `change`).
+`column`, `change`; for `create_level_metric`: `name`, `source_metric`, `entity_attribute`, `inner`, `outer`;
+for `create_weighted_average`: `name`, exactly one of `value_attribute` / `value_metric`, `weight_metric`,
+`entity_attribute`, `numerator_name`, `denominator_name`).
 
 **change_plan.json** (written by `plan`): phases in order, each with its steps (finding id, action,
 dry-run command, apply command), `before`, `unit_tests`, `regression` and `after` lists.

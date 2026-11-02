@@ -66,8 +66,8 @@ CATEGORY_PHASE = {"source_data": 1, "table": 1, "data_type": 2, "lookup": 2, "at
                   "format": 6, "discoverability": 6, "governance": 7, "performance": 7}
 REPUBLISH_PHASES = (1, 2, 3)
 ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_derived_metric",
-                "patch_model_object", "patch_fact_metrics", "add_lookup_table", "source_change", "publish", "certify",
-                "manual")
+                "create_level_metric", "create_weighted_average", "patch_model_object", "patch_fact_metrics",
+                "add_lookup_table", "source_change", "publish", "certify", "manual")
 
 
 # ── small helpers ─────────────────────────────────────────────────────────────────────────────
@@ -1116,6 +1116,28 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
             opt(argv, flag, key)
         if a.get("replace"):
             argv.append("--replace")
+        return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
+    if kind == "create_level_metric":
+        need("name", "source_metric", "entity_attribute")
+        argv = base + ["create-level-metric", "--model-id", model_id, "--name", str(a.get("name", "")),
+                       "--source-metric", str(a.get("source_metric", "")),
+                       "--entity-attribute", str(a.get("entity_attribute", ""))]
+        for flag, key in (("--inner", "inner"), ("--outer", "outer"), ("--format", "format"),
+                          ("--description", "description")):
+            opt(argv, flag, key)
+        return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
+    if kind == "create_weighted_average":
+        need("name", "weight_metric", "entity_attribute")
+        if bool(a.get("value_attribute")) == bool(a.get("value_metric")):
+            problems.append(f"{kind}: give exactly one of args.value_attribute or args.value_metric")
+        argv = base + ["create-weighted-average", "--model-id", model_id, "--name", str(a.get("name", ""))]
+        opt(argv, "--value-attribute", "value_attribute")
+        opt(argv, "--value-metric", "value_metric")
+        argv += ["--weight-metric", str(a.get("weight_metric", "")), "--entity-attribute",
+                 str(a.get("entity_attribute", ""))]
+        for flag, key in (("--numerator-name", "numerator_name"), ("--denominator-name", "denominator_name"),
+                          ("--format", "format"), ("--description", "description")):
+            opt(argv, flag, key)
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "delete_derived_metric":
         if not a.get("name") and not a.get("object_id"):
