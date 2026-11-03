@@ -39,6 +39,16 @@ the new type applies at the next republish. In the verified run (13 columns: int
 date, text → double) the service also updated the attribute forms and fact metrics that read those columns,
 so a second pass to align them found nothing to write. `build_mosaic.py set-column-types` does both steps.
 
+## Formula attributes (verified 2026-10-30/31)
+`POST /api/model/dataModels/{mid}/attributes` in a changeset, one ID form (system form id
+`45C11FA478E745FEA08D781CEA190FE5`, `category: ID`) whose expression is tokens, never text: `function`,
+`character` (operators, parentheses, commas), `column_reference` with the column's objectId, `integer`,
+then `end_of_text`. Include `keyForm`, `attributeLookupTable` and report/browse `displays`, or the commit
+is refused. The server infers the form's type from the column inside the formula, so `Year([a date])`
+comes back as a date unless `dataType` is set to integer. Confirmed: `AddMonths([PERIOD], -1)`,
+`Year([date])`, `MonthsBetween([a], [b])`. String literals and decimals are unconfirmed.
+`build_mosaic.py create-formula-attribute` sends this shape.
+
 ## Column objectIds (the #1 trap)
 - After `POST .../tables`, column objectIds are **visible inside the changeset** but are **ephemeral until commit**. A subsequent attribute/metric that references those IDs in the same uncommitted changeset will fail at commit with `Object with ID '...' and type 26 (Column) is not found in metadata`.
 - Safe ordering: **commit tables first**, then re-`GET /api/model/dataModels/{mid}/tables/{tid}?showColumns=true` to capture the post-commit column objectIds, then open a new changeset for attributes/metrics.

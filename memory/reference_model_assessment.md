@@ -238,9 +238,21 @@ check the lookup); anything else is `manual` with `steps`. Lookup suggestions sa
 label column is listed as an attribute that no metric filters on.
 
 - **Fix it in the model first; change the source last.** Before proposing a `source_change`, check
-  whether the model can make the fix itself: a column type or date format is `change_column_type`; a
-  value derived from other columns can be an attribute form or a metric formula. Only a change the model
-  cannot express (new data, values that must be rewritten) needs the source changed and reloaded.
+  whether the model can make the fix itself: a column type or date format is `change_column_type`.
+  Only a change the model cannot express (new data, values that must be rewritten) needs the source
+  changed and reloaded.
+- **Where a new column comes from, in order of preference:**
+  1. **A lookup table** for anything that depends on one attribute's value: descriptions, groups and
+     flags of a code (`code_lookup`), calendar parents of a date (`date_lookup`: year and quarter; the
+     reporting period's `period_lookup` adds the latest-period flag). A lookup is fast at run time, and it
+     can be replaced later without deleting the metrics built on it.
+  2. **A derived metric** for any calculation over measures. Create these freely.
+  3. **A derived (formula) attribute** (`create_formula_attribute`) only when the user asks for one:
+     it costs at run time, and a derived metric that filters on it or counts it is deleted if the
+     attribute is ever replaced. `plan` refuses one without `args.requested_by_user: true`, and warns
+     when a derived metric in the plan is built on one.
+  4. **A source change** when none of these can produce it, for example a row-level state that depends
+     on a blank (a blank key matches no lookup row).
 - **Change the type first, test, then decide on the source.** A column read with the wrong type often
   comes back right once the type changes (leading zeros, letter codes), because the source still holds the
   original text. `plan` reports a column that has both a `change_column_type` and a `source_change`: keep
@@ -267,6 +279,11 @@ label column is listed as an attribute that no metric filters on.
   their zeros). `plan` gathers every `source_change` into **one** rebuild step at the start of phase 1,
   followed by one republish and re-certify. Each reload costs a re-map of attributes and fact metrics, so
   never plan several. `plan` reports a `source_change` whose text describes a type change.
+- **`create_formula_attribute`** (`name`, `formula` in Strategy syntax with `[COLUMNS]`, `description`,
+  `display_format` text | number | date, `data_type`, `table`, `update`, `requested_by_user`,
+  `unverified_ok`): verified live for functions, columns and integers (`AddMonths([PERIOD], -1)`,
+  `Year([date])` typed integer, `MonthsBetween`). String literals and decimals are unconfirmed and need
+  `unverified_ok`. Republish afterwards.
 - **`wire_relationships`** (`relationships`: a list of `{parent_attribute, child_attribute,
   relationship_table, type}`, type one_to_many | many_to_many | one_to_one; `relationship_table` optional
   on a one-table model, matched loosely otherwise) declares parent-child
@@ -284,7 +301,7 @@ label column is listed as an attribute that no metric filters on.
 `join`, `format`, `description`, `replace`, `kind`, `object_id`, `json_file`, `spec`; for
 `add_lookup_table`: `csv`, `key_attribute`, `new_attributes`, `new_forms`; for `change_column_type`:
 `column`, `type`, `date_format`, `table`; for `source_change`: `table`, `column`, `change`; for
-`wire_relationships`: `relationships`; for `patch_fact_metrics`: `spec` or inline `metrics` / `presets`; for `create_level_metric`: `name`, `source_metric`, `entity_attribute`, `inner`, `outer`;
+`wire_relationships`: `relationships`; for `create_formula_attribute`: see above; for `patch_fact_metrics`: `spec` or inline `metrics` / `presets`; for `create_level_metric`: `name`, `source_metric`, `entity_attribute`, `inner`, `outer`;
 for `create_weighted_average`: `name`, exactly one of `value_attribute` / `value_metric`, `weight_metric`,
 `entity_attribute`, `numerator_name`, `denominator_name`).
 

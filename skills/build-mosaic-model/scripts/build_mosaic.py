@@ -30,6 +30,7 @@ Subcommands:
   create-level-metric        Once-per-entity metric: Sum(Max([M]) {~+, [Entity]+}) {~+} (snapshot facts).
   create-weighted-average    Weighted average once per entity: numerator + denominator helpers and the ratio.
   set-column-types           Change column types in the model (table + pipeline), no reload; republish after.
+  create-formula-attribute   Attribute computed from columns (prefer a lookup table); republish after.
 
 Authentication
 ~~~~~~~~~~~~~~
@@ -6047,6 +6048,124 @@ def cmd_set_column_types(m: MSTR, args):
                      indent=2))
 
 
+# ── create-formula-attribute: an attribute computed from the table's columns ─────────────────
+# Ported from runs that worked live (AddMonths([PERIOD], -1); Year([date]) typed integer; MonthsBetween).
+# Prefer a lookup table: it is faster at run time, and it can be replaced without deleting the derived
+# metrics built on it. Create a formula attribute only when the user asks for one.
+
+_ID_FORM = "45C11FA478E745FEA08D781CEA190FE5"     # the system ID form
+_FORMULA_TOKEN = _re.compile(r"""\s*(?:
+    (?P<col>\[[^\]]+\])            |
+    (?P<str>'(?:[^']|'')*')        |
+    (?P<num>\d+(?:\.\d+)?)         |
+    (?P<op><=|>=|<>|[(),+\-*/=<>]) |
+    (?P<id>[A-Za-z_][A-Za-z0-9_]*)
+)""", _re.X)
+
+
+def formula_attribute_tokens(formula: str, cols: dict[str, tuple[str, str]]) -> tuple[list[dict], list[str]]:
+    """Strategy formula over [COLUMNS] -> (tokens, unverified token kinds used). Verified live: functions,
+    [columns], integers, operators. String literals and decimals have not been confirmed on a tenant."""
+    toks, unverified, pos, text = [], [], 0, formula.strip()
+    while pos < len(text):
+        hit = _FORMULA_TOKEN.match(text, pos)
+        if not hit or hit.end() == pos:
+            die(f"cannot read the formula at: {text[pos:pos + 20]!r}")
+        pos = hit.end()
+        if hit.group("col"):
+            name = hit.group("col")[1:-1]
+            if name.casefold() not in cols:
+                die(f"unknown column [{name}]; columns: {sorted(c[1] for c in cols.values())}")
+            cid, cname = cols[name.casefold()]
+            toks.append(_colref_token(cid, cname))
+        elif hit.group("str"):
+            toks.append({"type": "string", "value": hit.group("str")})
+            unverified.append("string literal")
+        elif hit.group("num"):
+            v = hit.group("num")
+            toks.append({"type": "real" if "." in v else "integer", "value": v})
+            if "." in v:
+                unverified.append("decimal")
+        elif hit.group("op"):
+            toks.append({"type": "character", "value": hit.group("op")})
+        else:
+            word = hit.group("id")
+            toks.append({"type": "function" if text[pos:].lstrip()[:1] == "(" else "identifier", "value": word})
+    return toks + [{"type": "end_of_text", "value": ""}], sorted(set(unverified))
+
+
+def formula_attribute_body(name: str, tokens: list[dict], table_ref: dict, *, description: str = "",
+                           display_format: str = "text", data_type: str | None = None) -> dict:
+    form = {"id": _ID_FORM, "category": "ID", "type": "system", "displayFormat": display_format, "name": "ID",
+            "expressions": [{"expression": {"tokens": tokens}, "tables": [table_ref]}], "lookupTable": table_ref}
+    if data_type:
+        form["dataType"] = dict(COLUMN_TYPES[data_type])
+    shown = [{"id": _ID_FORM, "name": "ID"}]
+    return {"information": {"name": name, "description": description}, "forms": [form],
+            "keyForm": {"id": _ID_FORM}, "attributeLookupTable": table_ref,
+            "displays": {"reportDisplays": shown, "browseDisplays": list(shown)}}
+
+
+def cmd_create_formula_attribute(m: MSTR, args):
+    """Create (or, with --update, rewrite) an attribute whose ID form is a formula over the table's columns.
+    One changeset. Republish afterwards for it to hold data. Prefer a lookup table where one can do the job."""
+    if args.data_type and args.data_type not in COLUMN_TYPES:
+        die(f"--data-type must be one of {', '.join(COLUMN_TYPES)}")
+    m.login(identity=True)
+    mid = args.model_id
+    r = m.post(f"/api/model/dataModels/{mid}/export")
+    if not r.ok:
+        die(f"export model: {format_mstr_error(r)}")
+    model = (r.json().get("model") or [{}])[0]
+    table = _pick_table(model.get("tables") or [], args.table)
+    tinfo = table["information"]
+    table_ref = {"objectId": tinfo["objectId"], "subType": "logical_table", "name": tinfo["name"]}
+    cols = {c["columnName"].casefold(): (c["information"]["objectId"], c["columnName"])
+            for c in table["physicalTable"]["columns"]}
+    tokens, unverified = formula_attribute_tokens(args.formula, cols)
+    if unverified:
+        _require_unverified_ok(args, "create-formula-attribute",
+                               f"the formula uses {', '.join(unverified)}, which no live run has confirmed.")
+    existing = {(a.get("information") or {}).get("name", "").casefold(): a for a in model.get("attributes") or []}
+    current = existing.get(args.name.casefold())
+    if args.update:
+        if not current:
+            die(f"no attribute named '{args.name}' to update")
+        aid = current["information"]["objectId"]
+        g = m.get(f"/api/model/dataModels/{mid}/attributes/{aid}")
+        if not g.ok:
+            die(f"GET attribute: {format_mstr_error(g)}")
+        forms = (g.json() or {}).get("forms") or []
+        if len(forms) != 1:
+            die(f"'{args.name}' has {len(forms)} forms; --update handles single-form attributes only")
+        f = {k: v for k, v in forms[0].items() if k != "translations"}
+        f["expressions"] = [{"expression": {"tokens": tokens}, "tables": [table_ref]}]
+        if args.data_type:
+            f["dataType"] = dict(COLUMN_TYPES[args.data_type])
+        f["displayFormat"] = args.display_format or f.get("displayFormat") or "text"
+        method, path, body = "PATCH", f"/api/model/dataModels/{mid}/attributes/{aid}", {"forms": [f]}
+    else:
+        if current:
+            die(f"an attribute named '{args.name}' exists; pass --update to rewrite its formula")
+        method, path = "POST", f"/api/model/dataModels/{mid}/attributes"
+        body = formula_attribute_body(args.name, tokens, table_ref, description=args.description or "",
+                                      display_format=args.display_format or "text", data_type=args.data_type)
+    if args.dry_run:
+        print(json.dumps({"ok": True, "dry_run": True, "method": method, "path": path, "body": body}, indent=2))
+        return
+    cs = open_cs(m)
+    try:
+        w = m.patch(path, json=body) if method == "PATCH" else m.post(path, json=body)
+        if not w.ok:
+            die(f"{method} attribute '{args.name}': {format_mstr_error(w)}")
+        commit_cs(m, cs)
+    except BaseException:
+        discard_cs(m, cs)
+        raise
+    print(json.dumps({"ok": True, "attribute": args.name, "updated": bool(args.update),
+                      "next": "republish the model for the attribute to hold data"}, indent=2))
+
+
 def cmd_patch_fact_metrics(m: MSTR, args):
     """Set aggregation function and/or number format on many fact metrics in ONE
     changeset: list → per-metric GET (diff) → PATCH only what differs → commit →
@@ -6994,6 +7113,22 @@ def build_parser():
     sp.add_argument("--description", default="", help=f"business description (max {DESCRIPTION_MAX} characters)")
     sp.add_argument("--dry-run", action="store_true", help="print the three requests; open no changeset")
 
+    sp = sub.add_parser("create-formula-attribute",
+        help="Attribute computed from the table's columns (e.g. Year([FIRST DATE])). Prefer a lookup table: "
+             "faster, and replaceable without deleting the metrics built on it. Republish afterwards.")
+    sp.add_argument("--model-id", required=True)
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--formula", required=True, help="Strategy syntax, columns in [brackets]")
+    sp.add_argument("--description", default="")
+    sp.add_argument("--display-format", choices=["text", "number", "date"])
+    sp.add_argument("--data-type", help="text | integer | bigint | double | date | timestamp (Year() of a date "
+                                        "comes back as a date unless you set integer)")
+    sp.add_argument("--table", help="table name (default: the table with the most columns)")
+    sp.add_argument("--update", action="store_true", help="rewrite the formula of an existing single-form attribute")
+    sp.add_argument("--unverified-ok", action="store_true",
+                    help="send a formula with string literals or decimals (not yet confirmed live)")
+    sp.add_argument("--dry-run", action="store_true", help="print the request; open no changeset")
+
     sp = sub.add_parser("set-column-types",
         help="Change column types in the model without reloading the source (table + pipeline, then the "
              "attribute forms and fact metrics that read them); republish afterwards.")
@@ -7079,6 +7214,7 @@ def main():
             "delete-derived-metric": cmd_delete_derived_metric,
             "create-level-metric": cmd_create_level_metric,
             "create-weighted-average": cmd_create_weighted_average,
+            "create-formula-attribute": cmd_create_formula_attribute,
             "set-column-types": cmd_set_column_types,
             "patch-fact-metrics": cmd_patch_fact_metrics,
             "attach-transformation": cmd_attach_transformation,

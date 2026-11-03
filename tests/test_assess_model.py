@@ -757,9 +757,28 @@ class EarlyStageSignalTests(unittest.TestCase):
 
     def test_numeric_codes_and_integer_periods_get_lookups(self):
         sugg = {s["attribute"]: s["kind"] for s in am.lookup_suggestions(self.SCOPE)}
-        self.assertEqual(sugg, {"status code": "code_lookup", "reporting period": "period_lookup"})
+        self.assertEqual(sugg, {"status code": "code_lookup", "reporting period": "period_lookup",
+                                "close date": "date_lookup"})
         self.assertEqual(am._period_parts("201,912"), ("2019", "2019-Q4", "12"))
         self.assertEqual(am._period_parts("20200301"), ("2020", "2020-Q1", "03"))
+
+
+    def test_date_lookup_gives_calendar_parents_as_attributes(self):
+        (sug,) = [x for x in am.lookup_suggestions(self.SCOPE) if x["kind"] == "date_lookup"]
+        self.assertEqual(sug["columns"], ["close date", "close date year", "close date quarter"])
+        self.assertEqual((sug["new_attributes"], sug["new_forms"]), (["close date year", "close date quarter"], []))
+        self.assertIn("preferred to a derived attribute", sug["reason"])
+        scope = {"model": "Store Sales", "attributes": [{**self.SCOPE["attributes"][1], "profile": {
+            "distinct_values": 2, "min": "20200301", "max": "20211201", "values": ["20200301", "20211201"]}}]}
+        d = tempfile.mkdtemp(prefix="assess-datelookup-")
+        self.addCleanup(shutil.rmtree, d, True)
+        (done,) = am.build_lookups(None, "p", scope, [sug], d)
+        with open(done["csv"], encoding="utf-8", newline="") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(rows, [["close date", "close date year", "close date quarter"],
+                                ["20200301", "2020", "2020-Q1"], ["20211201", "2021", "2021-Q4"]])
+        named = {**self.SCOPE, "attributes": self.SCOPE["attributes"] + [{"name": "close date year", "type": "bigint"}]}
+        self.assertNotIn("date_lookup", [x["kind"] for x in am.lookup_suggestions(named)])
 
 
 class SourceChangeAndLookupStepTests(unittest.TestCase):
@@ -925,6 +944,26 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
             am.main(["plan", "--findings", fp, "--model-id", "MID", "--out", os.path.join(d, "change_plan.json")])
         with open(os.path.join(d, "specs", "F7_fact_metrics.json"), encoding="utf-8") as f:
             self.assertEqual(json.load(f)["metrics"][0]["function"], "avg")
+
+    def test_formula_attribute_needs_the_users_request_and_warns_dependents(self):
+        fa = {"kind": "create_formula_attribute", "args": {"name": "close year", "formula": "Year([CLOSE DATE])",
+                                                         "data_type": "integer"}}
+        cm = {"kind": "create_conditional_metric", "args": {"name": "Closed 2021", "count_attribute": "account",
+                                                            "attribute": "close year", "elements": ["2021"]}}
+        plan = am.build_plan({"findings": [_finding("F1", "attribute", actions=[fa]),
+                                           _finding("F2", "missing_metric", actions=[cm])]}, model_id="MID")
+        self.assertTrue(any("Prefer a lookup table" in p and "requested_by_user" in p for p in plan["problems"]))
+        self.assertTrue(any("built on 'close year', a derived attribute" in w for w in plan["warnings"]))
+        fa["args"].update(requested_by_user=True)
+        plan = am.build_plan({"findings": [_finding("F1", "attribute", actions=[fa])]}, model_id="MID")
+        self.assertEqual(plan["problems"], [])
+        (step,) = plan["phases"][0]["steps"]
+        self.assertEqual(step["apply"]["argv"][2:], ["create-formula-attribute", "--model-id", "MID", "--name",
+                                                     "close year", "--formula", "Year([CLOSE DATE])",
+                                                     "--data-type", "integer"])
+        fa["args"].update(formula="CaseV([CODE], '01', 'Y', 'N')")
+        plan = am.build_plan({"findings": [_finding("F1", "attribute", actions=[fa])]}, model_id="MID")
+        self.assertTrue(any("string literal" in w for w in plan["warnings"]))
 
     def test_source_change_needs_a_change(self):
         plan = am.build_plan({"findings": [_finding("F1", "source_data", actions=[

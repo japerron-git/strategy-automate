@@ -232,7 +232,9 @@ certify, permissions), respecting `depends_on`. Fix things in the model first: a
 format is a `change_column_type` action (made in the model, no reload; `plan` merges them into one
 `set-column-types` command per table at the start of phase 2). Only changes the model cannot make (new
 data, rewritten values, sentinels) are `source_change` actions: `plan` merges them all into one rebuild at
-the start of phase 1, so the source is reloaded once. Change a column's type before rewriting its values:
+the start of phase 1, so the source is reloaded once. A new column comes from a lookup table first (codes,
+calendar parents of dates), a derived metric for calculations, and a derived attribute only when the user
+asks for one. Change a column's type before rewriting its values:
 `plan` reports a column with both. An empty column is described, not filled. Relationships are a
 `wire_relationships` action (one command in phase 3); `plan` writes the spec files its commands read
 (`files` in change_plan.json). Once-per-entity amounts and weighted averages on snapshot facts

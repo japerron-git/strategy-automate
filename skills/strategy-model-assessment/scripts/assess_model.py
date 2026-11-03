@@ -68,8 +68,8 @@ CATEGORY_PHASE = {"source_data": 1, "table": 1, "data_type": 2, "lookup": 2, "at
 REPUBLISH_PHASES = (1, 2, 3)
 ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_derived_metric",
                 "create_level_metric", "create_weighted_average", "patch_model_object", "patch_fact_metrics",
-                "add_lookup_table", "change_column_type", "source_change", "wire_relationships", "publish",
-                "certify", "manual")
+                "add_lookup_table", "change_column_type", "source_change", "wire_relationships",
+                "create_formula_attribute", "publish", "certify", "manual")
 COLUMN_TYPES = ("text", "integer", "bigint", "double", "date", "timestamp")   # build_mosaic.py set-column-types
 # Changes made once for the whole plan, at the start of one phase; other phases get a note.
 MERGED_KINDS = {"source_change": 1, "change_column_type": 2, "wire_relationships": 3}
@@ -866,6 +866,22 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                               "and calendar parents (year, quarter) need a period table",
                     "columns": [period_attr, "year", "quarter", "month", "latest period flag"],
                     "new_forms": ["month"], "new_attributes": ["year", "quarter", "latest period flag"]})
+    # Calendar parents of other dates come from a lookup keyed on the date, not a derived attribute: a lookup
+    # is faster at run time and can be replaced without deleting the metrics built on it.
+    for a in attrs:
+        if a["name"] == period_attr or (_distinct(a) or 0) < 2:
+            continue
+        if not (a.get("type", "").lower() in ("date", "timestamp") or looks_like_integer_date(a)):
+            continue
+        year = f"{a['name']} year"
+        if any(n.lower() in (year.lower(), f"{a['name']} yr".lower()) for n in names):
+            continue
+        out.append({"id": f"L-{_slug(a['name'])}", "kind": "date_lookup", "attribute": a["name"],
+                    "reason": "no calendar parents: grouping by year or quarter needs a lookup keyed on the date "
+                              "(preferred to a derived attribute: faster, and replaceable without deleting the "
+                              "metrics built on it)",
+                    "columns": [a["name"], year, f"{a['name']} quarter"],
+                    "new_forms": [], "new_attributes": [year, f"{a['name']} quarter"]})
     if relationships:
         static = (relationships.get("suggestions") or {}).get("entity_level_attributes") or []
         if len(static) >= 5:
@@ -925,12 +941,15 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
         if got is None:
             done.append({**sug, "csv": None, "error": "values could not be read"})
             continue
-        values = [_plain_number(v) if sug["kind"] == "period_lookup" else v for v in got if v not in (None, "")]
+        values = [_plain_number(v) if sug["kind"] in ("period_lookup", "date_lookup") else v
+                  for v in got if v not in (None, "")]
         dropped = _null_artifacts(values, profiles.get(sug["attribute"], {}), scope, sug["attribute"])
         values = [v for v in values if v not in dropped]
         path = os.path.join(csv_dir, f"{_slug(sug['attribute'])}_lookup.csv")
         if sug["kind"] == "code_lookup":
             _write_csv(path, sug["columns"], [[v, "", ""] for v in values])
+        elif sug["kind"] == "date_lookup":
+            _write_csv(path, sug["columns"], [[v, *_period_parts(v)[:2]] for v in values])
         else:
             latest = max(values) if values else None
             _write_csv(path, sug["columns"], [[v, *_period_parts(v), "Y" if v == latest else "N"] for v in values])
@@ -1208,6 +1227,22 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         argv = base + ["set-column-types", "--model-id", model_id] + column_type_set_args([a])
         opt(argv, "--table", "table")
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
+    if kind == "create_formula_attribute":
+        need("name", "formula")
+        if a.get("requested_by_user") is not True:
+            problems.append(f"{kind}: '{a.get('name')}' is a derived attribute. Prefer a lookup table (faster at run "
+                            f"time, and replaceable without deleting the metrics built on it); plan a derived "
+                            f"attribute only when the user asks for one, then set args.requested_by_user")
+        argv = base + ["create-formula-attribute", "--model-id", model_id, "--name", str(a.get("name", "")),
+                       "--formula", str(a.get("formula", ""))]
+        for flag, key in (("--description", "description"), ("--display-format", "display_format"),
+                          ("--data-type", "data_type"), ("--table", "table")):
+            opt(argv, flag, key)
+        if a.get("update"):
+            argv.append("--update")
+        if a.get("unverified_ok"):
+            argv.append("--unverified-ok")
+        return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "wire_relationships":
         rels = a.get("relationships")
         if not isinstance(rels, list) or not rels:
@@ -1367,6 +1402,30 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                 if _DISPLAY_COLUMN.search(str(col)) and str(col).lower() not in filtered:
                     warnings.append(f"{f['id']}: '{col}' looks like a display column; list it under new_forms "
                                     f"unless a metric will filter on it")
+
+    # A derived metric built on a derived attribute is hard to replace later: replacing the attribute (say, with
+    # a lookup) deletes every metric that filters on it or counts it.
+    formula_attrs = {str((a.get("args") or {}).get("name") or "").lower(): f["id"] for f in ordered
+                     for a in f.get("actions") or [] if a.get("kind") == "create_formula_attribute"}
+    for f in ordered:
+        for a in f.get("actions") or []:
+            args = a.get("args") or {}
+            if a.get("kind") not in ("create_conditional_metric", "create_level_metric", "create_weighted_average"):
+                continue
+            used = [args.get(k) for k in ("attribute", "count_attribute", "level_attribute", "entity_attribute",
+                                          "value_attribute")] + [c[0] for c in args.get("and") or []
+                                                                 if isinstance(c, list) and c]
+            for u in used:
+                if u and str(u).lower() in formula_attrs:
+                    warnings.append(f"{f['id']}: '{args.get('name')}' is built on '{u}', a derived attribute "
+                                    f"({formula_attrs[str(u).lower()]}); replacing that attribute later deletes "
+                                    f"this metric. Prefer a lookup table for it")
+        for a in f.get("actions") or []:
+            if a.get("kind") == "create_formula_attribute" and re.search(r"'|\d\.\d", str((a.get("args") or {})
+                                                                                         .get("formula") or "")):
+                if not (a.get("args") or {}).get("unverified_ok"):
+                    warnings.append(f"{f['id']}: the formula of '{(a.get('args') or {}).get('name')}' uses a string "
+                                    f"literal or a decimal, not yet confirmed live; set args.unverified_ok to try it")
 
     # patch_fact_metrics may carry its spec inline (args.metrics): plan writes the file into the bundle.
     for f in ordered:
