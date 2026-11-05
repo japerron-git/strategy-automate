@@ -5862,7 +5862,9 @@ def resolve_column_targets(model: dict, cols: dict[str, tuple[str, str]],
         if key in cols:
             col = cols[key][1]
         else:
-            hits = sorted(set(via.get(key) or []))
+            # the connector names an attribute's forms "<attribute>__<form>" (postal code__id): use the attribute
+            base = key.split("__", 1)[0] if "__" in key and key not in via else key
+            hits = sorted(set(via.get(base) or []))
             if len(hits) != 1:
                 unknown.append(name if not hits else f"{name} (reads {hits})")
                 continue

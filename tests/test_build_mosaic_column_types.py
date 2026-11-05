@@ -157,6 +157,8 @@ class NameResolutionTests(unittest.TestCase):
         self.assertEqual(out, {"status code": ("STATUS CODE", "text", ""), "amount": ("AMOUNT", "double", ""),
                                "period": ("PERIOD", "date", "yyyyMM")})
         self.assertEqual(notes, ["'Status' reads column STATUS CODE"])
+        out, _ = bm.resolve_column_targets(self.model, self.cols, bm.column_type_targets([["status__id", "text"]], None))
+        self.assertEqual(list(out), ["status code"])          # the connector's "<attribute>__<form>" name
 
     def test_unknown_names_and_conflicts_stop(self):
         _dies(bm.resolve_column_targets, self.model, self.cols, bm.column_type_targets([["Nothing", "text"]], None))
