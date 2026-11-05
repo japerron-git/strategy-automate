@@ -71,7 +71,7 @@ blocks; the parser joins them).
 - `UNION ALL` of `SELECT DISTINCT` branches works; the scripts batch value samples that way (and
   profiles as several `COUNT(DISTINCT)` / `MIN` / `MAX` columns per query), cutting connector calls about
   tenfold for agent-driven runs.
-- Sentinels such as `9999` ("not available") inside scores and ratios inflate averages; check the
+- Sentinels ("not available" written as a number, such as -1, 99 or a run of 9s) inside scores and ratios inflate averages; check the
   profile `max` against the documented range.
 
 ## Question levels
