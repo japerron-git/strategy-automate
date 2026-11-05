@@ -31,6 +31,7 @@ Subcommands:
   create-weighted-average    Weighted average once per entity: numerator + denominator helpers and the ratio.
   set-column-types           Change column types in the model (table + pipeline), no reload; republish after.
   create-formula-attribute   Attribute computed from columns (prefer a lookup table); republish after.
+  rename-describe            Rename / describe attributes and fact metrics by name; no republish.
 
 Authentication
 ~~~~~~~~~~~~~~
@@ -6168,6 +6169,88 @@ def cmd_create_formula_attribute(m: MSTR, args):
                       "next": "republish the model for the attribute to hold data"}, indent=2))
 
 
+# ── rename-describe: names and descriptions of attributes and fact metrics ──────────────────
+# Ported from runs that worked live: PATCH {"information": {"name", "description"}} on the attribute or fact
+# metric, all in one changeset; takes effect at once, no republish. Derived metrics need a full PUT (not here).
+
+DESCRIPTION_LIMIT = 250   # characters, Strategy's limit for a description
+
+
+def rename_describe_items(spec: dict | list) -> list[dict]:
+    """{"items": [{object_type, current_name, new_name?, description?}]} (or the list itself) -> checked items."""
+    items = spec.get("items") if isinstance(spec, dict) else spec
+    out = []
+    for it in items or []:
+        kind = str(it.get("object_type") or "").lower()
+        if kind not in ("attribute", "fact_metric"):
+            die(f"{it.get('current_name')}: object_type must be attribute or fact_metric (derived metrics take "
+                f"their description when created)")
+        if not it.get("current_name"):
+            die("an item has no current_name")
+        desc = it.get("description")
+        if desc is not None and len(str(desc)) > DESCRIPTION_LIMIT:
+            die(f"{it['current_name']}: description is {len(str(desc))} characters (max {DESCRIPTION_LIMIT})")
+        if not (it.get("new_name") or desc is not None):
+            die(f"{it['current_name']}: give new_name, description or both")
+        out.append({"object_type": kind, "current_name": str(it["current_name"]),
+                    "new_name": it.get("new_name") or None, "description": desc})
+    if not out:
+        die("no items")
+    return out
+
+
+def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[list[tuple], list[str]]:
+    """-> (writes [(label, path, body)], notes). Already-applied items are skipped, so a rerun is harmless."""
+    pools = {"attribute": ("attributes", model.get("attributes") or []),
+             "fact_metric": ("factMetrics", model.get("factMetrics") or [])}
+    by_name = {k: {(o.get("information") or {}).get("name", "").casefold(): o for o in objs}
+               for k, (_, objs) in pools.items()}
+    writes, notes = [], []
+    for it in items:
+        seg, _ = pools[it["object_type"]]
+        names = by_name[it["object_type"]]
+        o = names.get(it["current_name"].casefold())
+        if o is None:
+            if it["new_name"] and it["new_name"].casefold() in names:
+                notes.append(f"{it['current_name']}: already renamed to '{it['new_name']}'")
+                continue
+            die(f"{it['object_type']} '{it['current_name']}' not found")
+        info = o["information"]
+        name = it["new_name"] or info["name"]
+        desc = info.get("description", "") if it["description"] is None else str(it["description"])
+        if name.casefold() != info["name"].casefold() and name.casefold() in names:
+            die(f"{info['name']}: another {it['object_type']} is already named '{name}'")
+        if name == info["name"] and desc == info.get("description", ""):
+            notes.append(f"{info['name']}: unchanged")
+            continue
+        names[name.casefold()] = o
+        what = " + ".join(x for x in ((f"rename -> '{name}'" if name != info["name"] else ""),
+                                       ("description" if desc != info.get("description", "") else "")) if x)
+        writes.append((f"{it['object_type']} '{info['name']}': {what}",
+                       f"/api/model/dataModels/{mid}/{seg}/{info['objectId']}",
+                       {"information": {"name": name, "description": desc}}))
+    return writes, notes
+
+
+def cmd_rename_describe(m: MSTR, args):
+    """Rename attributes and fact metrics and/or set their descriptions, by name, in one changeset."""
+    items = rename_describe_items(_load_json_arg(None, args.spec))
+    m.login(identity=True)
+    r = m.post(f"/api/model/dataModels/{args.model_id}/export")
+    if not r.ok:
+        die(f"export model: {format_mstr_error(r)}")
+    model = (r.json().get("model") or [{}])[0]
+    writes, notes = rename_describe_writes(model, args.model_id, items)
+    for n in notes:
+        print(f"  = {n}", file=sys.stderr)
+    for w in writes:
+        print(f"  ~ {w[0]}", file=sys.stderr)
+    if writes and not args.dry_run:
+        _patch_in_changeset(m, writes, "rename-describe")
+    print(json.dumps({"ok": True, "dry_run": bool(args.dry_run), "changed": [w[0] for w in writes],
+                      "skipped": notes}, indent=2))
+
+
 def cmd_patch_fact_metrics(m: MSTR, args):
     """Set aggregation function and/or number format on many fact metrics in ONE
     changeset: list → per-metric GET (diff) → PATCH only what differs → commit →
@@ -7115,6 +7198,13 @@ def build_parser():
     sp.add_argument("--description", default="", help=f"business description (max {DESCRIPTION_MAX} characters)")
     sp.add_argument("--dry-run", action="store_true", help="print the three requests; open no changeset")
 
+    sp = sub.add_parser("rename-describe",
+        help="Rename attributes and fact metrics and/or set their descriptions by name, in one changeset "
+             "(no republish). Spec: {items: [{object_type, current_name, new_name, description}]}.")
+    sp.add_argument("--model-id", required=True)
+    sp.add_argument("--spec", required=True, help="JSON file with the items")
+    sp.add_argument("--dry-run", action="store_true", help="print the changes; open no changeset")
+
     sp = sub.add_parser("create-formula-attribute",
         help="Attribute computed from the table's columns (e.g. Year([FIRST DATE])). Prefer a lookup table: "
              "faster, and replaceable without deleting the metrics built on it. Republish afterwards.")
@@ -7218,6 +7308,7 @@ def main():
             "delete-derived-metric": cmd_delete_derived_metric,
             "create-level-metric": cmd_create_level_metric,
             "create-weighted-average": cmd_create_weighted_average,
+            "rename-describe": cmd_rename_describe,
             "create-formula-attribute": cmd_create_formula_attribute,
             "set-column-types": cmd_set_column_types,
             "patch-fact-metrics": cmd_patch_fact_metrics,

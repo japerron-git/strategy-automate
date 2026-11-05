@@ -291,6 +291,17 @@ label column is listed as an attribute that no metric filters on.
   on a one-table model, matched loosely otherwise) declares parent-child
   relationships. `plan` merges them into one `build_mosaic.py wire-relationships` command at the start of
   phase 3 and ships its hints file as `specs/relationships.json`.
+- **`rename_describe`** (`items`: `{object_type: attribute | fact_metric, current_name, new_name,
+  description}`, descriptions at most 250 characters): `plan` merges every item into one
+  `build_mosaic.py rename-describe` command in phase 6 and ships its spec as `specs/rename_describe.json`.
+  Takes effect at once, no republish; derived metrics take their description when they are created.
+  Use it for every rename and description change instead of a manual step.
+- **Tests are not manual steps.** A manual step that only checks a result ("Test after republish:
+  ...") becomes a `verify` note that `/verify-changes` handles; it doesn't stop the apply script. Write
+  such checks as questions in the bank, linked through the finding's `tests`.
+- **One lookup checklist per phase.** `plan` gathers a phase's `add_lookup_table` actions into one
+  manual step (shared instructions once, one line per table). Adding a table from a file has no verified
+  API yet, so this stays manual.
 - **A lookup keyed on a retyped attribute gets a retype step.** When the plan changes a column's type
   and also adds a lookup keyed on it, `plan` follows the lookup step with `set-column-types --table <the
   CSV's name> --set <key> <type>`, so the lookup's key joins the retyped column.
@@ -307,7 +318,7 @@ label column is listed as an attribute that no metric filters on.
 `join`, `format`, `description`, `replace`, `kind`, `object_id`, `json_file`, `spec`; for
 `add_lookup_table`: `csv`, `key_attribute`, `new_attributes`, `new_forms`; for `change_column_type`:
 `column`, `type`, `date_format`, `table`; for `source_change`: `table`, `column`, `change`; for
-`wire_relationships`: `relationships`; for `create_formula_attribute`: see above; for `patch_fact_metrics`: `spec` or inline `metrics` / `presets`; for `create_level_metric`: `name`, `source_metric`, `entity_attribute`, `inner`, `outer`;
+`wire_relationships`: `relationships`; for `create_formula_attribute`: see above; for `rename_describe`: `items`; for `patch_fact_metrics`: `spec` or inline `metrics` / `presets`; for `create_level_metric`: `name`, `source_metric`, `entity_attribute`, `inner`, `outer`;
 for `create_weighted_average`: `name`, exactly one of `value_attribute` / `value_metric`, `weight_metric`,
 `entity_attribute`, `numerator_name`, `denominator_name`).
 

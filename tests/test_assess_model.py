@@ -931,7 +931,7 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         self.assertEqual([w for w in plan["warnings"] if "display column" in w],
                          ["F1: 'status description' looks like a display column; list it under new_forms unless a "
                           "metric will filter on it"])
-        self.assertIn("Leave out the CSV's source column", plan["phases"][0]["steps"][0]["manual"])
+        self.assertIn("leave out the CSV's source column", plan["phases"][0]["steps"][0]["manual"])
 
     def test_plan_cli_writes_spec_files(self):
         d = tempfile.mkdtemp(prefix="assess-plan-")
@@ -993,6 +993,60 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         fa["args"]["formula"] = "Year([CLOSE DATE])"
         plan = am.build_plan({"findings": [_finding("F1", "attribute", actions=[fa])]}, model_id="MID")
         self.assertFalse(any("not yet confirmed live" in w for w in plan["warnings"]))
+
+    def test_lookups_of_a_phase_become_one_checklist_step(self):
+        lk = lambda csv, key, **kw: {"kind": "add_lookup_table", "args": {"csv": csv, "key_attribute": key, **kw}}  # noqa: E731
+        doc = {"findings": [
+            _finding("F1", "data_type", actions=[{"kind": "change_column_type", "args": {"column": "status", "type": "text"}}]),
+            _finding("F2", "lookup", risks=["map to the existing attribute"], actions=[
+                lk("lookups/status_lookup.csv", "status", new_attributes=["status group"], new_forms=["status description"]),
+                lk("lookups/region_lookup.csv", "region", new_forms=["region name"])]),
+            _finding("F3", "lookup", actions=[lk("lookups/close_date_lookup.csv", "close date",
+                                                 new_attributes=["close date year"])])]}
+        plan = am.build_plan(doc, model_id="MID")
+        steps = plan["phases"][0]["steps"]
+        self.assertEqual([st["kind"] for st in steps], ["change_column_type", "add_lookup_table", "change_column_type"])
+        merged = steps[1]
+        self.assertEqual((merged["finding"], merged["title"]), ("F2, F3", "Add 3 lookup tables"))
+        self.assertIn("(1) lookups/status_lookup.csv -> key 'status'; attributes: status group; forms: status description.",
+                      merged["manual"])
+        self.assertIn("(2) lookups/region_lookup.csv -> key 'region'; forms: region name; key column typed like 'region'.",
+                      merged["manual"])
+        self.assertIn("set by the commands right after this step", merged["manual"])
+        self.assertEqual(merged["risks"], ["map to the existing attribute"])
+        self.assertEqual(steps[2]["apply"]["argv"][-5:], ["--table", "status_lookup", "--set", "status", "text"])
+
+    def test_test_steps_do_not_stop_the_script(self):
+        doc = {"findings": [_finding("F4", "data_type", actions=[{"kind": "manual", "steps": [
+            "Remove the latitude form from the region attribute", "Test after republish: region values '041' appear"]},
+            {"kind": "manual", "steps": "1. After republish, test: codes include 'RA'. 2. Check the flag is never blank."}])]}
+        plan = am.build_plan(doc, model_id="MID")
+        steps = plan["phases"][0]["steps"]
+        self.assertEqual([st["kind"] for st in steps], ["verify", "manual", "verify"])
+        self.assertEqual(steps[1]["manual"], "1. Remove the latitude form from the region attribute.")
+        self.assertTrue(steps[0]["note"].startswith("Checked by /verify-changes after this phase: Test after republish"))
+        self.assertIsNone(steps[2]["manual"])
+
+    def test_names_and_descriptions_merge_into_one_command(self):
+        doc = {"findings": [
+            _finding("F14", "data_type", actions=[{"kind": "rename_describe", "args": {"items": [
+                {"object_type": "fact_metric", "current_name": "costs", "description": "Empty in this data."}]}}]),
+            _finding("F16", "description", actions=[{"kind": "rename_describe", "args": {"items": [
+                {"object_type": "attribute", "current_name": "region", "new_name": "Sales Region"}]}}])]}
+        plan = am.build_plan(doc, model_id="MID")
+        self.assertEqual(plan["problems"], [])
+        p2, p6 = plan["phases"]
+        self.assertEqual([st["kind"] for st in p2["steps"]], ["note"])
+        (step,) = p6["steps"]
+        self.assertEqual(step["apply"]["argv"][2:], ["rename-describe", "--model-id", "MID", "--spec",
+                                                     "specs/rename_describe.json"])
+        self.assertEqual([i["current_name"] for i in plan["files"]["specs/rename_describe.json"]["items"]],
+                         ["costs", "region"])
+        bad = am.build_plan({"findings": [_finding("F1", "description", actions=[{"kind": "rename_describe", "args": {
+            "items": [{"object_type": "metric", "current_name": "x", "description": "y" * 251}]}}])]}, model_id="MID")
+        text = " | ".join(bad["problems"])
+        self.assertIn("object_type must be attribute or fact_metric", text)
+        self.assertIn("over 250 characters", text)
 
     def test_source_change_needs_a_change(self):
         plan = am.build_plan({"findings": [_finding("F1", "source_data", actions=[

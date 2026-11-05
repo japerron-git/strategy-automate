@@ -39,6 +39,12 @@ the new type applies at the next republish. In the verified run (13 columns: int
 date, text → double) the service also updated the attribute forms and fact metrics that read those columns,
 so a second pass to align them found nothing to write. `build_mosaic.py set-column-types` does both steps.
 
+## Renames and descriptions (verified 2026-10-30/31)
+`PATCH /api/model/dataModels/{mid}/attributes/{id}` or `.../factMetrics/{id}` with `{"information": {"name",
+"description"}}` inside a changeset renames and/or describes; it takes effect on commit, with no republish.
+Descriptions over 250 characters are refused. Derived metrics need a full-body PUT instead.
+`build_mosaic.py rename-describe` sends this shape.
+
 ## Formula attributes (verified 2026-10-30/31)
 `POST /api/model/dataModels/{mid}/attributes` in a changeset, one ID form (system form id
 `45C11FA478E745FEA08D781CEA190FE5`, `category: ID`) whose expression is tokens, never text: `function`,

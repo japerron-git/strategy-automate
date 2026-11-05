@@ -69,13 +69,17 @@ REPUBLISH_PHASES = (1, 2, 3)
 ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_derived_metric",
                 "create_level_metric", "create_weighted_average", "patch_model_object", "patch_fact_metrics",
                 "add_lookup_table", "change_column_type", "source_change", "wire_relationships",
-                "create_formula_attribute", "publish", "certify", "manual")
+                "create_formula_attribute", "rename_describe", "publish", "certify", "manual")
 COLUMN_TYPES = ("text", "integer", "bigint", "double", "date", "timestamp")   # build_mosaic.py set-column-types
 # Changes made once for the whole plan, at the start of one phase; other phases get a note.
-MERGED_KINDS = {"source_change": 1, "change_column_type": 2, "wire_relationships": 3}
+MERGED_KINDS = {"source_change": 1, "change_column_type": 2, "wire_relationships": 3, "rename_describe": 6}
 MERGED_NOTES = {"source_change": "Source change done in the phase {phase} rebuild",
                 "change_column_type": "Column type change done in phase {phase} (set-column-types)",
-                "wire_relationships": "Relationships declared in phase {phase} (wire-relationships)"}
+                "wire_relationships": "Relationships declared in phase {phase} (wire-relationships)",
+                "rename_describe": "Names and descriptions set in phase {phase} (rename-describe)"}
+RENAME_DESCRIBE_SPEC = "specs/rename_describe.json"
+DESCRIPTION_LIMIT = 250
+_TEST_STEP = re.compile(r"^\s*(after (the )?(republish|reload|type change)\w*,?\s*)?(re-?)?(test|check|verify|confirm)\b", re.I)
 RELATIONSHIP_TYPES = ("one_to_many", "many_to_many", "one_to_one")
 RELATIONSHIP_HINTS = "specs/relationships.json"   # written into the bundle by plan; scripts run from the repo root
 VERIFIED_FORMULA_FUNCTIONS = {"addmonths", "year", "monthsbetween"}   # create-formula-attribute, confirmed live
@@ -1005,6 +1009,44 @@ def lookup_steps(args: dict) -> str:
     return " ".join(f"{i}. {t}" for i, t in enumerate(steps, 1))
 
 
+def lookups_checklist(items: list[tuple[dict, bool]]) -> str:
+    """One manual step for every lookup table of a phase: shared instructions once, then one line per table.
+    `items` is [(add_lookup_table args, key retyped by a command after this step)]."""
+    lines = []
+    for i, (a, retyped) in enumerate(items, 1):
+        key = a.get("key_attribute") or "<key attribute>"
+        bits = [f"{a.get('csv') or '<csv file>'} -> key '{key}'"]
+        if a.get("new_attributes"):
+            bits.append("attributes: " + ", ".join(a["new_attributes"]))
+        if a.get("new_forms"):
+            bits.append("forms: " + ", ".join(a["new_forms"]))
+        if not (a.get("new_attributes") or a.get("new_forms")):
+            bits.append("new columns: attributes if a metric filters on them, otherwise forms")
+        if not retyped:
+            bits.append(f"key column typed like '{key}'")
+        lines.append(f"({i}) " + "; ".join(bits) + ".")
+    head = (f"{'Add these ' + str(len(items)) + ' lookup tables, each the same way' if len(items) > 1 else 'Add this lookup table'}"
+            f": add the CSV as a new table; map its key column to the EXISTING attribute named (keep it: "
+            f"deleting or replacing it deletes the derived metrics that filter on it); create the listed attributes "
+            f"as attributes of their own, related to the key, since metrics filter on them; add the listed forms as "
+            f"forms of the key (display only); check the key attribute uses the new table as its lookup "
+            f"(auto-detection may keep the fact table); leave out the CSV's source column if it has one."
+            + (" Key types that must change are set by the commands right after this step." if any(r for _, r in items)
+               else "") + " The phase republishes once at the end.")
+    return head + " Tables: " + " ".join(lines)
+
+
+def split_test_steps(steps) -> tuple[list[str], list[str]]:
+    """Manual steps -> (work, tests). Tests ("Test after republish: ...", "Check that ...") are checked by
+    /verify-changes after the phase; they don't stop the apply script."""
+    if isinstance(steps, (list, tuple)):
+        items = [str(x).strip() for x in steps if str(x).strip()]
+    else:
+        items = [x.strip() for x in re.split(r"(?:^|\s)\d+\.\s+", str(steps or "")) if x.strip()]
+    tests = [x for x in items if _TEST_STEP.match(x)]
+    return [x for x in items if x not in tests], tests
+
+
 def column_type_set_args(changes: list[dict]) -> list[str]:
     """--set COLUMN TYPE [DATE_FORMAT] for each change_column_type action."""
     out: list[str] = []
@@ -1228,6 +1270,21 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         argv = base + ["set-column-types", "--model-id", model_id] + column_type_set_args([a])
         opt(argv, "--table", "table")
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
+    if kind == "rename_describe":
+        items = a.get("items")
+        if not isinstance(items, list) or not items:
+            problems.append(f"{kind}: args.items must list object_type, current_name and new_name or description")
+        for it in items if isinstance(items, list) else []:
+            if str(it.get("object_type") or "").lower() not in ("attribute", "fact_metric"):
+                problems.append(f"{kind}: '{it.get('current_name')}': object_type must be attribute or fact_metric "
+                                f"(a derived metric takes its description when it is created)")
+            if not it.get("current_name") or not (it.get("new_name") or it.get("description") is not None):
+                problems.append(f"{kind}: each item needs current_name and a new_name or description")
+            if len(str(it.get("description") or "")) > DESCRIPTION_LIMIT:
+                problems.append(f"{kind}: the description of '{it.get('current_name')}' is over {DESCRIPTION_LIMIT} "
+                                f"characters")
+        argv = base + ["rename-describe", "--model-id", model_id, "--spec", RENAME_DESCRIBE_SPEC]
+        return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "create_formula_attribute":
         need("name", "formula")
         if a.get("requested_by_user") is not True:
@@ -1379,6 +1436,20 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
              "title": "Declare attribute relationships", "kind": "wire_relationships",
              "dry_run": cmd(argv + ["--dry-run"]), "apply": cmd(argv), "manual": None,
              "risks": ["The dry run lists any relationship it cannot wire (unknown attribute or table) and why."]})
+    if merged["rename_describe"]:
+        items = [dict(it, finding=c["finding"]) for c in merged["rename_describe"] for it in c.get("items") or []
+                 if isinstance(it, dict)]
+        dup = _dupes([f"{it.get('object_type')}:{str(it.get('current_name') or '').casefold()}" for it in items])
+        if dup:
+            problems.append(f"rename_describe: {dup} changed twice; merge them into one item")
+        files[RENAME_DESCRIBE_SPEC] = {"items": [{k: v for k, v in it.items() if k != "finding"} for it in items]}
+        argv = [python, BUILD_SCRIPT, "rename-describe", "--model-id", mid, "--spec", RENAME_DESCRIBE_SPEC]
+        merged_steps.setdefault(MERGED_KINDS["rename_describe"], []).append(
+            {"finding": ", ".join(dict.fromkeys(c["finding"] for c in merged["rename_describe"])),
+             "title": "Set names and descriptions", "kind": "rename_describe",
+             "dry_run": cmd(argv + ["--dry-run"]), "apply": cmd(argv), "manual": None,
+             "risks": ["Takes effect at once (no republish). Derived metrics keep working after a rename: "
+                       "they refer to objects by id."]})
     merged_findings = {k: {c["finding"] for c in v} for k, v in merged.items()}
     retyped_to = {str(c.get("column") or "").casefold(): (str(c.get("type") or "").lower(), c.get("date_format") or "")
                   for c in merged["change_column_type"]}
@@ -1471,6 +1542,8 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         items = [f for f in ordered if _phase_of(f) == n]
         steps = list(merged_steps.get(n, []))
         noted: set[tuple[str, str]] = set()
+        lookups: list[tuple[dict, bool]] = []
+        lookup_at, lookup_findings, retypes = None, [], []
         for f in items:
             for action in f.get("actions") or [{"kind": "manual", "steps": f.get("recommendation")}]:
                 kind = action.get("kind")
@@ -1487,6 +1560,15 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                     continue
                 c = action_commands(action, mid, python)
                 problems += [f"{f['id']}: {p}" for p in c["problems"]]
+                if kind == "manual":
+                    work, tests = split_test_steps(action.get("steps") or (action.get("args") or {}).get("steps"))
+                    if tests:
+                        steps.append({"finding": f["id"], "title": f.get("title"), "kind": "verify",
+                                      "dry_run": None, "apply": None, "manual": None, "risks": [],
+                                      "note": "Checked by /verify-changes after this phase: " + " ".join(tests)})
+                        if not work:
+                            continue
+                        c = {**c, "manual": " ".join(f"{i}. {w.rstrip('.')}." for i, w in enumerate(work, 1))}
                 retype = None
                 if kind == "add_lookup_table":
                     largs = action.get("args") or {}
@@ -1503,11 +1585,26 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                                             "matched loosely."]}
                 first = (f["id"], "risks") not in noted          # a finding's risks show on its first step only
                 noted.add((f["id"], "risks"))
+                if kind == "add_lookup_table":   # all of a phase's lookups become one checklist step
+                    if lookup_at is None:
+                        lookup_at = len(steps)
+                    lookups.append((action.get("args") or {}, bool(retype)))
+                    lookup_findings.append(f["id"])
+                    if retype:
+                        retypes.append(retype)
+                    continue
                 steps.append({"finding": f["id"], "title": f.get("title"), "kind": action.get("kind"),
                               "dry_run": cmd(c["dry_run"]), "apply": cmd(c["apply"]), "manual": c["manual"],
                               "risks": (f.get("risks") or []) if first else []})
                 if retype:
                     steps.append(retype)
+        if lookups:
+            ids = list(dict.fromkeys(lookup_findings))
+            risks = [r for fid in ids for f in items if f["id"] == fid for r in (f.get("risks") or [])]
+            steps[lookup_at:lookup_at] = [{"finding": ", ".join(ids), "title": f"Add {len(lookups)} lookup table"
+                                           f"{'s' if len(lookups) > 1 else ''}", "kind": "add_lookup_table",
+                                           "dry_run": None, "apply": None, "manual": lookups_checklist(lookups),
+                                           "risks": list(dict.fromkeys(risks))}] + retypes
         before = ["Save a backup copy of the model before applying this phase."]
         if n == 3:
             before.append("For every attribute removed or replaced: list the derived metrics that filter on "
