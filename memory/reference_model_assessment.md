@@ -283,12 +283,18 @@ label column is listed as an attribute that no metric filters on.
   `display_format` text | number | date, `data_type`, `table`, `update`, `requested_by_user`,
   `unverified_ok`): verified live for functions, columns and integers (`AddMonths([PERIOD], -1)`,
   `Year([date])` typed integer, `MonthsBetween`). String literals and decimals are unconfirmed and need
-  `unverified_ok`. Republish afterwards.
+  `unverified_ok`; `plan` warns on any other function. The dry run checks the columns only: the tenant
+  checks the functions when the step is applied, inside a changeset that is discarded if refused.
+  Republish afterwards.
 - **`wire_relationships`** (`relationships`: a list of `{parent_attribute, child_attribute,
   relationship_table, type}`, type one_to_many | many_to_many | one_to_one; `relationship_table` optional
   on a one-table model, matched loosely otherwise) declares parent-child
   relationships. `plan` merges them into one `build_mosaic.py wire-relationships` command at the start of
   phase 3 and ships its hints file as `specs/relationships.json`.
+- **A lookup keyed on a retyped attribute gets a retype step.** When the plan changes a column's type
+  and also adds a lookup keyed on it, `plan` follows the lookup step with `set-column-types --table <the
+  CSV's name> --set <key> <type>`, so the lookup's key joins the retyped column.
+- **Manual steps** may be a list; `plan` joins them into one numbered paragraph.
 - **Spec files travel with the plan.** `change_plan.json` has a `files` map (relative path → JSON) that
   `plan` also writes next to it: the relationship hints, and the spec of any `patch_fact_metrics` action
   given inline as `args.metrics` (with optional `args.presets`) instead of `args.spec`.

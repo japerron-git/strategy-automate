@@ -78,6 +78,7 @@ MERGED_NOTES = {"source_change": "Source change done in the phase {phase} rebuil
                 "wire_relationships": "Relationships declared in phase {phase} (wire-relationships)"}
 RELATIONSHIP_TYPES = ("one_to_many", "many_to_many", "one_to_one")
 RELATIONSHIP_HINTS = "specs/relationships.json"   # written into the bundle by plan; scripts run from the repo root
+VERIFIED_FORMULA_FUNCTIONS = {"addmonths", "year", "monthsbetween"}   # create-formula-attribute, confirmed live
 _DISPLAY_COLUMN = re.compile(r"\b(description|desc|name|label|title|text)$", re.I)
 # A source_change whose text describes a type change: that is change_column_type, done in the model.
 _TYPE_CHANGE_TEXT = re.compile(r"\b(data ?type|column type|varchar|utf8|retype)\b|\b(load|reload|re-load|read|cast|"
@@ -1266,6 +1267,8 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         return {"dry_run": None, "apply": base + ["certify", "--object-id", model_id], "manual": None,
                 "problems": problems}
     steps = action.get("steps") or a.get("steps")
+    if isinstance(steps, list):    # a list of steps reads as one numbered paragraph
+        steps = " ".join(f"{i}. {str(x).strip().rstrip('.')}." for i, x in enumerate(steps, 1) if str(x).strip())
     if kind != "manual":
         problems.append(f"unknown action kind '{kind}' (use one of {', '.join(ACTION_KINDS)})")
     elif not steps:
@@ -1377,6 +1380,8 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
              "dry_run": cmd(argv + ["--dry-run"]), "apply": cmd(argv), "manual": None,
              "risks": ["The dry run lists any relationship it cannot wire (unknown attribute or table) and why."]})
     merged_findings = {k: {c["finding"] for c in v} for k, v in merged.items()}
+    retyped_to = {str(c.get("column") or "").casefold(): (str(c.get("type") or "").lower(), c.get("date_format") or "")
+                  for c in merged["change_column_type"]}
 
     # A type change can already restore what a source change would rewrite (leading zeros, letter codes):
     # test the values after the type change, and change the source only if they are still wrong.
@@ -1421,8 +1426,14 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                                     f"({formula_attrs[str(u).lower()]}); replacing that attribute later deletes "
                                     f"this metric. Prefer a lookup table for it")
         for a in f.get("actions") or []:
-            if a.get("kind") == "create_formula_attribute" and re.search(r"'|\d\.\d", str((a.get("args") or {})
-                                                                                         .get("formula") or "")):
+            formula = str((a.get("args") or {}).get("formula") or "") if a.get("kind") == "create_formula_attribute" else ""
+            new_fns = sorted({fn for fn in re.findall(r"([A-Za-z_]\w*)\s*\(", formula)
+                              if fn.lower() not in VERIFIED_FORMULA_FUNCTIONS})
+            if new_fns:
+                warnings.append(f"{f['id']}: '{(a.get('args') or {}).get('name')}' uses {', '.join(new_fns)}, not yet "
+                                f"confirmed live. The dry run checks columns only; the tenant checks the functions "
+                                f"when the step is applied (one changeset, discarded if refused). Record the result")
+            if a.get("kind") == "create_formula_attribute" and re.search(r"'|\d\.\d", formula):
                 if not (a.get("args") or {}).get("unverified_ok"):
                     warnings.append(f"{f['id']}: the formula of '{(a.get('args') or {}).get('name')}' uses a string "
                                     f"literal or a decimal, not yet confirmed live; set args.unverified_ok to try it")
@@ -1476,11 +1487,27 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                     continue
                 c = action_commands(action, mid, python)
                 problems += [f"{f['id']}: {p}" for p in c["problems"]]
+                retype = None
+                if kind == "add_lookup_table":
+                    largs = action.get("args") or {}
+                    key = str(largs.get("key_column") or largs.get("key_attribute") or "")
+                    t = retyped_to.get(key.casefold()) or retyped_to.get(str(largs.get("key_attribute") or "").casefold())
+                    if t:   # the fact column changes type in this plan: the lookup's key must match it to join
+                        table = os.path.splitext(os.path.basename(str(largs.get("csv") or "")))[0]
+                        argv = [python, BUILD_SCRIPT, "set-column-types", "--model-id", mid, "--table", table,
+                                "--set", key, t[0]] + ([t[1]] if t[1] else [])
+                        retype = {"finding": f["id"], "title": f"Give the {table} key the type of '{key}'",
+                                  "kind": "change_column_type", "dry_run": cmd(argv + ["--dry-run"]),
+                                  "apply": cmd(argv), "manual": None,
+                                  "risks": ["Run after the lookup table is added; the table name is the CSV's, "
+                                            "matched loosely."]}
                 first = (f["id"], "risks") not in noted          # a finding's risks show on its first step only
                 noted.add((f["id"], "risks"))
                 steps.append({"finding": f["id"], "title": f.get("title"), "kind": action.get("kind"),
                               "dry_run": cmd(c["dry_run"]), "apply": cmd(c["apply"]), "manual": c["manual"],
                               "risks": (f.get("risks") or []) if first else []})
+                if retype:
+                    steps.append(retype)
         before = ["Save a backup copy of the model before applying this phase."]
         if n == 3:
             before.append("For every attribute removed or replaced: list the derived metrics that filter on "

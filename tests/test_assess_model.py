@@ -965,6 +965,35 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         plan = am.build_plan({"findings": [_finding("F1", "attribute", actions=[fa])]}, model_id="MID")
         self.assertTrue(any("string literal" in w for w in plan["warnings"]))
 
+    def test_manual_steps_given_as_a_list_read_as_one_paragraph(self):
+        plan = am.build_plan({"findings": [_finding("F1", "description", actions=[
+            {"kind": "manual", "steps": ["Rename the metric", "Describe it."]}])]}, model_id="MID")
+        self.assertEqual(plan["phases"][0]["steps"][0]["manual"], "1. Rename the metric. 2. Describe it.")
+
+    def test_lookup_key_gets_the_type_of_a_retyped_attribute(self):
+        doc = {"findings": [
+            _finding("F1", "data_type", actions=[{"kind": "change_column_type", "args": {
+                "column": "close date", "type": "date", "date_format": "yyyyMM"}}]),
+            _finding("F2", "lookup", actions=[{"kind": "add_lookup_table", "args": {
+                "csv": "lookups/close_date_lookup.csv", "key_attribute": "close date",
+                "new_attributes": ["close date year"]}}])]}
+        plan = am.build_plan(doc, model_id="MID")
+        kinds = [(st["kind"], st["finding"]) for st in plan["phases"][0]["steps"]]
+        self.assertEqual(kinds, [("change_column_type", "F1"), ("add_lookup_table", "F2"), ("change_column_type", "F2")])
+        retype = plan["phases"][0]["steps"][2]
+        self.assertEqual(retype["apply"]["argv"][2:], ["set-column-types", "--model-id", "MID", "--table",
+                                                       "close_date_lookup", "--set", "close date", "date", "yyyyMM"])
+
+    def test_unconfirmed_formula_functions_are_a_warning(self):
+        fa = {"kind": "create_formula_attribute", "args": {"name": "open flag", "requested_by_user": True,
+                                                         "formula": "If(IsNull([CLOSE CODE]), 1, 0)"}}
+        plan = am.build_plan({"findings": [_finding("F1", "attribute", actions=[fa])]}, model_id="MID")
+        self.assertTrue(any("uses If, IsNull, not yet confirmed live" in w and "checks columns only" in w
+                            for w in plan["warnings"]))
+        fa["args"]["formula"] = "Year([CLOSE DATE])"
+        plan = am.build_plan({"findings": [_finding("F1", "attribute", actions=[fa])]}, model_id="MID")
+        self.assertFalse(any("not yet confirmed live" in w for w in plan["warnings"]))
+
     def test_source_change_needs_a_change(self):
         plan = am.build_plan({"findings": [_finding("F1", "source_data", actions=[
             {"kind": "source_change", "args": {"column": "X"}}])]}, model_id="MID")

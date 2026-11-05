@@ -7127,7 +7127,9 @@ def build_parser():
     sp.add_argument("--update", action="store_true", help="rewrite the formula of an existing single-form attribute")
     sp.add_argument("--unverified-ok", action="store_true",
                     help="send a formula with string literals or decimals (not yet confirmed live)")
-    sp.add_argument("--dry-run", action="store_true", help="print the request; open no changeset")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="check the columns against the model and print the request; open no changeset. The "
+                         "tenant checks the functions only when the step is applied")
 
     sp = sub.add_parser("set-column-types",
         help="Change column types in the model without reloading the source (table + pipeline, then the "
