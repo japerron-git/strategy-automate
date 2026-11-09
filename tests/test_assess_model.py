@@ -827,7 +827,7 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
             _finding("F2", "data_type", actions=[{"kind": "source_change", "args": {
                 "table": "sales.csv", "column": "STATUS", "change": "pad to 2 digits (1 -> 01)"}}]),
             _finding("F3", "metric_defect", actions=[
-                {"kind": "source_change", "args": {"table": "sales.csv", "column": "COSTS", "change": "9999 to NULL"}},
+                {"kind": "source_change", "args": {"table": "sales.csv", "column": "COSTS", "change": "-1 to NULL"}},
                 {"kind": "create_compound_metric", "args": {"name": "Net", "formula": "[A] - [B]"}}]),
             _finding("F4", "data_type", actions=[{"kind": "source_change", "args": {"column": "X"}}], status="proposed")]}
         plan = am.build_plan(doc, model_id="MID")
@@ -1014,7 +1014,7 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         self.assertFalse(any("not yet confirmed live" in w for w in plan["warnings"]))
         fa["args"]["formula"] = "Sign([BALANCE])"
         plan = am.build_plan({"findings": [_finding("F1", "attribute", actions=[fa])]}, model_id="MID")
-        self.assertTrue(any("refused as an unknown function" in p for p in plan["problems"]))
+        self.assertTrue(any("refused as an unknown function" in w for w in plan["warnings"]))
 
     def test_lookups_of_a_phase_become_one_checklist_step(self):
         lk = lambda csv, key, **kw: {"kind": "add_lookup_table", "args": {"csv": csv, "key_attribute": key, **kw}}  # noqa: E731

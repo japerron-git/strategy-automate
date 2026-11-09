@@ -221,10 +221,10 @@ class JoinedTableTests(unittest.TestCase):
 class ObjectRefTests(unittest.TestCase):
     def test_connector_form_names_resolve_to_the_attribute(self):
         fake = _Fake({("GET", f"{MP}/attributes"): _Resp(200, {"attributes": [
-            {"information": {"objectId": "A9", "name": "zero balance"}}]})})
+            {"information": {"objectId": "A9", "name": "exit status"}}]})})
         with contextlib.redirect_stderr(io.StringIO()):
-            ref = bm.resolve_model_object_ref(fake, "M1", "attributes", "attribute", "zero balance__code")
-        self.assertEqual(ref, {"objectId": "A9", "subType": "attribute", "name": "zero balance"})
+            ref = bm.resolve_model_object_ref(fake, "M1", "attributes", "attribute", "exit status__code")
+        self.assertEqual(ref, {"objectId": "A9", "subType": "attribute", "name": "exit status"})
         _dies(bm.resolve_model_object_ref, fake, "M1", "attributes", "attribute", "nothing__code")
 
 

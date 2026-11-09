@@ -319,12 +319,12 @@ label column is listed as an attribute that no metric filters on.
   more), so propose the per-entity average with it: `create_level_metric` with `outer: Avg`
   (`Avg(Max([M]){~+,[Entity]+}){~+}`).
 - **Counts by a status that can change read one period.** On a snapshot fact an entity's status (an exit
-  code, a delinquency bucket) can change between periods, so "entities that ever had status X" picks up
+  code, a status tier) can change between periods, so "entities that ever had status X" picks up
   stale values. Count at the latest period (latest-period flag or level rule `last`) unless the question
   really asks for "ever". Check with the data: entities with more than one value of the status.
 
 - **Percent formats follow the stored scale.** `percent` multiplies by 100, for values stored as 0-1
-  fractions; values stored in points (an LTV of 76.01, a rate of 3.875) take `percent_0_100`, or `fixed2`
+  fractions; values stored in points (a ratio of 76.01, a rate of 3.875) take `percent_0_100`, or `fixed2`
   where more decimals matter. Check the column's range before choosing: a derived metric's format can't be
   changed by these commands after it is created.
 
