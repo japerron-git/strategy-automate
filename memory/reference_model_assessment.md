@@ -316,6 +316,11 @@ label column is listed as an attribute that no metric filters on.
   period) are `create_level_metric` and `create_weighted_average`, not hand-written formulas: summing the
   raw fact counts an entity once per period, and a plain average weights by row count.
 
+- **Percent formats follow the stored scale.** `percent` multiplies by 100, for values stored as 0-1
+  fractions; values stored in points (an LTV of 76.01, a rate of 3.875) take `percent_0_100`, or `fixed2`
+  where more decimals matter. Check the column's range before choosing: a derived metric's format can't be
+  changed by these commands after it is created.
+
 `args` use the CLI option names without dashes (`source_metric`, `count_attribute`,
 `attribute`, `elements`, `and` as a list of lists, `level_rule`, `level_attribute`, `formula`,
 `join`, `format`, `description`, `replace`, `kind`, `object_id`, `json_file`, `spec`; for
