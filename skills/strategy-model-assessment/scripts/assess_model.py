@@ -84,7 +84,7 @@ DESCRIPTION_LIMIT = 250
 _TEST_STEP = re.compile(r"^\s*(after (the )?(republish|reload|type change)\w*,?\s*)?(re-?)?(test|check|verify|confirm)\b", re.I)
 RELATIONSHIP_TYPES = ("one_to_many", "many_to_many", "one_to_one")
 RELATIONSHIP_HINTS = "specs/relationships.json"   # written into the bundle by plan; scripts run from the repo root
-VERIFIED_FORMULA_FUNCTIONS = {"addmonths", "year", "monthsbetween"}   # create-formula-attribute, confirmed live
+VERIFIED_FORMULA_FUNCTIONS = {"addmonths", "year", "monthsbetween", "case"}   # create-formula-attribute, accepted live
 MISSING_FORMULA_FUNCTIONS = {"sign"}      # refused by a tenant: "Searching for '<name>' resulted in no matches"
 _DISPLAY_COLUMN = re.compile(r"\b(description|desc|name|label|title|text)$", re.I)
 # A source_change whose text describes a type change: that is change_column_type, done in the model.
