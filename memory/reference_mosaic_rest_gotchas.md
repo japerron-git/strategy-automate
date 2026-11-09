@@ -55,8 +55,9 @@ comes back as a date unless `dataType` is set to integer. Confirmed: `AddMonths(
 `Year([date])`, `MonthsBetween([a], [b])`. String literals and decimals are unconfirmed. `Sign` does not exist
 (refused with `8004cd15`, "Searching for 'Sign' resulted in no matches", 2026-11-09): the tenant resolves each
 function by name when the request is applied, inside the changeset, which is discarded on refusal.
-`Case([CURRENT ACTUAL UPB] > 0, 1, 0)` typed integer was accepted (2026-11-09): `Case` and the `>`
-comparison pass validation. Its values after the republish are not yet checked.
+`Case([CURRENT ACTUAL UPB] > 0, 1, 0)` typed integer was accepted (2026-11-09) and, after the republish,
+flags exactly the rows with a positive balance (count of loans flagged 1 = count with UPB > 0): `Case` and
+the `>` comparison work in formula attributes.
 `build_mosaic.py create-formula-attribute` sends this shape.
 
 ## Column objectIds (the #1 trap)
