@@ -800,6 +800,52 @@ class EarlyStageSignalTests(unittest.TestCase):
         self.assertNotIn("date_lookup", [x["kind"] for x in am.lookup_suggestions(named)])
 
 
+class BaselineTests(unittest.TestCase):
+    """Reviewed answers of ungraded questions, frozen: a later change is reported for review, never graded."""
+
+    BANK = {"questions": [
+        {"id": "Q1", "level": 2, "key": ["region"], "measures": ["n"], "expected": {"source": "none"}},
+        {"id": "Q2", "level": 2, "key": ["region"], "measures": ["n"],
+         "expected": {"source": "inline", "rows": [{"region": "N", "n": 5}]}},
+        {"id": "Q3", "level": 3, "expected": {"source": "none"}}]}
+
+    def _results(self, n):
+        return {"results": [{"id": "Q1", "ok": True, "rows": [{"region": "N", "n": n}, {"region": "S", "n": 2}]},
+                            {"id": "Q2", "ok": True, "rows": [{"region": "N", "n": 5}]},
+                            {"id": "Q3", "ok": False, "error": "boom"}]}
+
+    def test_freeze_then_grade_same_and_changed(self):
+        bank = json.loads(json.dumps(self.BANK))
+        out = am.freeze_baselines(bank, self._results(4), ["Q1", "Q2", "Q3", "Q9"], round_no=5, note="reviewed")
+        self.assertEqual(out["frozen"], ["Q1"])
+        self.assertEqual([x["id"] for x in out["skipped"]], ["Q2", "Q3"])     # graded already; no result
+        self.assertEqual(out["unknown"], ["Q9"])
+        self.assertEqual(bank["questions"][0]["baseline"]["round"], 5)
+
+        same = am.grade_bank(bank, self._results(4))
+        q1 = next(g for g in same["questions"] if g["id"] == "Q1")
+        self.assertEqual((q1["verdict"], q1["baseline"]), ("ungraded", "same"))   # still ungraded, not a pass
+        self.assertEqual(same["summary"]["by_verdict"].get("pass"), 1)            # only Q2 passes
+        self.assertEqual(same["baseline_changes"], [])
+
+        changed = am.grade_bank(bank, self._results(7))
+        self.assertEqual(changed["baseline_changes"], ["Q1"])
+        self.assertEqual(changed["summary"]["baseline"], {"changed": 1})
+
+    def test_cli_freezes_into_the_bank(self):
+        d = tempfile.mkdtemp(prefix="assess-baseline-")
+        self.addCleanup(shutil.rmtree, d, True)
+        bp, rp = os.path.join(d, "bank.json"), os.path.join(d, "results.json")
+        with open(bp, "w", encoding="utf-8") as f:
+            json.dump(self.BANK, f)
+        with open(rp, "w", encoding="utf-8") as f:
+            json.dump(self._results(4), f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(am.main(["baseline", "--bank", bp, "--results", rp, "--ids", "Q1", "--round", "5"]), 0)
+        with open(bp, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["questions"][0]["baseline"]["rows"][1], {"region": "S", "n": 2})
+
+
 class SourceChangeAndLookupStepTests(unittest.TestCase):
     def test_lookup_steps_make_filtered_columns_attributes(self):
         text = am.lookup_steps({"csv": "period.csv", "key_attribute": "snapshot month",

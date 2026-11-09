@@ -101,6 +101,13 @@ model probably cannot answer.
 - **Discoverability:** `clear` (name and description lead to the right metric), `ambiguous` (two
   plausible metrics), `misleading` (the obvious choice gives a wrong answer).
 - **Performance:** seconds per query; note time-outs.
+- **Baseline** (ungraded questions only): a reviewed answer frozen with `assess_model.py baseline`
+  (`question.baseline`: rows, round, note). Grading marks the question `same` or `changed` against it and
+  lists `baseline_changes`; the verdict stays `ungraded`. A baseline says what the model answered when
+  someone checked it, not that it was right, so a change is reviewed (an intended fix or a regression),
+  never counted as a fail, and baselines never count as passes. Freeze only answers reviewed and judged
+  right; refresh a baseline after a finding changes it on purpose. Prefer a real expected value whenever
+  an outside reference exists.
 
 Headline score: verdicts by level, and answer paths overall. A model is in good shape when level 1-3
 questions pass through governed metrics and level 4 questions pass through governed metrics or

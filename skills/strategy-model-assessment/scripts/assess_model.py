@@ -1113,6 +1113,44 @@ def _reference_rows(q: dict, result: dict, bank_dir: str) -> tuple[list[dict] | 
     return None, "no expected value"
 
 
+def baseline_check(q: dict, res: dict) -> dict[str, Any]:
+    """An ungraded question with a frozen, reviewed answer: is today's answer the same? A difference is
+    'changed', to review (an intended fix or a regression), never a pass or fail: a baseline says what the
+    model answered when someone checked it, not that it was right."""
+    base = q["baseline"]
+    try:
+        cmp = svm.compare_rows(res.get("rows") or [], list(base.get("rows") or []), list(q.get("key") or []),
+                               list(q.get("measures") or []), float(base.get("tolerance", 1e-6)), str(q.get("id")),
+                               allow_empty=True)
+    except SystemExit as e:   # no numeric columns: compare the rows as they are
+        same = sorted(json.dumps(r, sort_keys=True) for r in res.get("rows") or []) == \
+               sorted(json.dumps(r, sort_keys=True) for r in base.get("rows") or [])
+        return {"baseline": "same" if same else "changed", "baseline_round": base.get("round"),
+                "baseline_note": f"compared as text ({e})"}
+    return {"baseline": "same" if cmp["status"] == "ok" else "changed", "baseline_round": base.get("round"),
+            "baseline_comparison": cmp}
+
+
+def freeze_baselines(bank: dict, results: dict, ids: list[str], *, round_no: int | None, note: str = "",
+                     force: bool = False) -> dict[str, Any]:
+    """Save reviewed answers of ungraded questions as baselines (in place on `bank`)."""
+    by_id = {r.get("id"): r for r in results.get("results") or []}
+    done, skipped = [], []
+    for q in bank.get("questions") or []:
+        if q.get("id") not in ids:
+            continue
+        res = by_id.get(q["id"])
+        if (q.get("expected") or {}).get("source") not in (None, "none") and not force:
+            skipped.append({"id": q["id"], "why": "has an expected value; a baseline is for ungraded questions"})
+        elif not res or not res.get("ok"):
+            skipped.append({"id": q["id"], "why": "no successful result to freeze"})
+        else:
+            q["baseline"] = {"rows": res.get("rows") or [], "round": round_no, "note": note}
+            done.append(q["id"])
+    missing = [i for i in ids if i not in {q.get("id") for q in bank.get("questions") or []}]
+    return {"frozen": done, "skipped": skipped, "unknown": missing}
+
+
 def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: float | None = None,
                previous: dict | None = None) -> dict[str, Any]:
     by_id = {r.get("id"): r for r in results.get("results") or []}
@@ -1145,6 +1183,8 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
                 except SystemExit as e:
                     item.update({"verdict": "error", "note": f"comparison: {e}"})
             item["seconds"] = res.get("seconds")
+            if item["verdict"] == "ungraded" and q.get("baseline") and res.get("ok"):
+                item.update(baseline_check(q, res))
         graded.append(item)
 
     summary: dict[str, Any] = {"total": len(graded), "by_verdict": {}, "by_level": {}, "by_expected_path": {},
@@ -1155,7 +1195,12 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
                          ("by_strength", str(g["strength"])), ("by_use_case", str(g["use_case"]))):
             bucket = summary[key].setdefault(val, {})
             bucket[g["verdict"]] = bucket.get(g["verdict"], 0) + 1
-    out: dict[str, Any] = {"version": 1, "model": bank.get("model"), "summary": summary, "questions": graded}
+    summary["baseline"] = {}
+    for g in graded:
+        if g.get("baseline"):
+            summary["baseline"][g["baseline"]] = summary["baseline"].get(g["baseline"], 0) + 1
+    out: dict[str, Any] = {"version": 1, "model": bank.get("model"), "summary": summary, "questions": graded,
+                           "baseline_changes": [g["id"] for g in graded if g.get("baseline") == "changed"]}
     if previous:
         before = {g.get("id"): g.get("verdict") for g in previous.get("questions") or []}
         changes = [{"id": g["id"], "before": before[g["id"]], "after": g["verdict"]}
@@ -1932,6 +1977,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="relative tolerance when a question sets none (default 1e-6)")
     sp.add_argument("--previous", help="an earlier graded.json: report changed verdicts and regressions")
 
+    sp = sub.add_parser("baseline", help="freeze reviewed answers of ungraded questions as baselines")
+    sp.add_argument("--bank", required=True, help="question bank to update in place")
+    sp.add_argument("--results", required=True, help="results.json holding the reviewed answers")
+    sp.add_argument("--ids", required=True, help="comma-separated question ids, reviewed and judged right")
+    sp.add_argument("--round", type=int, default=None)
+    sp.add_argument("--note", default="", help="what the review checked")
+    sp.add_argument("--force", action="store_true", help="also for questions that have an expected value")
+
     sp = sub.add_parser("plan", help="order approved findings into phases with commands and test plans")
     sp.add_argument("--findings", required=True)
     sp.add_argument("--out", required=True)
@@ -2062,8 +2115,18 @@ def _offline(args: argparse.Namespace) -> int:
         report = {"ok": True, "out": args.out, "by_verdict": out["summary"]["by_verdict"]}
         if "regressions" in out:
             report["regressions"] = out["regressions"]
+        if out["baseline_changes"]:
+            report["baseline_changes"] = out["baseline_changes"]   # review: an intended fix or a regression
         print(json.dumps(report, indent=2))
         return 0
+    if args.cmd == "baseline":
+        bank = _load_json(args.bank)
+        out = freeze_baselines(bank, _load_json(args.results), [i.strip() for i in args.ids.split(",") if i.strip()],
+                               round_no=args.round, note=args.note, force=args.force)
+        if out["frozen"]:
+            _write_json(args.bank, bank)
+        print(json.dumps({"ok": not out["unknown"], **out}, indent=2))
+        return 0 if not out["unknown"] else 2
     if args.cmd == "plan":
         statuses = tuple(s.strip() for s in args.status.split(",") if s.strip())
         bad = [s for s in statuses if s not in STATUSES]
