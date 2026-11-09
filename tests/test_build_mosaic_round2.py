@@ -832,6 +832,51 @@ class BaseUrlAndFlagTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 1)
 
 
+class RelationshipTableInferenceTests(unittest.TestCase):
+    """A hint without relationship_table on a model with several tables: the one table both attributes read."""
+
+    def test_names_of_the_connector_resolve_to_attributes(self):
+        self.assertEqual(bm.attribute_name_candidates("Zero Balance__code"), ["zero balance__code", "zero balance"])
+        self.assertEqual(bm.attribute_name_candidates("delinquency bucket (id)"),
+                         ["delinquency bucket (id)", "delinquency bucket"])
+        self.assertEqual(bm.attribute_name_candidates("region"), ["region"])
+
+    def test_infer_table(self):
+        tables = {"facts": "T", "map": "T2", "other": "T3"}
+        self.assertEqual(bm.infer_relationship_table({}, {"T2"}, {"T", "T2"}, tables), ("T2", ""))
+        self.assertIsNone(bm.infer_relationship_table({}, {"T3"}, {"T"}, tables)[0])
+        both = bm.infer_relationship_table({"attributeLookupTable": {"objectId": "T2"}}, {"T", "T2"}, {"T", "T2"}, tables)
+        self.assertEqual(both, ("T2", ""))
+        none, why = bm.infer_relationship_table({}, {"T", "T2"}, {"T", "T2"}, tables)
+        self.assertIsNone(none)
+        self.assertIn("['facts', 'map']", why)
+
+    def test_wire_infers_the_shared_table_on_a_multi_table_model(self):
+        def attribute(call):
+            reads = {"P": ["T2"], "C": ["T", "T2"]}[call.path.split("?")[0].rsplit("/", 1)[1]]
+            return Resp(200, {"forms": [{"expressions": [{"tables": [{"objectId": t}]} for t in reads]}]})
+        routes = {**changeset_routes(),
+                  ("GET", r"/api/model/dataModels/M/attributes"): Resp(200, {"attributes": [
+                      {"information": {"objectId": "P", "name": "Plus Flag"}},
+                      {"information": {"objectId": "C", "name": "Status"}}]}),
+                  ("GET", r"/api/model/dataModels/M/tables"): Resp(200, {"tables": [
+                      {"information": {"objectId": "T", "name": "facts.csv"}},
+                      {"information": {"objectId": "T2", "name": "status_map.csv"}}]}),
+                  ("GET", r"/api/model/dataModels/M/attributes/\w+"): attribute}
+        m = make_m(routes)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"relationships": [{"parent_attribute": "plus flag", "child_attribute": "Status (id)"}]}, f)
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                bm.cmd_wire_relationships(m, types.SimpleNamespace(model_id="M", hints=f.name, dry_run=True,
+                                                                   replace=False))
+        finally:
+            os.unlink(f.name)
+        self.assertIn("1 to write, 0 skipped", err.getvalue())
+        self.assertIn("via status_map.csv (inferred)", err.getvalue())
+
+
 # ── end to end: the CLI against the fake tenant ──────────────────────────────
 
 class CliCleanupTests(unittest.TestCase):

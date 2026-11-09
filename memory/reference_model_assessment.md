@@ -275,7 +275,7 @@ label column is listed as an attribute that no metric filters on.
   on a one-table model. Lookup and mapping tables already joined through the same attribute take the same
   type in the same command, so their joins keep working. After the type phase, questions that compare the
   column with numbers (`= 1`, `/ 100`) need text or date comparisons. Every command that takes an
-  attribute name also accepts the connector's `<attribute>__<form>` name.
+  attribute name also accepts the connector's form names, `<attribute>__<form>` and `<attribute> (<form>)`.
 - **`source_change`** (`table`, `column`, `change`) is a change the model cannot make: a new column from
   outside the model, sentinels to NULL, values rewritten (padding codes that the source stores without
   their zeros). `plan` gathers every `source_change` into **one** rebuild step at the start of phase 1,
@@ -289,8 +289,9 @@ label column is listed as an attribute that no metric filters on.
   checks the functions when the step is applied, inside a changeset that is discarded if refused.
   Republish afterwards.
 - **`wire_relationships`** (`relationships`: a list of `{parent_attribute, child_attribute,
-  relationship_table, type}`, type one_to_many | many_to_many | one_to_one; `relationship_table` optional
-  on a one-table model, matched loosely otherwise) declares parent-child
+  relationship_table, type}`, type one_to_many | many_to_many | one_to_one; `relationship_table` is
+  optional: the command uses the one table both attributes read, preferring the parent's lookup table, and
+  says which it chose) declares parent-child
   relationships. `plan` merges them into one `build_mosaic.py wire-relationships` command at the start of
   phase 3 and ships its hints file as `specs/relationships.json`.
 - **`rename_describe`** (`items`: `{object_type: attribute | fact_metric, current_name, new_name,

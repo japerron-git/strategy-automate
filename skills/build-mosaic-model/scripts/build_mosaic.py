@@ -4028,6 +4028,23 @@ def _read_merge_hints(path: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def infer_relationship_table(parent_full: dict, p_tids, c_tids, tables_by_name: dict) -> tuple[str | None, str]:
+    """The table a relationship lives in, when the hint names none: the one table both attributes read (each has
+    an expression on it). Several: the parent's lookup table if it is one of them. -> (table id, why not)."""
+    names = {tid: n for n, tid in tables_by_name.items()}
+    common = sorted(set(p_tids) & set(c_tids))
+    if len(common) == 1:
+        return common[0], ""
+    if not common:
+        return None, ("no table that both attributes read; name relationship_table, after giving the parent or "
+                      "child an expression on it")
+    lookup = (parent_full.get("attributeLookupTable") or {}).get("objectId")
+    if lookup in common:
+        return lookup, ""
+    return None, (f"both attributes read {len(common)} tables ({sorted(names.get(t, t) for t in common)}); name "
+                  f"relationship_table")
+
+
 def cmd_wire_relationships(m: MSTR, args):
     """Wire attribute relationships with step-3/step-5 validation.
 
@@ -4039,7 +4056,7 @@ def cmd_wire_relationships(m: MSTR, args):
       {"relationships": [
          {"parent_attribute": "<name or id>",
           "child_attribute":  "<name or id>",
-          "relationship_table": "<name or id>",   # optional on a one-table model
+          "relationship_table": "<name or id>",   # optional: inferred from the tables both attributes read
           "type": "one_to_many"|"many_to_many"|"one_to_one"}]}
     """
     m.login(identity=True)
@@ -4086,8 +4103,11 @@ def cmd_wire_relationships(m: MSTR, args):
     def _resolve_attr(ref: str) -> dict:
         if not ref: return None
         if ref in by_id: return by_id[ref]
-        hits = by_name.get(ref.lower()) or []
-        return hits[0] if len(hits) == 1 else None
+        for cand in attribute_name_candidates(ref):   # also the connector's form names
+            hits = by_name.get(cand) or []
+            if hits:
+                return hits[0] if len(hits) == 1 else None
+        return None
 
     def _attr_problem(ref: str, role: str) -> str:
         n = len(by_name.get((ref or "").lower()) or [])
@@ -4096,8 +4116,8 @@ def cmd_wire_relationships(m: MSTR, args):
         return f"{role} attribute {ref!r} not found"
 
     def _resolve_table(ref: str) -> str:
-        if not ref:   # optional on a one-table model: the relationship lives in that table
-            return next(iter(tables_by_name.values())) if len(tables_by_name) == 1 else None
+        if not ref:   # inferred below from the tables both attributes read
+            return None
         if ref in tables_by_name.values(): return ref
         if ref in tables_by_name: return tables_by_name[ref]
         loose = [tid for nm, tid in tables_by_name.items() if _table_key(nm) == _table_key(ref)]
@@ -4111,6 +4131,7 @@ def cmd_wire_relationships(m: MSTR, args):
         child  = _resolve_attr(h.get("child_attribute"))
         rtbl_id = _resolve_table(h.get("relationship_table"))
         rtype  = h.get("type","one_to_many")
+        table_given = bool(h.get("relationship_table"))
         label = f"{h.get('parent_attribute')}→{h.get('child_attribute')} via {h.get('relationship_table')}"
 
         if not parent:
@@ -4119,10 +4140,9 @@ def cmd_wire_relationships(m: MSTR, args):
         if not child:
             skips.append((label, _attr_problem(h.get("child_attribute"), "child")))
             continue
-        if not rtbl_id:
-            why = (f"relationship_table {h.get('relationship_table')!r} not found in model" if h.get("relationship_table")
-                   else "relationship_table is required when the model has more than one table")
-            skips.append((label, f"{why}; tables: {sorted(tables_by_name)}"))
+        if table_given and not rtbl_id:
+            skips.append((label, f"relationship_table {h.get('relationship_table')!r} not found in model; "
+                                 f"tables: {sorted(tables_by_name)}"))
             continue
 
         # Step-3: forbid self-reference.
@@ -4137,6 +4157,13 @@ def cmd_wire_relationships(m: MSTR, args):
         c_full = _fetch_attribute(m, model_id, c_id, fetched)
         p_tids = _attr_table_ids(p_full)
         c_tids = _attr_table_ids(c_full)
+        if not table_given:
+            rtbl_id, why = infer_relationship_table(p_full, p_tids, c_tids, tables_by_name)
+            if not rtbl_id:
+                skips.append((label, why))
+                continue
+            label = f"{h.get('parent_attribute')}→{h.get('child_attribute')} via " \
+                    f"{next((n for n, t in tables_by_name.items() if t == rtbl_id), rtbl_id)} (inferred)"
 
         # Step-5: both endpoints must have an expression on the relationship table.
         missing = []
@@ -5398,6 +5425,19 @@ def embedded_element_filter_body(attribute: dict, elements: list[str]) -> dict:
     return embedded_filter_body([(attribute, elements)])
 
 
+def attribute_name_candidates(name: str) -> list[str]:
+    """The connector shows an attribute's forms as '<attribute>__<form>' or '<attribute> (<form>)'. Return the
+    name as given, then the attribute name behind such a form name (lower case)."""
+    n = (name or "").strip().lower()
+    out = [n]
+    if "__" in n:
+        out.append(n.split("__", 1)[0].strip())
+    hit = _re.match(r"^(.*\S)\s+\(([^()]+)\)$", n)
+    if hit:
+        out.append(hit.group(1))
+    return list(dict.fromkeys(x for x in out if x))
+
+
 def resolve_model_object_ref(m: MSTR, model_id: str, collection: str, sub_type: str,
                              name_or_id: str) -> dict:
     """Name (case-insensitive) or objectId → {"objectId", "subType", "name"} from a
@@ -5407,9 +5447,10 @@ def resolve_model_object_ref(m: MSTR, model_id: str, collection: str, sub_type: 
     infos = [o.get("information") or {} for o in items if isinstance(o, dict)]
     hits = [i for i in infos if (i.get("objectId") or "").upper() == name_or_id.upper()
             or (i.get("name") or "").lower() == name_or_id.lower()]
-    if not hits and "__" in name_or_id:   # the connector names an attribute's forms "<attribute>__<form>"
-        base = name_or_id.split("__", 1)[0].lower()
-        hits = [i for i in infos if (i.get("name") or "").lower() == base]
+    for alt in attribute_name_candidates(name_or_id)[1:]:   # a connector form name: its attribute
+        if hits:
+            break
+        hits = [i for i in infos if (i.get("name") or "").lower() == alt]
     if not hits:
         die(f"no {collection} entry matches '{name_or_id}'")
     if len(hits) > 1:
@@ -5866,8 +5907,8 @@ def resolve_column_targets(model: dict, cols: dict[str, tuple[str, str]],
         if key in cols:
             col = cols[key][1]
         else:
-            # the connector names an attribute's forms "<attribute>__<form>" (postal code__id): use the attribute
-            base = key.split("__", 1)[0] if "__" in key and key not in via else key
+            # a connector form name ("postal code__id", "bucket (id)"): use the attribute behind it
+            base = next((c for c in attribute_name_candidates(key) if c in via), key)
             hits = sorted(set(via.get(base) or []))
             if len(hits) != 1:
                 unknown.append(name if not hits else f"{name} (reads {hits})")
