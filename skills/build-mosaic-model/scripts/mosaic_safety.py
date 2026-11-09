@@ -112,6 +112,10 @@ def parse_mstr_error(value: Any) -> dict[str, Any]:
             return result
         if isinstance(body, dict):
             _fill_error_fields(result, body)
+    headers = getattr(value, "headers", None) or {}
+    if not (result["code"] or result["message"]) and hasattr(headers, "get"):   # errors sent as headers only
+        result["code"] = headers.get("X-MSTR-ErrorCode") or None
+        result["message"] = (headers.get("X-MSTR-ErrorMessage") or "")[:400]
     return result
 
 
@@ -126,7 +130,18 @@ def _fill_error_fields(result: dict, body: dict) -> dict:
         except ValueError:
             pass
     result["iServerCode"] = iserver if iserver not in (None, "") else result.get("iServerCode")
-    result["message"] = body.get("message") or body.get("error") or result.get("message") or ""
+    msg = body.get("message") or body.get("error") or body.get("detail") or body.get("title")
+    if not isinstance(msg, str):
+        msg = None
+    nested = body.get("errors") or body.get("details")   # some services nest their errors
+    if isinstance(nested, list) and nested and isinstance(nested[0], dict):
+        first = nested[0]
+        result["code"] = result["code"] or first.get("code")
+        inner = "; ".join(str(e.get("message") or e.get("detail") or "") for e in nested[:3] if isinstance(e, dict))
+        msg = msg or inner or None
+    if not msg and not result["code"] and body:
+        msg = json.dumps(body, separators=(",", ":"))[:400]   # unknown shape: show it rather than lose it
+    result["message"] = msg or result.get("message") or ""
     return result
 
 

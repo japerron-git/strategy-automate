@@ -232,5 +232,25 @@ class TestDetectRolePlayingSecondaries(unittest.TestCase):
         self.assertEqual(len(s), 1)
 
 
+
+class ErrorShapeTests(unittest.TestCase):
+    """The tenant's reason must reach the operator whatever shape the error takes."""
+
+    class R:
+        def __init__(self, status, text, headers=None):
+            self.status_code, self.text, self.headers = status, text, headers or {}
+
+    def test_nested_unknown_and_header_errors(self):
+        R = self.R
+        self.assertEqual(ms.format_mstr_error(R(400, '{"errors":[{"code":"8004cc0b","message":"bad function"}]}')),
+                         "HTTP 400 [8004cc0b] bad function")
+        self.assertEqual(ms.format_mstr_error(R(400, '{"objectErrors":[{"field":"forms"}]}')),
+                         'HTTP 400 {"objectErrors":[{"field":"forms"}]}')
+        self.assertEqual(ms.format_mstr_error(R(400, "", {"X-MSTR-ErrorCode": "ERR001",
+                                                          "X-MSTR-ErrorMessage": "Invalid formula"})),
+                         "HTTP 400 [ERR001] Invalid formula")
+        self.assertEqual(ms.format_mstr_error(R(400, '{"code":"8004ccc7","message":"Table cannot be used"}')),
+                         "HTTP 400 [8004ccc7] Table cannot be used")
+
 if __name__ == "__main__":
     unittest.main()
