@@ -314,7 +314,10 @@ label column is listed as an attribute that no metric filters on.
   given inline as `args.metrics` (with optional `args.presets`) instead of `args.spec`.
 - **Once-per-entity amounts and weighted averages** on a periodic-snapshot fact (one row per entity per
   period) are `create_level_metric` and `create_weighted_average`, not hand-written formulas: summing the
-  raw fact counts an entity once per period, and a plain average weights by row count.
+  raw fact counts an entity once per period, and a plain average weights by row count. Setting a fact
+  metric's aggregation to Avg leaves that row weighting in place (an entity with more periods counts
+  more), so propose the per-entity average with it: `create_level_metric` with `outer: Avg`
+  (`Avg(Max([M]){~+,[Entity]+}){~+}`).
 
 - **Percent formats follow the stored scale.** `percent` multiplies by 100, for values stored as 0-1
   fractions; values stored in points (an LTV of 76.01, a rate of 3.875) take `percent_0_100`, or `fixed2`

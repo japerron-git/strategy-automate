@@ -597,6 +597,13 @@ class MaturityTests(unittest.TestCase):
         attrs[2]["name"] = "snapshot month"
         self.assertEqual(am.maturity_signals({"attributes": attrs, "metrics": metrics})["estimated_level"], "M3")
         self.assertEqual(am.maturity_signals({"attributes": attrs, "metrics": metrics[:2]})["estimated_level"], "M2")
+        # many governed metrics on top of structural defects stay at M2; helper metrics don't count
+        flawed = metrics + [{"name": f"{n} score", "type": "bigint", "formula": f"sum(t.{{{n}}})"} for n in "abc"]
+        self.assertEqual(am.maturity_signals({"attributes": attrs, "metrics": flawed})["estimated_level"], "M2")
+        helpers = [{"name": f"WA x {k}", "type": "double", "formula": "Sum(Max([a]){~+,[b]+})"}
+                   for k in ("numerator", "denominator")]
+        self.assertEqual(am.maturity_signals({"attributes": attrs, "metrics": metrics[:2] + helpers})["derived_metrics"],
+                         am.maturity_signals({"attributes": attrs, "metrics": metrics[:2]})["derived_metrics"])
 
 
 def _snapshot_rows():

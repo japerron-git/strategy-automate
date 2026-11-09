@@ -501,6 +501,9 @@ def looks_like_integer_date(attr: dict) -> bool:
     return bool(lo and hi and ok(lo) and ok(hi))
 
 
+_HELPER_METRIC = re.compile(r"\b(numerator|denominator|helper)\s*$", re.I)
+
+
 def maturity_signals(scope: dict) -> dict[str, Any]:
     """Signals from the scope and an estimated maturity level (memory/reference_model_assessment.md
     "Maturity levels"). An estimate to confirm during the assessment, not a grade."""
@@ -509,7 +512,8 @@ def maturity_signals(scope: dict) -> dict[str, Any]:
     names = [a["name"].lower() for a in attrs]
     described = sum(1 for o in attrs + metrics if (o.get("description") or "").strip())
     total = len(attrs) + len(metrics) or 1
-    derived = [m["name"] for m in metrics if m.get("formula") and not _RAW_METRIC.match(m["formula"].strip())]
+    derived = [m["name"] for m in metrics if m.get("formula") and not _RAW_METRIC.match(m["formula"].strip())
+               and not _HELPER_METRIC.search(m["name"])]   # a weighted average's helpers are one metric, not three
     default_named = [o["name"] for o in attrs + metrics if _DEFAULT_NAME.match(o["name"].strip())]
     attribute_like_metrics = [m["name"] for m in metrics if _ATTRIBUTE_LIKE.search(_words(m["name"]))
                               and m.get("formula") and _RAW_METRIC.match(m["formula"].strip())]
@@ -529,6 +533,8 @@ def maturity_signals(scope: dict) -> dict[str, Any]:
         level = "M2" if decoded else "M1"
     else:
         level = "M4" if (share >= 0.9 and latest_flag and decoded) else "M3"
+    if structural and level in ("M3", "M4"):
+        level = "M2"   # governed metrics on top of structural defects (summed scores, numeric dates, text amounts)
     return {"estimated_level": level, "described_share": share, "derived_metrics": len(derived),
             "raw_metrics": len(metrics) - len(derived), "default_named_objects": default_named,
             "metrics_that_look_like_attributes": attribute_like_metrics,
