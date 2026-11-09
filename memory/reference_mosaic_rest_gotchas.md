@@ -52,7 +52,9 @@ Descriptions over 250 characters are refused. Derived metrics need a full-body P
 then `end_of_text`. Include `keyForm`, `attributeLookupTable` and report/browse `displays`, or the commit
 is refused. The server infers the form's type from the column inside the formula, so `Year([a date])`
 comes back as a date unless `dataType` is set to integer. Confirmed: `AddMonths([PERIOD], -1)`,
-`Year([date])`, `MonthsBetween([a], [b])`. String literals and decimals are unconfirmed.
+`Year([date])`, `MonthsBetween([a], [b])`. String literals and decimals are unconfirmed. `Sign` does not exist
+(refused with `8004cd15`, "Searching for 'Sign' resulted in no matches", 2026-11-09): the tenant resolves each
+function by name when the request is applied, inside the changeset, which is discarded on refusal.
 `build_mosaic.py create-formula-attribute` sends this shape.
 
 ## Column objectIds (the #1 trap)

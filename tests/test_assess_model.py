@@ -994,6 +994,9 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         fa["args"]["formula"] = "Year([CLOSE DATE])"
         plan = am.build_plan({"findings": [_finding("F1", "attribute", actions=[fa])]}, model_id="MID")
         self.assertFalse(any("not yet confirmed live" in w for w in plan["warnings"]))
+        fa["args"]["formula"] = "Sign([BALANCE])"
+        plan = am.build_plan({"findings": [_finding("F1", "attribute", actions=[fa])]}, model_id="MID")
+        self.assertTrue(any("refused as an unknown function" in p for p in plan["problems"]))
 
     def test_lookups_of_a_phase_become_one_checklist_step(self):
         lk = lambda csv, key, **kw: {"kind": "add_lookup_table", "args": {"csv": csv, "key_attribute": key, **kw}}  # noqa: E731

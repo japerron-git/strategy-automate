@@ -85,6 +85,7 @@ _TEST_STEP = re.compile(r"^\s*(after (the )?(republish|reload|type change)\w*,?\
 RELATIONSHIP_TYPES = ("one_to_many", "many_to_many", "one_to_one")
 RELATIONSHIP_HINTS = "specs/relationships.json"   # written into the bundle by plan; scripts run from the repo root
 VERIFIED_FORMULA_FUNCTIONS = {"addmonths", "year", "monthsbetween"}   # create-formula-attribute, confirmed live
+MISSING_FORMULA_FUNCTIONS = {"sign"}      # refused by a tenant: "Searching for '<name>' resulted in no matches"
 _DISPLAY_COLUMN = re.compile(r"\b(description|desc|name|label|title|text)$", re.I)
 # A source_change whose text describes a type change: that is change_column_type, done in the model.
 _TYPE_CHANGE_TEXT = re.compile(r"\b(data ?type|column type|varchar|utf8|retype)\b|\b(load|reload|re-load|read|cast|"
@@ -1502,6 +1503,11 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
             formula = str((a.get("args") or {}).get("formula") or "") if a.get("kind") == "create_formula_attribute" else ""
             new_fns = sorted({fn for fn in re.findall(r"([A-Za-z_]\w*)\s*\(", formula)
                               if fn.lower() not in VERIFIED_FORMULA_FUNCTIONS})
+            gone = [fn for fn in new_fns if fn.lower() in MISSING_FORMULA_FUNCTIONS]
+            if gone:
+                problems.append(f"{f['id']}: '{(a.get('args') or {}).get('name')}' uses {', '.join(gone)}, which a "
+                                f"tenant has refused as an unknown function; use another formula or a source change")
+                new_fns = [fn for fn in new_fns if fn not in gone]
             if new_fns:
                 warnings.append(f"{f['id']}: '{(a.get('args') or {}).get('name')}' uses {', '.join(new_fns)}, not yet "
                                 f"confirmed live. The dry run checks columns only; the tenant checks the functions "
