@@ -558,10 +558,31 @@ def _select(questions: list[dict], only: str = "", levels: str = "") -> list[dic
     return [q for q in questions if (not ids or q.get("id") in ids) and (not lv or q.get("level") in lv)]
 
 
+CHARS_PER_TOKEN = 4   # rough English/SQL average; costs are estimates of connector I/O, not billed tokens
+
+
+def query_cost(sql: str, reply_text: str) -> dict[str, int]:
+    """What one connector query moved: the SQL sent and the reply received, with an estimated token count.
+    Claude's own reasoning around the query is not included (a chat can't see its token counts)."""
+    sent, received = len(sql or ""), len(reply_text or "")
+    return {"queries": 1, "sql_chars": sent, "reply_chars": received,
+            "est_tokens": -(-(sent + received) // CHARS_PER_TOKEN)}
+
+
+def add_costs(*costs: dict | None) -> dict[str, int]:
+    out = {"queries": 0, "sql_chars": 0, "reply_chars": 0, "est_tokens": 0}
+    for c in costs:
+        for k in out:
+            out[k] += int((c or {}).get(k) or 0)
+    return out
+
+
 def _execute(runner: Runner, project: str, sql: str, max_rows: int) -> dict[str, Any]:
     t0 = time.monotonic()
     try:
-        parsed = parse_query_result(runner.call("query", {"project": project, "query": sql}))
+        reply = runner.call("query", {"project": project, "query": sql})
+        parsed = parse_query_result(reply)
+        parsed["cost"] = query_cost(sql, tool_text(reply) or json.dumps(reply.get("structuredContent") or ""))
     except PendingReply:
         return {"ok": False, "pending": True, "error": "reply not saved yet", "columns": [], "rows": [],
                 "row_count": 0, "truncated": False, "seconds": None}
@@ -570,7 +591,7 @@ def _execute(runner: Runner, project: str, sql: str, max_rows: int) -> dict[str,
     rows = parsed["rows"]
     return {"ok": parsed["ok"], "error": parsed["error"], "columns": parsed["columns"],
             "rows": rows[:max_rows], "row_count": len(rows), "truncated": len(rows) > max_rows,
-            "seconds": round(time.monotonic() - t0, 3)}
+            "seconds": round(time.monotonic() - t0, 3), "cost": parsed.get("cost") or query_cost(sql, "")}
 
 
 def run_bank(runner: Runner, project: str, bank: dict, *, only: str = "", levels: str = "",
@@ -581,6 +602,10 @@ def run_bank(runner: Runner, project: str, bank: dict, *, only: str = "", levels
     for i, q in enumerate(questions):
         log(f"run {i + 1}/{len(questions)}: {q.get('id')}")
         entry: dict[str, Any] = {"id": q.get("id"), "level": q.get("level")}
+        best = q.get("best_answer") or {}
+        if (best.get("sql") or "").strip():   # also for questions the governed path can't answer
+            best_sql = svm.inject_model(best["sql"], model)
+            entry["best_run"] = {"sql": best_sql, **_execute(runner, project, best_sql, max_rows)}
         if not (q.get("sql") or "").strip():
             entry.update({"ok": False, "error": "no sql (expected_path not_answerable?)", "skipped": True})
             results.append(entry)
@@ -1113,6 +1138,26 @@ def _reference_rows(q: dict, result: dict, bank_dir: str) -> tuple[list[dict] | 
     return None, "no expected value"
 
 
+def rows_digest(rows: list[dict] | None) -> str:
+    """A stable fingerprint of a result, to tell whether it changed between rounds."""
+    return hashlib.sha256(json.dumps(sorted(json.dumps(r, sort_keys=True) for r in rows or []))
+                          .encode("utf-8")).hexdigest()[:12]
+
+
+def _compare(q: dict, rows: list[dict], ref: list[dict], tol: float) -> tuple[str, dict | None, str | None]:
+    """-> (verdict, comparison, error note) with the question's key and measures."""
+    try:
+        cmp = svm.compare_rows(rows or [], ref or [], list(q.get("key") or []), list(q.get("measures") or []),
+                               float(tol), str(q.get("id")))
+        return {"ok": "pass", "mismatch": "fail", "empty": "empty"}.get(cmp["status"], "fail"), cmp, None
+    except SystemExit as e:
+        return "error", None, f"comparison: {e}"
+
+
+def best_answer_version(q: dict) -> int:
+    return len((q.get("best_answer") or {}).get("history") or []) + 1
+
+
 def baseline_check(q: dict, res: dict) -> dict[str, Any]:
     """An ungraded question with a frozen, reviewed answer: is today's answer the same? A difference is
     'changed', to review (an intended fix or a regression), never a pass or fail: a baseline says what the
@@ -1129,6 +1174,45 @@ def baseline_check(q: dict, res: dict) -> dict[str, Any]:
                 "baseline_note": f"compared as text ({e})"}
     return {"baseline": "same" if cmp["status"] == "ok" else "changed", "baseline_round": base.get("round"),
             "baseline_comparison": cmp}
+
+
+BEST_ANSWER_REASONS = ("initial", "decision", "data_change", "sql_error")
+_WS = re.compile(r"\s+")
+
+
+def set_best_answer(bank: dict, qid: str, *, sql: str = "", not_answerable: str = "", reason_kind: str,
+                    reason: str = "", rationale: str = "", round_no: int | None = None) -> dict[str, Any]:
+    """Record a question's best answer: expert SQL over the model's own columns (or why none exists), with
+    its rationale. Later changes are overrides with a recorded reason: the user's decision, a data change,
+    or an error found in the earlier SQL. The history keeps every earlier version."""
+    q = next((x for x in bank.get("questions") or [] if x.get("id") == qid), None)
+    problems = []
+    if q is None:
+        return {"ok": False, "problems": [f"unknown question {qid}"]}
+    if reason_kind not in BEST_ANSWER_REASONS:
+        problems.append(f"reason kind must be one of {', '.join(BEST_ANSWER_REASONS)}")
+    if bool(sql.strip()) == bool(not_answerable.strip()):
+        problems.append("give the best-answer SQL or a not-answerable reason, not both")
+    current = q.get("best_answer")
+    if reason_kind == "initial" and current:
+        problems.append(f"{qid} has a best answer; change it with reason kind decision, data_change or sql_error")
+    if reason_kind != "initial" and not current:
+        problems.append(f"{qid} has no best answer yet; set it with reason kind initial")
+    if reason_kind != "initial" and not reason.strip():
+        problems.append("an override needs --reason: what was decided, what changed in the data, or what was wrong")
+    if sql.strip() and _WS.sub(" ", sql.strip()).lower() == _WS.sub(" ", (q.get("sql") or "").strip()).lower():
+        problems.append("the best answer must be independent of the question's own SQL, or it proves nothing")
+    if problems:
+        return {"ok": False, "problems": problems}
+    history = list((current or {}).get("history") or [])
+    if current:
+        history.append({k: current.get(k) for k in ("sql", "not_answerable", "rationale", "round", "reason_kind",
+                                                     "reason") if current.get(k) is not None})
+    q["best_answer"] = {k: v for k, v in {"sql": sql.strip() or None, "not_answerable": not_answerable.strip() or None,
+                                          "rationale": rationale.strip() or (current or {}).get("rationale"),
+                                          "round": round_no, "reason_kind": reason_kind, "reason": reason.strip() or None,
+                                          "history": history}.items() if v not in (None, [])}
+    return {"ok": True, "id": qid, "version": best_answer_version(q)}
 
 
 def freeze_baselines(bank: dict, results: dict, ids: list[str], *, round_no: int | None, note: str = "",
@@ -1162,6 +1246,19 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
                                 "strength": exp.get("strength") or ("same_model" if exp.get("source") == "same_model_sql"
                                                                     else None)}
         res = by_id.get(q.get("id"))
+        best_q = q.get("best_answer") or {}
+        if best_q:
+            item["best_answer_version"] = best_answer_version(q)
+            if best_q.get("not_answerable"):
+                item["best_answer"] = f"not answerable: {best_q['not_answerable']}"
+        if res is not None:
+            item["cost"] = add_costs(res.get("cost"), (res.get("expected_run") or {}).get("cost"))
+            brun = res.get("best_run") or {}
+            if brun:
+                item["best_cost"] = add_costs(brun.get("cost"))
+                item["best_digest"] = rows_digest(brun.get("rows")) if brun.get("ok") else None
+                if not brun.get("ok"):
+                    item["best_answer_error"] = brun.get("error")
         if res is None:
             item["verdict"] = "not_run"
         elif res.get("skipped"):
@@ -1171,18 +1268,26 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
             item.update({"verdict": "error", "note": res.get("error")})
         else:
             ref, why = _reference_rows(q, res, bank_dir)
+            tol = exp.get("tolerance", tolerance if tolerance is not None else 1e-6)
+            outside = exp.get("source") in ("inline", "reference_file")
+            best = res.get("best_run") or {}
+            if not outside and best.get("ok"):
+                # no outside reference: the best answer ranks above a plain same-model check
+                ref, why = list(best.get("rows") or []), ""
+                item["strength"], item["graded_against"] = "best_answer", "best_answer"
             if ref is None:
                 item.update({"verdict": "ungraded" if why == "no expected value" else "error", "note": why})
             else:
-                tol = exp.get("tolerance", tolerance if tolerance is not None else 1e-6)
-                try:
-                    cmp = svm.compare_rows(res.get("rows") or [], ref, list(q.get("key") or []),
-                                           list(q.get("measures") or []), float(tol), str(q.get("id")))
-                    item["verdict"] = {"ok": "pass", "mismatch": "fail", "empty": "empty"}.get(cmp["status"], "fail")
+                verdict, cmp, err = _compare(q, res.get("rows") or [], ref, tol)
+                item["verdict"] = verdict
+                if cmp:
                     item["comparison"] = cmp
-                except SystemExit as e:
-                    item.update({"verdict": "error", "note": f"comparison: {e}"})
+                if err:
+                    item["note"] = err
+            if outside and best.get("ok") and ref is not None:   # an outside reference checks the best answer too
+                item["best_vs_reference"] = _compare(q, best.get("rows") or [], ref, tol)[0]
             item["seconds"] = res.get("seconds")
+            item["rows_digest"] = rows_digest(res.get("rows"))
             if item["verdict"] == "ungraded" and q.get("baseline") and res.get("ok"):
                 item.update(baseline_check(q, res))
         graded.append(item)
@@ -1195,6 +1300,14 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
                          ("by_strength", str(g["strength"])), ("by_use_case", str(g["use_case"]))):
             bucket = summary[key].setdefault(val, {})
             bucket[g["verdict"]] = bucket.get(g["verdict"], 0) + 1
+    summary["cost"] = {"answers": add_costs(*[g.get("cost") for g in graded]),
+                       "best_answers": add_costs(*[g.get("best_cost") for g in graded]), "by_level": {}}
+    for g in graded:
+        lvl = summary["cost"]["by_level"].setdefault(str(g["level"]), {"answers": add_costs(), "best_answers": add_costs()})
+        lvl["answers"] = add_costs(lvl["answers"], g.get("cost"))
+        lvl["best_answers"] = add_costs(lvl["best_answers"], g.get("best_cost"))
+    summary["cost"]["note"] = (f"connector I/O only: SQL sent plus replies received, ~{CHARS_PER_TOKEN} characters "
+                               f"per token; Claude's own reasoning is not included")
     summary["baseline"] = {}
     for g in graded:
         if g.get("baseline"):
@@ -1207,6 +1320,21 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
                    for g in graded if g["id"] in before and before[g["id"]] != g["verdict"]]
         out["changes"] = changes
         out["regressions"] = [c["id"] for c in changes if c["before"] == "pass"]
+        prev = {g.get("id"): g for g in previous.get("questions") or []}
+        moved, overridden, suspicious = [], [], []
+        for g in graded:
+            p = prev.get(g["id"]) or {}
+            if not (p.get("best_digest") and g.get("best_digest")) or p["best_digest"] == g["best_digest"]:
+                continue
+            if p.get("best_answer_version") == g.get("best_answer_version"):
+                moved.append(g["id"])            # same SQL, different result: the data or model changed under it
+                if g.get("verdict") == "pass" and p.get("verdict") != "pass" and \
+                        p.get("rows_digest") != g.get("rows_digest"):
+                    suspicious.append(g["id"])   # both answers moved this round and now agree: check why
+            else:
+                overridden.append(g["id"])
+        out["best_answer_moved"], out["best_answer_overridden"] = moved, overridden
+        out["suspicious_agreement"] = suspicious
     return out
 
 
@@ -1985,6 +2113,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--note", default="", help="what the review checked")
     sp.add_argument("--force", action="store_true", help="also for questions that have an expected value")
 
+    sp = sub.add_parser("best-answer", help="set a question's best answer, or override it with a recorded reason")
+    sp.add_argument("--bank", required=True, help="question bank to update in place")
+    sp.add_argument("--id", required=True)
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--sql", help="expert SQL over the model's own columns")
+    g.add_argument("--sql-file", help="file holding the expert SQL")
+    g.add_argument("--not-answerable", help="why no SQL over this model can answer it")
+    sp.add_argument("--reason-kind", required=True, choices=BEST_ANSWER_REASONS)
+    sp.add_argument("--reason", default="", help="for an override: the decision, the data change or the error")
+    sp.add_argument("--rationale", default="", help="what the SQL does and why it is the right definition")
+    sp.add_argument("--round", type=int, default=None)
+
     sp = sub.add_parser("plan", help="order approved findings into phases with commands and test plans")
     sp.add_argument("--findings", required=True)
     sp.add_argument("--out", required=True)
@@ -2119,6 +2259,19 @@ def _offline(args: argparse.Namespace) -> int:
             report["baseline_changes"] = out["baseline_changes"]   # review: an intended fix or a regression
         print(json.dumps(report, indent=2))
         return 0
+    if args.cmd == "best-answer":
+        bank = _load_json(args.bank)
+        sql = args.sql or ""
+        if args.sql_file:
+            with open(args.sql_file, encoding="utf-8") as f:
+                sql = f.read()
+        out = set_best_answer(bank, args.id, sql=sql, not_answerable=args.not_answerable or "",
+                              reason_kind=args.reason_kind, reason=args.reason, rationale=args.rationale,
+                              round_no=args.round)
+        if out["ok"]:
+            _write_json(args.bank, bank)
+        print(json.dumps(out, indent=2))
+        return 0 if out["ok"] else 2
     if args.cmd == "baseline":
         bank = _load_json(args.bank)
         out = freeze_baselines(bank, _load_json(args.results), [i.strip() for i in args.ids.split(",") if i.strip()],

@@ -101,6 +101,23 @@ model probably cannot answer.
 - **Discoverability:** `clear` (name and description lead to the right metric), `ambiguous` (two
   plausible metrics), `misleading` (the obvious choice gives a wrong answer).
 - **Performance:** seconds per query; note time-outs.
+- **Best answer:** an expert answer to every question, written during the assessment as SQL over the
+  model's own columns (`question.best_answer`: sql or `not_answerable`, rationale, round), with whatever
+  it takes to be right: once per entity, the latest period, sentinels excluded, distinct counts. It runs
+  every round, including for questions the governed path can't answer. Ranking of what a question is
+  graded against: an outside reference (`inline`, `reference_file`) > the best answer > a plain
+  same-model check. Where an outside reference exists, the best answer is checked against it too
+  (`best_vs_reference`). Set it with `assess_model.py best-answer --reason-kind initial`; change it only as
+  an override with a recorded reason (`decision`: the user decided a definition; `data_change`: the source
+  changed; `sql_error`: the earlier SQL was wrong). The history keeps every version, and SQL identical to
+  the question's own is refused. Grading flags `best_answer_moved` (same SQL, new result: the data or
+  model changed under it), `best_answer_overridden`, and `suspicious_agreement` (the best answer moved
+  and the question now passes: check that both didn't change for the same wrong reason). A best answer
+  from the same model is the assessor's definition, not proof: prefer an outside reference when one exists.
+- **Cost** per question and round: queries, SQL characters sent, reply characters received and an
+  estimated token count (characters / 4), for the governed answer and the best answer separately,
+  totalled per level in the summary. It covers connector I/O only: a chat can't see its own token counts,
+  so Claude's reasoning is not included. A falling cost to reach the right answer is a maturity signal.
 - **Baseline** (ungraded questions only): a reviewed answer frozen with `assess_model.py baseline`
   (`question.baseline`: rows, round, note). Grading marks the question `same` or `changed` against it and
   lists `baseline_changes`; the verdict stays `ungraded`. A baseline says what the model answered when

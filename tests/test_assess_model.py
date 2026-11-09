@@ -800,6 +800,85 @@ class EarlyStageSignalTests(unittest.TestCase):
         self.assertNotIn("date_lookup", [x["kind"] for x in am.lookup_suggestions(named)])
 
 
+def _table_reply(rows):
+    head = "| " + " | ".join(rows[0]) + " |\n| " + " | ".join("---" for _ in rows[0]) + " |\n"
+    return _text(head + "".join("| " + " | ".join(str(c) for c in r) + " |\n" for r in rows[1:]))
+
+
+class BestAnswerAndCostTests(unittest.TestCase):
+    """An expert answer per question, re-run every round; per-question connector cost."""
+
+    def _bank(self):
+        return {"model": "Store Sales", "questions": [
+            {"id": "Q1", "level": 1, "sql": "SELECT region, SUM(\"sales\") AS n FROM [[MODEL]] GROUP BY 1",
+             "key": ["region"], "measures": ["n"], "expected": {"source": "none"}},
+            {"id": "Q2", "level": 4, "sql": "", "expected_path": "not_answerable", "expected": {"source": "none"}},
+            {"id": "Q3", "level": 2, "sql": "SELECT region, SUM(\"sales\") AS n FROM [[MODEL]] WHERE x GROUP BY 1",
+             "key": ["region"], "measures": ["n"],
+             "expected": {"source": "inline", "rows": [{"region": "N", "n": 5}]}}]}
+
+    def _runner(self, governed, best):
+        return FakeRunner({"WHERE x": _table_reply([["region", "n"], ["N", 5]]),
+                           "/* B1 */": _table_reply([["region", "n"], ["N", best]]),
+                           "/* BX */": _table_reply([["region", "n"], ["N", 5]]),
+                           "SUM(\"sales\")": _table_reply([["region", "n"], ["N", governed]])})
+
+    def _set(self, bank):
+        for qid, sql in (("Q1", "SELECT region, SUM(x) AS n /* B1 */ FROM [[MODEL]] GROUP BY 1"),
+                         ("Q2", "SELECT 'N' AS region, 1 AS n /* BX */ FROM [[MODEL]]"),
+                         ("Q3", "SELECT region, 5 AS n /* BX */ FROM [[MODEL]] GROUP BY 1")):
+            self.assertTrue(am.set_best_answer(bank, qid, sql=sql, reason_kind="initial", rationale="r", round_no=1)["ok"])
+
+    def test_cost_is_measured_per_query(self):
+        c = am.query_cost("SELECT 1", "x" * 92)
+        self.assertEqual(c, {"queries": 1, "sql_chars": 8, "reply_chars": 92, "est_tokens": 25})
+        self.assertEqual(am.add_costs(c, c, None)["queries"], 2)
+
+    def test_best_answer_grades_ungraded_questions_and_is_checked_by_references(self):
+        bank = self._bank()
+        self._set(bank)
+        res = am.run_bank(self._runner(4, 4), "retail", bank)
+        self.assertIn("best_run", next(r for r in res["results"] if r["id"] == "Q2"))   # runs even with no governed SQL
+        graded = am.grade_bank(bank, res)
+        by = {g["id"]: g for g in graded["questions"]}
+        self.assertEqual((by["Q1"]["verdict"], by["Q1"]["strength"]), ("pass", "best_answer"))
+        self.assertEqual((by["Q3"]["verdict"], by["Q3"]["best_vs_reference"]), ("pass", "pass"))
+        self.assertEqual(by["Q1"]["cost"]["queries"], 1)
+        self.assertEqual(by["Q1"]["best_cost"]["queries"], 1)
+        self.assertGreater(graded["summary"]["cost"]["answers"]["est_tokens"], 0)
+        self.assertIn("1", graded["summary"]["cost"]["by_level"])
+        self.assertIn("reasoning is not included", graded["summary"]["cost"]["note"])
+
+    def test_drift_override_and_suspicious_agreement(self):
+        bank = self._bank()
+        self._set(bank)
+        r1 = am.grade_bank(bank, am.run_bank(self._runner(3, 4), "retail", bank))     # governed 3, best 4: fail
+        self.assertEqual(next(g for g in r1["questions"] if g["id"] == "Q1")["verdict"], "fail")
+        r2 = am.grade_bank(bank, am.run_bank(self._runner(7, 7), "retail", bank), previous=r1)
+        self.assertEqual(r2["best_answer_moved"], ["Q1"])          # same SQL, new result: data changed under it
+        self.assertEqual(r2["suspicious_agreement"], ["Q1"])       # both moved and now agree
+        self.assertTrue(am.set_best_answer(bank, "Q1", sql="SELECT region, 9 AS n /* B1 */ FROM [[MODEL]]",
+                                           reason_kind="decision", reason="user: count REO", round_no=3)["ok"])
+        r3 = am.grade_bank(bank, am.run_bank(self._runner(7, 9), "retail", bank), previous=r2)
+        self.assertEqual((r3["best_answer_overridden"], r3["best_answer_moved"]), (["Q1"], []))
+        self.assertEqual(len(bank["questions"][0]["best_answer"]["history"]), 1)
+
+    def test_override_rules(self):
+        bank = self._bank()
+        self._set(bank)
+        bad = lambda **kw: am.set_best_answer(bank, "Q1", **kw)["problems"]  # noqa: E731
+        self.assertIn("has a best answer", " ".join(bad(sql="SELECT 2", reason_kind="initial", reason="")))
+        self.assertIn("needs --reason", " ".join(bad(sql="SELECT 2", reason_kind="sql_error", reason="")))
+        self.assertIn("independent of the question's own SQL",
+                      " ".join(bad(sql=bank["questions"][0]["sql"], reason_kind="sql_error", reason="x")))
+        self.assertIn("not both", " ".join(bad(sql="SELECT 2", not_answerable="x", reason_kind="sql_error", reason="x")))
+        ok = am.set_best_answer(bank, "Q2", not_answerable="no loss amounts in this model", reason_kind="data_change",
+                                reason="column dropped", round_no=4)
+        self.assertEqual(ok["version"], 2)
+        graded = am.grade_bank(bank, {"results": [{"id": "Q2", "skipped": True, "error": "no sql"}]})
+        self.assertTrue(next(g for g in graded["questions"] if g["id"] == "Q2")["best_answer"].startswith("not answerable"))
+
+
 class BaselineTests(unittest.TestCase):
     """Reviewed answers of ungraded questions, frozen: a later change is reported for review, never graded."""
 
