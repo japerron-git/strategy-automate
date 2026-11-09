@@ -333,7 +333,8 @@ class PlanTests(unittest.TestCase):
 
         facts = am.action_commands({"kind": "patch_fact_metrics", "args": {"spec": "spec.yaml"}}, mid)
         self.assertEqual(facts["dry_run"][-1], "--dry-run")
-        self.assertEqual(am.action_commands({"kind": "publish"}, mid)["apply"][2:], ["publish", "--model-id", mid])
+        self.assertEqual(am.action_commands({"kind": "publish"}, mid)["apply"][2:],
+                         ["publish", "--model-id", mid, "--poll-seconds", "1800"])   # large models publish slowly
         self.assertIsNone(am.action_commands({"kind": "certify"}, mid)["dry_run"])
 
     def test_level_metric_and_weighted_average_commands(self):

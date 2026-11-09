@@ -78,6 +78,8 @@ MERGED_NOTES = {"source_change": "Source change done in the phase {phase} rebuil
                 "wire_relationships": "Relationships declared in phase {phase} (wire-relationships)",
                 "rename_describe": "Names and descriptions set in phase {phase} (rename-describe)"}
 RENAME_DESCRIBE_SPEC = "specs/rename_describe.json"
+# A republish of a large model runs well past publish's 180 s default; the wait ends as soon as every table is done.
+PUBLISH_WAIT = ["--poll-seconds", "1800"]
 DESCRIPTION_LIMIT = 250
 _TEST_STEP = re.compile(r"^\s*(after (the )?(republish|reload|type change)\w*,?\s*)?(re-?)?(test|check|verify|confirm)\b", re.I)
 RELATIONSHIP_TYPES = ("one_to_many", "many_to_many", "one_to_one")
@@ -1318,7 +1320,7 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         need("csv", "key_attribute")
         return {"dry_run": None, "apply": None, "manual": lookup_steps(a), "problems": problems}
     if kind == "publish":
-        return {"dry_run": None, "apply": base + ["publish", "--model-id", model_id], "manual": None,
+        return {"dry_run": None, "apply": base + ["publish", "--model-id", model_id] + PUBLISH_WAIT, "manual": None,
                 "problems": problems}
     if kind == "certify":
         return {"dry_run": None, "apply": base + ["certify", "--object-id", model_id], "manual": None,
@@ -1617,7 +1619,7 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         after = []
         if republish:
             after.append({"what": "Republish the model (tables, attributes or fact metrics changed).",
-                          "command": cmd([python, BUILD_SCRIPT, "publish", "--model-id", mid])})
+                          "command": cmd([python, BUILD_SCRIPT, "publish", "--model-id", mid] + PUBLISH_WAIT)})
         after.append({"what": "Re-certify the model (edits drop certification; MCP cannot see an uncertified model).",
                       "command": cmd([python, BUILD_SCRIPT, "certify", "--object-id", mid])})
         tests = sorted({t for f in items for t in f.get("tests") or []})
