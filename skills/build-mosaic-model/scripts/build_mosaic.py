@@ -5407,6 +5407,9 @@ def resolve_model_object_ref(m: MSTR, model_id: str, collection: str, sub_type: 
     infos = [o.get("information") or {} for o in items if isinstance(o, dict)]
     hits = [i for i in infos if (i.get("objectId") or "").upper() == name_or_id.upper()
             or (i.get("name") or "").lower() == name_or_id.lower()]
+    if not hits and "__" in name_or_id:   # the connector names an attribute's forms "<attribute>__<form>"
+        base = name_or_id.split("__", 1)[0].lower()
+        hits = [i for i in infos if (i.get("name") or "").lower() == base]
     if not hits:
         die(f"no {collection} entry matches '{name_or_id}'")
     if len(hits) > 1:
@@ -5879,6 +5882,28 @@ def resolve_column_targets(model: dict, cols: dict[str, tuple[str, str]],
     return out, notes
 
 
+def joined_column_targets(model: dict, table_id: str,
+                          targets: dict[str, tuple[str, str, str]]) -> dict[str, dict[str, tuple[str, str, str]]]:
+    """Columns of OTHER tables that the same attribute form reads (a lookup or mapping table keyed on the
+    retyped column). They must take the same type or the join breaks. -> {table_id: {column key: target}}."""
+    out: dict[str, dict[str, tuple[str, str, str]]] = {}
+    for a in model.get("attributes") or []:
+        for f in a.get("forms") or []:
+            reads = []
+            for e in f.get("expressions") or []:
+                col = _simple_column((e.get("expression") or {}).get("text"))
+                for t in e.get("tables") or []:
+                    if col and t.get("objectId"):
+                        reads.append((t["objectId"], col))
+            hit = next((targets[c.casefold()] for tid, c in reads if tid == table_id and c.casefold() in targets), None)
+            if not hit:
+                continue
+            for tid, col in reads:
+                if tid != table_id:
+                    out.setdefault(tid, {})[col.casefold()] = (col, hit[1], hit[2])
+    return out
+
+
 def column_type_table_patch(table: dict, targets: dict[str, tuple[str, str, str]]):
     """-> (physicalTable body for PATCH /tables/{id}, [(column, old type, new type, fmt)], [unchanged columns]).
     Sets each type in physicalTable.columns AND the pipeline; both must agree."""
@@ -6037,6 +6062,20 @@ def cmd_set_column_types(m: MSTR, args):
     if changed and not args.dry_run:
         _patch_in_changeset(m, [(f"table '{tinfo['name']}'", f"/api/model/dataModels/{mid}/tables/{tinfo['objectId']}",
                                  {"physicalTable": pt})], "table")
+    # A lookup or mapping table keyed on a retyped column takes the same type, or its join breaks.
+    joined = [] if args.no_joined else [(t, tgt) for t, tgt in joined_column_targets(model, tinfo["objectId"],
+                                                                                     targets).items()]
+    joined_changed = []
+    for tid, tgt in joined:
+        other = get(f"/api/model/dataModels/{mid}/tables/{tid}")
+        oname = (other.get("information") or {}).get("name", tid)
+        opt, ochanged, _ = column_type_table_patch(other, tgt)
+        for col, old, new, fmt in ochanged:
+            print(f"  ~ {oname}.{col}: {old} -> {new} (joined)", file=sys.stderr)
+            joined_changed.append({"table": oname, "column": col, "from": old, "to": new})
+        if ochanged and not args.dry_run:
+            _patch_in_changeset(m, [(f"table '{oname}'", f"/api/model/dataModels/{mid}/tables/{tid}",
+                                     {"physicalTable": opt})], f"joined table {oname}")
     writes, notes = column_type_object_writes(model, mid, cols, targets, get)
     for n in notes:
         print(f"  ! {n}", file=sys.stderr)
@@ -6045,9 +6084,11 @@ def cmd_set_column_types(m: MSTR, args):
     print(json.dumps({"ok": True, "dry_run": bool(args.dry_run), "table": tinfo["name"],
                       "changed": [{"column": c, "from": o, "to": n, "date_format": f or None}
                                   for c, o, n, f in changed],
-                      "already_set": same, "resolved": resolved, "aligned": [w[0] for w in writes],
+                      "already_set": same, "resolved": resolved, "joined": joined_changed,
+                      "aligned": [w[0] for w in writes],
                       "check_by_hand": notes,
-                      "next": "republish the model for the data to change" if (changed or writes) else None},
+                      "next": "republish the model for the data to change" if (changed or writes or joined_changed)
+                      else None},
                      indent=2))
 
 
@@ -7233,6 +7274,9 @@ def build_parser():
     sp.add_argument("--spec", help="CSV (column_name, target_type, date_format, enabled) or JSON "
                                    "{columns: [{column, type, date_format}]}")
     sp.add_argument("--table", help="table name (default: the table with the most columns)")
+    sp.add_argument("--no-joined", action="store_true",
+                    help="don't retype the matching key column of lookup/mapping tables joined through the same "
+                         "attribute (by default they take the same type, or the join breaks)")
     sp.add_argument("--dry-run", action="store_true", help="print the changes; open no changeset")
 
     sp = sub.add_parser("patch-fact-metrics",

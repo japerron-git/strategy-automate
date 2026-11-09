@@ -73,7 +73,7 @@ def _routes(attr_type=INT):
 
 
 def _args(**kw):
-    base = dict(model_id="M1", set=[["STATUS CODE", "text"]], spec=None, table=None, dry_run=False)
+    base = dict(model_id="M1", set=[["STATUS CODE", "text"]], spec=None, table=None, no_joined=False, dry_run=False)
     base.update(kw)
     return types.SimpleNamespace(**base)
 
@@ -171,6 +171,61 @@ class NameResolutionTests(unittest.TestCase):
         self.assertIs(bm._pick_table([t], "sales_data"), t)
         self.assertIs(bm._pick_table([t], "SALES DATA.CSV"), t)
         self.assertEqual(bm._table_key("My_Table.parquet"), "mytable")
+
+
+def _lookup_table():
+    pipeline = {"rootTable": {"children": [{"columns": [{"id": "L1", "name": "STATUS", "dataType": dict(INT),
+                                                         "sourceDataType": dict(INT)}]}]}}
+    return {"information": {"objectId": "T2", "name": "status_lookup.csv", "subType": "logical_table"},
+            "physicalTable": {"information": {"objectId": "P2", "name": "status_lookup.csv"},
+                              "columns": [{"information": {"objectId": "L1", "name": "STATUS"}, "columnName": "STATUS",
+                                           "dataType": dict(INT)}],
+                              "pipeline": json.dumps(pipeline)}}
+
+
+def _joined_model():
+    m = _model()
+    m["tables"].append(_lookup_table())
+    m["attributes"][0]["forms"][0]["expressions"] = [
+        {"expression": {"text": "[STATUS CODE]"}, "tables": [{"objectId": "T1"}]},
+        {"expression": {"text": "[STATUS]"}, "tables": [{"objectId": "T2"}]}]
+    return m
+
+
+class JoinedTableTests(unittest.TestCase):
+    """A lookup or mapping table keyed on the retyped column takes the same type, or the join breaks."""
+
+    def test_joined_targets(self):
+        targets = bm.column_type_targets([["STATUS CODE", "text"]], None)
+        self.assertEqual(bm.joined_column_targets(_joined_model(), "T1", targets),
+                         {"T2": {"status": ("STATUS", "text", "")}})
+        self.assertEqual(bm.joined_column_targets(_model(), "T1", targets), {})
+
+    def test_flow_retypes_the_joined_key(self):
+        routes = _routes()
+        routes[("POST", f"{MP}/export")] = _Resp(200, {"model": [_joined_model()]})
+        routes[("GET", f"{MP}/tables/T2")] = _Resp(200, _lookup_table())
+        routes[("PATCH", f"{MP}/tables/T2")] = _Resp(200, {})
+        fake = _Fake(routes)
+        out = _run(fake, _args())
+        self.assertEqual(out["joined"], [{"table": "status_lookup.csv", "column": "STATUS", "from": "integer",
+                                          "to": "utf8_char"}])
+        body = next(kw["json"] for m, p, kw, _ in fake.calls if (m, p) == ("PATCH", f"{MP}/tables/T2"))
+        self.assertEqual(body["physicalTable"]["columns"][0]["dataType"], TXT)
+        fake = _Fake(routes)
+        out = _run(fake, _args(no_joined=True))
+        self.assertEqual(out["joined"], [])
+        self.assertNotIn(("PATCH", f"{MP}/tables/T2"), [(m, p) for m, p, _, _ in fake.calls])
+
+
+class ObjectRefTests(unittest.TestCase):
+    def test_connector_form_names_resolve_to_the_attribute(self):
+        fake = _Fake({("GET", f"{MP}/attributes"): _Resp(200, {"attributes": [
+            {"information": {"objectId": "A9", "name": "zero balance"}}]})})
+        with contextlib.redirect_stderr(io.StringIO()):
+            ref = bm.resolve_model_object_ref(fake, "M1", "attributes", "attribute", "zero balance__code")
+        self.assertEqual(ref, {"objectId": "A9", "subType": "attribute", "name": "zero balance"})
+        _dies(bm.resolve_model_object_ref, fake, "M1", "attributes", "attribute", "nothing__code")
 
 
 class FlowTests(unittest.TestCase):

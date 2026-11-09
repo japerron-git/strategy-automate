@@ -272,8 +272,10 @@ label column is listed as an attribute that no metric filters on.
   `change_column_type` into **one** command per table at the start of phase 2; the data changes at that
   phase's republish, so give each finding a test of the values afterwards. `column` may be the attribute or
   fact metric name the connector shows: the command resolves it to the column it reads. Leave `table` out
-  on a one-table model. After the type phase, questions that compare the column with numbers (`= 1`,
-  `/ 100`) need text or date comparisons.
+  on a one-table model. Lookup and mapping tables already joined through the same attribute take the same
+  type in the same command, so their joins keep working. After the type phase, questions that compare the
+  column with numbers (`= 1`, `/ 100`) need text or date comparisons. Every command that takes an
+  attribute name also accepts the connector's `<attribute>__<form>` name.
 - **`source_change`** (`table`, `column`, `change`) is a change the model cannot make: a new column from
   outside the model, sentinels to NULL, values rewritten (padding codes that the source stores without
   their zeros). `plan` gathers every `source_change` into **one** rebuild step at the start of phase 1,
