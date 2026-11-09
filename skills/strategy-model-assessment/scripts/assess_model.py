@@ -520,8 +520,13 @@ def maturity_signals(scope: dict) -> dict[str, Any]:
     numeric_attributes = [a["name"] for a in attrs if a.get("type", "").lower() in _NUMERIC]
     decoded = any(re.search(r"(__|\b)(description|desc|label)\b", n) for n in names)
     latest_flag = any(("latest" in n or "current period" in n or "is current" in n) for n in names)
+    names = names + [n.split("__", 1)[0] for n in names if "__" in n]
     constants = [a["name"] for a in attrs if (a.get("profile") or {}).get("distinct_values") == 1]
-    integer_dates = [a["name"] for a in attrs if looks_like_integer_date(a)]
+    # A date stored as a number is a defect only without calendar parents (its own "<date> year", or for the
+    # reporting period a period lookup with a year and a latest flag).
+    integer_dates = [a["name"] for a in attrs if looks_like_integer_date(a)
+                     and not (f"{a['name'].lower()} year" in names
+                              or (re.search(r"period|month", a["name"], re.I) and "year" in names and latest_flag))]
     summed_nonadditive = [m["name"] for m in metrics if m.get("formula") and
                           re.match(r"^sum\(", m["formula"].strip(), re.I) and _SUMMED_NONADDITIVE.search(_words(m["name"]))]
     text_metrics = [m["name"] for m in metrics if m.get("type", "").lower() in ("varchar", "char", "string", "text")]

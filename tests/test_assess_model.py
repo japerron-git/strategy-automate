@@ -605,6 +605,17 @@ class MaturityTests(unittest.TestCase):
         self.assertEqual(am.maturity_signals({"attributes": attrs, "metrics": metrics[:2] + helpers})["derived_metrics"],
                          am.maturity_signals({"attributes": attrs, "metrics": metrics[:2]})["derived_metrics"])
 
+    def test_numeric_dates_with_calendar_parents_are_not_a_defect(self):
+        date = lambda n: {"name": n, "type": "bigint", "profile": {"distinct_values": 30, "min": "201901",  # noqa: E731
+                                                                    "max": "202201"}}
+        bare = am.maturity_signals({"attributes": [date("reporting period"), date("close date")], "metrics": []})
+        self.assertEqual(bare["dates_stored_as_numbers"], ["reporting period", "close date"])
+        calendar = am.maturity_signals({"attributes": [date("reporting period"), date("close date"),
+                                                       {"name": "year", "type": "bigint"},
+                                                       {"name": "latest period flag", "type": "varchar"},
+                                                       {"name": "close date year", "type": "bigint"}], "metrics": []})
+        self.assertEqual(calendar["dates_stored_as_numbers"], [])
+
 
 def _snapshot_rows():
     rows = []
