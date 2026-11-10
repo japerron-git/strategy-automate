@@ -160,6 +160,11 @@ Walk this list during step 5 even when questions passed. Details and fixes in th
 - Codes with no description lookup; descriptions that don't match the provider's dictionary.
 - Period attributes with no lookup table or no latest-period flag.
 - Attributes keyed on the wrong table; isolated attributes (`build_mosaic.py validate-topology`).
+- Columns in the wrong role (`assess_model.py roles`): codes, flags and small counts read only as
+  measures (users can't group or filter by them; summing a code means nothing), entity characteristics
+  summed across a snapshot's rows, continuous values held only as attributes. A column can need both
+  roles. Fix roles in phase 3, before metrics are built on them; add a question that groups by each
+  confirmed column, so the fix is tested.
 
 **Coverage and discoverability**
 - Common questions that need expert SQL where a governed metric could exist.
@@ -313,6 +318,13 @@ label column is listed as an attribute that no metric filters on.
   their zeros). `plan` gathers every `source_change` into **one** rebuild step at the start of phase 1,
   followed by one republish and re-certify. Each reload costs a re-map of attributes and fact metrics, so
   never plan several. `plan` reports a `source_change` whose text describes a type change.
+- **`add_column_attribute`** (`name`, `column`: the column or the fact metric or attribute that reads it,
+  `description`, `display_format`, `data_type`, `table`): an attribute that reads one existing column
+  as-is, so a column read as a fact metric can also be grouped and filtered on. Not a calculation, so no
+  `requested_by_user`; the fact metric stays. Phase 3 (category `attribute`), republish afterwards.
+  The name must differ from every metric's (the command refuses a clash: the connector would show two
+  columns with one name). `plan` refuses placeholders left from `roles.json` (`<...>`). Not yet run
+  live: the body is the formula attribute's, verified, with a single column token.
 - **`create_formula_attribute`** (`name`, `formula` in Strategy syntax with `[COLUMNS]`, `description`,
   `display_format` text | number | date, `data_type`, `table`, `update`, `requested_by_user`,
   `unverified_ok`): verified live for functions, columns and integers (`AddMonths([PERIOD], -1)`,

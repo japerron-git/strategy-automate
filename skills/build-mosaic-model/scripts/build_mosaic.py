@@ -31,6 +31,7 @@ Subcommands:
   create-weighted-average    Weighted average once per entity: numerator + denominator helpers and the ratio.
   set-column-types           Change column types in the model (table + pipeline), no reload; republish after.
   create-formula-attribute   Attribute computed from columns (prefer a lookup table); republish after.
+  add-column-attribute       Attribute that reads one existing column (e.g. a fact metric's) as-is; republish after.
   rename-describe            Rename / describe attributes and fact metrics by name; no republish.
 
 Authentication
@@ -6207,6 +6208,17 @@ def cmd_create_formula_attribute(m: MSTR, args):
     table_ref = {"objectId": tinfo["objectId"], "subType": "logical_table", "name": tinfo["name"]}
     cols = {c["columnName"].casefold(): (c["information"]["objectId"], c["columnName"])
             for c in table["physicalTable"]["columns"]}
+    if getattr(args, "column", None):   # add-column-attribute: one column as-is, named as column, attribute or metric
+        targets, notes = resolve_column_targets(model, cols, {args.column.casefold(): (args.column, "", "")})
+        ((col, _t, _f),) = targets.values()
+        for n in notes:
+            print(f"  = {n}", file=sys.stderr)
+        args.formula = f"[{col}]"
+        taken = {(o.get("information") or {}).get("name", "").casefold(): kind
+                 for kind in ("factMetrics", "metrics") for o in model.get(kind) or []}
+        if args.name.casefold() in taken:
+            die(f"'{args.name}' is already a metric's name; give the attribute another name, or the connector "
+                f"shows two columns with one name")
     tokens, unverified = formula_attribute_tokens(args.formula, cols)
     if unverified:
         _require_unverified_ok(args, "create-formula-attribute",
@@ -7329,6 +7341,20 @@ def build_parser():
     sp.add_argument("--spec", required=True, help="JSON file with the items")
     sp.add_argument("--dry-run", action="store_true", help="print the changes; open no changeset")
 
+    sp = sub.add_parser("add-column-attribute",
+        help="Attribute that reads one existing column as-is, so a numeric column read as a fact metric can also be "
+             "grouped and filtered on (number of units, a score band, a code stored as a number). Not a formula: "
+             "the fact metric stays. Republish afterwards.")
+    sp.add_argument("--model-id", required=True)
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--column", required=True, help="the column, or the fact metric or attribute that reads it")
+    sp.add_argument("--description", default="")
+    sp.add_argument("--display-format", choices=["text", "number", "date"], default="number")
+    sp.add_argument("--data-type", help="text | integer | bigint | double | date | timestamp (default: the column's)")
+    sp.add_argument("--table", help="table name (default: the table with the most columns)")
+    sp.add_argument("--dry-run", action="store_true", help="resolve the column and print the request; no changeset")
+    sp.set_defaults(update=False, unverified_ok=False, formula="")
+
     sp = sub.add_parser("create-formula-attribute",
         help="Attribute computed from the table's columns (e.g. Year([FIRST DATE])). Prefer a lookup table: "
              "faster, and replaceable without deleting the metrics built on it. Republish afterwards.")
@@ -7437,6 +7463,7 @@ def main():
             "create-weighted-average": cmd_create_weighted_average,
             "rename-describe": cmd_rename_describe,
             "create-formula-attribute": cmd_create_formula_attribute,
+            "add-column-attribute": cmd_create_formula_attribute,
             "set-column-types": cmd_set_column_types,
             "patch-fact-metrics": cmd_patch_fact_metrics,
             "attach-transformation": cmd_attach_transformation,

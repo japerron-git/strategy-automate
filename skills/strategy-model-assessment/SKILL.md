@@ -103,6 +103,28 @@ it reports declared relationships the data contradicts and supported ones not de
 in the data is evidence, not proof: recommend a relationship only when the domain notes say it makes
 business sense — "weak" evidence (fewer than 30 child values) is often coincidence in small samples.
 
+### 1b2. Column roles → `roles.json`
+
+```bash
+python3 assess_model.py roles --project "<project>" --scope scope.json --relationships relationships.json \
+  --out roles.json
+```
+
+An automated build turns every numeric column into a fact metric. This checks each raw fact metric in
+the data (integer or not, range, non-blank count, and how many entities hold more than one value) and
+each numeric attribute, and names the role the evidence points to:
+- **attribute** — an integer code, band or calendar part read as a measure (adding it up means nothing,
+  and users can't group or filter by it);
+- **both** — a 0/1 flag or a small count per row: an attribute to group and filter by, and a measure to
+  add up (`add_column_attribute` keeps the fact metric and adds an attribute on the same column);
+- **entity_characteristic** — one value per entity, repeated on every row of a multi-row fact: a Sum
+  across rows multiplies it, so read it once per entity (`create_level_metric`);
+- **measure** — continuous values held only as an attribute;
+- **review** — a small integer range the names don't explain: check the dictionary.
+
+Evidence, not a verdict: confirm each against the domain notes. Fix roles early (phase 3), before
+metrics are built on these columns.
+
 ### 1c. Lookup tables → `lookups.json` and CSV templates
 
 ```bash

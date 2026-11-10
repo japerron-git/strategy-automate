@@ -12,6 +12,7 @@ import os
 import sys
 import types
 import unittest
+import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "skills", "build-mosaic-model", "scripts"))
@@ -97,6 +98,35 @@ class FlowTests(unittest.TestCase):
         patched = next(kw["json"] for m, p, kw, _ in fake.calls if m == "PATCH")["forms"][0]
         self.assertNotIn("translations", patched)
         self.assertEqual(patched["expressions"][0]["expression"]["tokens"][0]["value"], "Year")
+
+
+class ColumnAttributeTests(unittest.TestCase):
+    def test_reads_the_column_behind_a_fact_metric_as_is(self):
+        fake = _Fake(_routes())
+        out = _run(fake, _args(name="Amount band", formula="", column="Amount", data_type=None))
+        self.assertEqual(out["attribute"], "Amount band")
+        body = next(kw["json"] for m, p, kw, _ in fake.calls if (m, p) == ("POST", f"{MP}/attributes"))
+        tokens = body["forms"][0]["expressions"][0]["expression"]["tokens"]
+        self.assertEqual([(t["type"], t["value"]) for t in tokens], [("column_reference", "[AMOUNT]"), ("end_of_text", "")])
+        self.assertEqual(body["forms"][0]["lookupTable"]["name"], "sales")
+        _dies(bm.cmd_create_formula_attribute, _Fake(_routes()), _args(name="X", formula="", column="Nope"))
+        fake = _Fake(_routes())
+        _dies(bm.cmd_create_formula_attribute, fake, _args(name="amount", formula="", column="Amount"))   # a metric's name
+        self.assertNotIn("POST", [m for m, p, _, _ in fake.calls if p.endswith("/attributes")])
+
+    def test_parser(self):
+        ap_args = ["add-column-attribute", "--model-id", "M1", "--name", "Units", "--column", "Amount", "--dry-run"]
+        fake = _Fake(_routes())
+        fake.open_changesets, fake.logout = [], lambda: None
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
+                unittest.mock.patch.object(bm, "MSTR", lambda *a, **k: fake), \
+                unittest.mock.patch.object(sys, "argv", ["build_mosaic.py"] + ap_args):
+            try:
+                bm.main()
+            except SystemExit as e:
+                self.assertIn(e.code, (0, None))
+        self.assertTrue(json.loads(out.getvalue())["dry_run"])
 
 
 if __name__ == "__main__":

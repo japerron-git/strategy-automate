@@ -69,7 +69,8 @@ REPUBLISH_PHASES = (1, 2, 3)
 ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_derived_metric",
                 "create_level_metric", "create_weighted_average", "patch_model_object", "patch_fact_metrics",
                 "add_lookup_table", "change_column_type", "source_change", "wire_relationships",
-                "create_formula_attribute", "rename_describe", "publish", "certify", "manual")
+                "create_formula_attribute", "add_column_attribute", "rename_describe", "publish", "certify",
+                "manual")
 COLUMN_TYPES = ("text", "integer", "bigint", "double", "date", "timestamp")   # build_mosaic.py set-column-types
 # Changes made once for the whole plan, at the start of one phase; other phases get a note.
 MERGED_KINDS = {"source_change": 1, "change_column_type": 2, "wire_relationships": 3, "rename_describe": 6}
@@ -548,6 +549,182 @@ def maturity_signals(scope: dict) -> dict[str, Any]:
             "dates_stored_as_numbers": integer_dates, "summed_rates_scores_or_ages": summed_nonadditive,
             "metrics_stored_as_text": text_metrics,
             "note": "estimate from names, descriptions and formulas; confirm during the assessment"}
+
+
+# ── roles: columns read as the wrong kind of object ─────────────────────────────────────────
+# A numeric column becomes a fact metric in an automated build. Some of those are attributes (codes, flags, small
+# counts a user groups by), some are entity characteristics (one value per entity, repeated on every row of a
+# snapshot, so a Sum across rows multiplies them), and some continuous values sit only in an attribute. The
+# checks read the data, not just the names: integer range, share of non-integer values, and variation within
+# the entity.
+
+ROLE_LOW_SPAN = 30            # an integer measure spanning at most this many values may be a code, a band or a count
+ROLE_CONSTANT_SHARE = 0.01    # at most this share of entities with more than one value = one value per entity
+ROLE_MEASURE_DISTINCT = 1000  # a numeric attribute with at least this many values may be a measure
+_COUNT_LIKE = re.compile(r"\b(number of|count|num of|units|unit count|qty|quantity|items|lines)\b", re.I)
+_CODE_LIKE = re.compile(r"\b(id|code|key|zip|postal|flag|indicator|status|type|class|category|band|bucket|"
+                        r"tier|grade|year|month|quarter|week|day|number)\b", re.I)
+
+
+def roles_profile_sql(model: str, metrics: list[str], where: str = "") -> str:
+    parts = []
+    for i, name in enumerate(metrics):
+        col = quote_ident(name)
+        parts += [f"CAST(MIN({col}) AS VARCHAR) AS n{i}", f"CAST(MAX({col}) AS VARCHAR) AS x{i}",
+                  f"CAST(COUNT({col}) AS VARCHAR) AS c{i}",
+                  f"CAST(SUM(CASE WHEN {col} <> FLOOR({col}) THEN 1 ELSE 0 END) AS VARCHAR) AS f{i}"]
+    clause = f" WHERE {where}" if where else ""
+    return f"SELECT {', '.join(parts)} FROM {quote_model(model)}{clause}"  # nosec B608  # identifiers are quoted; the connector is read-only
+
+
+def roles_variation_sql(model: str, entity: str, metrics: list[str], where: str = "") -> str:
+    """Entities, rows, and per metric the entities whose rows hold more than one value."""
+    inner = ", ".join(f"MAX({quote_ident(n)}) - MIN({quote_ident(n)}) AS v{i}" for i, n in enumerate(metrics))
+    outer = ", ".join(f"CAST(SUM(CASE WHEN v{i} > 0 THEN 1 ELSE 0 END) AS VARCHAR) AS v{i}" for i in range(len(metrics)))
+    clause = f" WHERE {where}" if where else ""
+    return (f"SELECT CAST(COUNT(*) AS VARCHAR) AS entities, CAST(SUM(rows_) AS VARCHAR) AS row_count, {outer} "  # nosec B608  # identifiers are quoted; the connector is read-only
+            f"FROM (SELECT {quote_ident(entity)} AS e_, COUNT(*) AS rows_, {inner} FROM {quote_model(model)}{clause} "
+            f"GROUP BY 1) t")
+
+
+def _num(v: Any) -> float | None:
+    try:
+        return float(_plain_number(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def classify_roles(scope: dict, profiles: dict[str, dict], variation: dict[str, Any] | None, *,
+                   entity: str = "", low_span: int = ROLE_LOW_SPAN) -> list[dict[str, Any]]:
+    """-> candidates [{name, object, role, reason, evidence, suggested_actions}]. Pure: the queries are run by
+    review_roles. Roles: attribute (a code or flag read as a measure), both (a small count or a 0/1 flag: group
+    by it and add it up), entity_characteristic (one value per entity on a multi-row fact), measure (continuous
+    values held only as an attribute), review (a small integer range the names don't explain)."""
+    out: list[dict[str, Any]] = []
+    rows_per_entity = None
+    if variation and variation.get("entities"):
+        rows_per_entity = (variation.get("row_count") or 0) / variation["entities"]
+    multi_row = rows_per_entity is not None and rows_per_entity >= 1.5
+    metric_names = {m["name"].lower() for m in scope.get("metrics") or []}
+    for name, p in profiles.items():
+        if p.get("error") or p.get("pending"):
+            continue
+        lo, hi, n, frac = _num(p.get("min")), _num(p.get("max")), _num(p.get("non_blank")), _num(p.get("non_integer"))
+        if lo is None or hi is None or not n:
+            continue
+        integer, span = frac == 0, hi - lo
+        words = _words(name)
+        varying = ((variation or {}).get("varying") or {}).get(name)
+        constant = multi_row and varying is not None and varying <= ROLE_CONSTANT_SHARE * variation["entities"]
+        ev = {"min": lo, "max": hi, "non_blank": n, "integer": integer,
+              "entities_with_several_values": varying, "rows_per_entity": round(rows_per_entity, 2) if rows_per_entity else None}
+        role, reason, acts = None, "", []
+        attr_act = {"kind": "add_column_attribute",
+                    "args": {"column": name, "name": f"<{name} as an attribute: a business name, not the metric's>"}}
+        level_act = {"kind": "create_level_metric",
+                     "args": {"name": f"<{name}, once per entity>", "source_metric": name, "entity_attribute": entity,
+                              "inner": "Max", "outer": "Sum"}}
+        if integer and span <= 1:
+            role, reason = "both", ("a 0/1 flag read as a measure: an attribute to filter on, and its sum counts the "
+                                    "rows flagged")
+            acts = [attr_act]
+        elif integer and span <= low_span:
+            if _COUNT_LIKE.search(words):
+                role, reason = "both", ("a small count per row: group and filter by it as an attribute, add it up or "
+                                        "average it as a measure")
+                acts = [attr_act]
+            elif _CODE_LIKE.search(words):
+                role, reason = "attribute", ("an integer code, band or calendar part read as a measure: adding it up "
+                                             "means nothing, and users can't group or filter by it")
+                acts = [attr_act]
+            else:
+                role, reason = "review", (f"integers spanning {int(span) + 1} values: possibly a code, a band or a "
+                                          f"small count. Check the data dictionary")
+                acts = [attr_act]
+        if constant:
+            note = ("one value per entity, repeated on each of its rows: a Sum across rows multiplies it by the "
+                    "rows per entity. Read it once per entity")
+            if role:
+                reason = f"{reason}; also {note}"
+                acts = acts + [level_act]
+            else:
+                role, reason, acts = "entity_characteristic", note, [level_act]
+        if role:
+            out.append({"name": name, "object": "metric", "role": role, "reason": reason, "evidence": ev,
+                        "suggested_actions": acts})
+    for a in scope.get("attributes") or []:
+        prof = a.get("profile") or {}
+        name, typ = a["name"], (a.get("type") or "").lower()
+        distinct = prof.get("distinct_values")
+        if typ not in _NUMERIC or name == entity or "__" in name or looks_like_integer_date(a):
+            continue
+        if _CODE_LIKE.search(_words(name)) or any(name.lower() in m for m in metric_names):
+            continue
+        decimal_type = typ in ("double", "decimal", "real", "float")
+        if (decimal_type or (distinct or 0) >= ROLE_MEASURE_DISTINCT) and (distinct or 0) >= 50:
+            out.append({"name": name, "object": "attribute", "role": "measure",
+                        "reason": "continuous values held only as an attribute: users can group by them but not add "
+                                  "them up or average them",
+                        "evidence": {"type": typ, "distinct_values": distinct, "min": prof.get("min"),
+                                     "max": prof.get("max")},
+                        "suggested_actions": [{"kind": "manual", "steps": [
+                            f"Add a fact metric on the column behind '{name}' (or a derived metric over the "
+                            f"attribute), with the aggregation its meaning calls for"]}]})
+    return out
+
+
+def review_roles(runner: Runner, project: str, scope: dict, *, entity: str = "", where: str = "", batch: int = 8,
+                 low_span: int = ROLE_LOW_SPAN, log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
+    model = scope["model"]
+    entity = entity or guess_entity(scope)
+    names = [m["name"] for m in scope.get("metrics") or []
+             if m.get("formula") and _RAW_METRIC.match(m["formula"].strip())
+             and (m.get("type") or "").lower() in _NUMERIC]
+    profiles: dict[str, dict[str, Any]] = {}
+    variation: dict[str, Any] = {"varying": {}}
+    pending = 0
+    for start in range(0, len(names), max(batch, 1)):
+        chunk = names[start:start + max(batch, 1)]
+        log(f"roles: profile {len(chunk)} measures")
+        for kind, sql in (("profile", roles_profile_sql(model, chunk, where)),
+                          ("variation", roles_variation_sql(model, entity, chunk, where) if entity else "")):
+            if not sql:
+                continue
+            try:
+                parsed = parse_query_result(runner.call("query", {"project": project, "query": sql}))
+            except PendingReply:
+                pending += 1
+                if kind == "profile":
+                    profiles.update({n: {"pending": True} for n in chunk})
+                continue
+            row = parsed["rows"][0] if parsed["ok"] and parsed["rows"] else None
+            if row is None:
+                if kind == "profile":
+                    profiles.update({n: {"error": parsed["error"] or "no rows"} for n in chunk})
+                continue
+            if kind == "profile":
+                for i, n in enumerate(chunk):
+                    profiles[n] = {"min": row.get(f"n{i}"), "max": row.get(f"x{i}"), "non_blank": row.get(f"c{i}"),
+                                   "non_integer": row.get(f"f{i}")}
+            else:
+                variation["entities"] = _num(row.get("entities"))
+                variation["row_count"] = _num(row.get("row_count"))
+                for i, n in enumerate(chunk):
+                    variation["varying"][n] = _num(row.get(f"v{i}"))
+    candidates = classify_roles(scope, profiles, variation if variation.get("entities") else None,
+                                entity=entity, low_span=low_span)
+    return {"version": 1, "model": model, "entity": entity, "generated": time.strftime("%Y-%m-%d"),
+            "measures_checked": len(names), "pending_queries": pending,
+            "rows_per_entity": (round(variation["row_count"] / variation["entities"], 2)
+                                if variation.get("entities") and variation.get("row_count") else None),
+            "profiles": profiles, "candidates": candidates,
+            "notes": ["Evidence from the data, not a verdict: the business meaning decides. A column can need both "
+                      "roles (an attribute to group by and a measure to add up).",
+                      "add_column_attribute keeps the fact metric and adds an attribute on the same column; give the "
+                      "attribute a name that differs from every metric, or the connector shows two columns with "
+                      "one name.",
+                      "Fix roles before building metrics on these columns: a metric built on the wrong role is "
+                      "rebuilt later."]}
 
 
 # ── run ──────────────────────────────────────────────────────────────────────────────────────
@@ -1402,6 +1579,10 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         if a.get(key) not in (None, "", []):
             argv += [flag, str(a[key])]
 
+    for key in ("name", "column", "source_metric", "entity_attribute", "attribute"):   # templates from roles.json
+        if re.fullmatch(r"<[^<>]*>", str(a.get(key) or "").strip()):
+            problems.append(f"{kind}: args.{key} is still a placeholder ({a[key]}); fill it in")
+
     if kind == "create_conditional_metric":
         need("name", "attribute", "elements")
         if bool(a.get("source_metric")) == bool(a.get("count_attribute")):
@@ -1504,6 +1685,14 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
                 problems.append(f"{kind}: the description of '{it.get('current_name')}' is over {DESCRIPTION_LIMIT} "
                                 f"characters")
         argv = base + ["rename-describe", "--model-id", model_id, "--spec", RENAME_DESCRIBE_SPEC]
+        return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
+    if kind == "add_column_attribute":   # one column as-is: an attribute role for a column read as a measure
+        need("name", "column")
+        argv = base + ["add-column-attribute", "--model-id", model_id, "--name", str(a.get("name", "")),
+                       "--column", str(a.get("column", ""))]
+        for flag, key in (("--description", "description"), ("--display-format", "display_format"),
+                          ("--data-type", "data_type"), ("--table", "table")):
+            opt(argv, flag, key)
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "create_formula_attribute":
         need("name", "formula")
@@ -2168,6 +2357,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--batch", type=int, default=10, help="pairs per query (default 10)")
     sp.add_argument("--declared", help="JSON list of the model's declared relationships: [{child, parent}]")
 
+    sp = sub.add_parser("roles", help="find numeric columns read as the wrong kind of object (codes and counts as "
+                                      "measures, entity characteristics summed across rows, measures held as attributes)")
+    sp.add_argument("--project", required=True)
+    sp.add_argument("--scope", required=True, help="scope.json from the scope command (with profiles)")
+    sp.add_argument("--out", required=True)
+    sp.add_argument("--entity", default="", help="entity key attribute (default: relationships.json's, else guessed)")
+    sp.add_argument("--relationships", help="relationships.json, for its entity")
+    sp.add_argument("--where", default="", help="SQL condition that scopes the checks on large models")
+    sp.add_argument("--batch", type=int, default=8, help="measures per query (default 8)")
+    sp.add_argument("--low-span", type=int, default=ROLE_LOW_SPAN,
+                    help=f"integer range treated as a code, band or small count (default {ROLE_LOW_SPAN})")
+
     sp = sub.add_parser("lookups", help="recommend lookup tables and write CSV templates for them")
     sp.add_argument("--project", required=True)
     sp.add_argument("--scope", required=True)
@@ -2294,6 +2495,17 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
         print(json.dumps({"ok": True, "out": args.out, "entity": out["entity"], "tested_pairs": out["tested_pairs"],
                           "parent_child": len(out["suggestions"]["parent_child"]),
                           "one_to_one": len(out["suggestions"]["same_entity_one_to_one"])}, indent=2))
+        return 0
+    if args.cmd == "roles":
+        entity = args.entity or ((_load_json(args.relationships) or {}).get("entity") if args.relationships else "")
+        out = review_roles(runner(), args.project, _load_json(args.scope), entity=entity or "", where=args.where,
+                           batch=args.batch, low_span=args.low_span, log=log)
+        _write_json(args.out, out)
+        if _pending(runner):
+            return 3
+        print(json.dumps({"ok": True, "out": args.out, "entity": out["entity"], "measures_checked": out["measures_checked"],
+                          "candidates": {r: sum(1 for c in out["candidates"] if c["role"] == r)
+                                         for r in sorted({c["role"] for c in out["candidates"]})}}, indent=2))
         return 0
     if args.cmd == "lookups":
         scope = _load_json(args.scope)

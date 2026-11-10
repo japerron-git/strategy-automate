@@ -1378,3 +1378,70 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoleTests(unittest.TestCase):
+    """Numeric columns read as the wrong kind of object, from the data rather than the names alone."""
+
+    SCOPE = {"model": "Store Sales", "attributes": [
+        {"name": "store id", "type": "bigint", "profile": {"distinct_values": 5000}},
+        {"name": "unit price", "type": "double", "profile": {"distinct_values": 4200, "min": "0.5", "max": "99"}},
+        {"name": "region code", "type": "integer", "profile": {"distinct_values": 9}}],
+        "metrics": [{"name": m, "type": t, "formula": f"sum(sales.csv.{{{m}}})"} for m, t in (
+            ("number of units", "bigint"), ("status code", "integer"), ("returned flag", "integer"),
+            ("opening size", "double"), ("net sales", "double"), ("level", "integer"))]}
+
+    def _profiles(self):
+        return {"number of units": {"min": "1", "max": "6", "non_blank": "900", "non_integer": "0"},
+                "status code": {"min": "0", "max": "12", "non_blank": "900", "non_integer": "0"},
+                "returned flag": {"min": "0", "max": "1", "non_blank": "900", "non_integer": "0"},
+                "opening size": {"min": "100.5", "max": "9,500.25", "non_blank": "900", "non_integer": "850"},
+                "net sales": {"min": "-50.0", "max": "4,000.75", "non_blank": "900", "non_integer": "880"},
+                "level": {"min": "1", "max": "7", "non_blank": "900", "non_integer": "0"}}
+
+    def test_classification(self):
+        variation = {"entities": 100, "row_count": 900, "varying": {
+            "number of units": 0, "status code": 60, "returned flag": 40, "opening size": 0, "net sales": 95, "level": 50}}
+        out = {c["name"]: c for c in am.classify_roles(self.SCOPE, self._profiles(), variation, entity="store id")}
+        self.assertEqual(out["status code"]["role"], "attribute")
+        self.assertEqual(out["returned flag"]["role"], "both")
+        self.assertEqual(out["level"]["role"], "review")
+        self.assertEqual(out["opening size"]["role"], "entity_characteristic")
+        self.assertEqual([a["kind"] for a in out["opening size"]["suggested_actions"]], ["create_level_metric"])
+        units = out["number of units"]                                         # a small count, constant per entity
+        self.assertEqual(units["role"], "both")
+        self.assertEqual([a["kind"] for a in units["suggested_actions"]], ["add_column_attribute", "create_level_metric"])
+        self.assertNotIn("net sales", out)                                      # a real measure
+        self.assertEqual(out["unit price"]["role"], "measure")                  # continuous, only an attribute
+        self.assertNotIn("store id", out)                                       # the entity key
+        self.assertNotIn("region code", out)                                    # a code attribute is fine
+
+    def test_one_row_per_entity_skips_the_constancy_rule(self):
+        variation = {"entities": 900, "row_count": 900, "varying": {"opening size": 0}}
+        out = am.classify_roles(self.SCOPE, {"opening size": self._profiles()["opening size"]}, variation)
+        self.assertEqual([c["name"] for c in out if c["object"] == "metric"], [])
+
+    def test_review_roles_runs_batched_queries(self):
+        prof = [["n0", "x0", "c0", "f0", "n1", "x1", "c1", "f1"], ["0", "1", "900", "0", "1", "6", "900", "0"]]
+        var = [["entities", "row_count", "v0", "v1"], ["100", "900", "40", "0"]]
+        scope = {"model": "Store Sales", "attributes": self.SCOPE["attributes"],
+                 "metrics": self.SCOPE["metrics"][2:3] + self.SCOPE["metrics"][:1]}    # returned flag, number of units
+        runner = FakeRunner({"FLOOR(": _table_reply(prof), "GROUP BY 1) t": _table_reply(var)})
+        out = am.review_roles(runner, "retail", scope, entity="store id")
+        self.assertEqual(out["rows_per_entity"], 9.0)
+        self.assertEqual({c["name"]: c["role"] for c in out["candidates"] if c["object"] == "metric"},
+                         {"returned flag": "both", "number of units": "both"})
+        self.assertEqual(len([c for c in runner.calls if c[0] == "query"]), 2)
+
+    def test_plan_turns_an_attribute_role_into_a_command(self):
+        act = {"kind": "add_column_attribute", "args": {"column": "status code", "name": "Status"}}
+        plan = am.build_plan({"findings": [_finding("F1", "attribute", actions=[act])]}, model_id="MID")
+        self.assertEqual(plan["problems"], [])
+        (ph,) = plan["phases"]
+        self.assertEqual(ph["phase"], 3)
+        self.assertEqual(ph["steps"][0]["apply"]["argv"][2:], ["add-column-attribute", "--model-id", "MID", "--name",
+                                                                "Status", "--column", "status code"])
+        bad = am.build_plan({"findings": [_finding("F1", "attribute", actions=[
+            {"kind": "add_column_attribute", "args": {"column": "status code", "name": "<status code as an attribute>"}}])]},
+            model_id="MID")
+        self.assertTrue(any("placeholder" in p for p in bad["problems"]))
