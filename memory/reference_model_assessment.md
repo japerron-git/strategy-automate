@@ -118,6 +118,10 @@ model probably cannot answer.
   estimated token count (characters / 4), for the governed answer and the best answer separately,
   totalled per level in the summary. It covers connector I/O only: a chat can't see its own token counts,
   so Claude's reasoning is not included. A falling cost to reach the right answer is a maturity signal.
+  `run` also measures the model description (the `get_semantics` reply, which every analyst session
+  reads first) as `summary.cost.model_description`: it grows with each metric and description, so a
+  round can make answers cheaper and every session's start dearer. In replay mode, `run` asks for the
+  `get_semantics` reply too (`semantics.txt`).
 - **Baseline** (ungraded questions only): a reviewed answer frozen with `assess_model.py baseline`
   (`question.baseline`: rows, round, note). Grading marks the question `same` or `changed` against it and
   lists `baseline_changes`; the verdict stays `ungraded`. A baseline says what the model answered when
@@ -249,8 +253,12 @@ Result column names in `key` / `measures` must match the SQL aliases.
                "risks": ["<side effects>"], "depends_on": [], "republish": false,
                "tests": ["Q012"],
                "status": "proposed | approved | modified | declined | applied | verified | failed",
-               "decision_note": ""}]}
+               "applied_phases": [4], "decision_note": ""}]}
 ```
+`applied_phases` lists the phases of a finding that reached the model. A finding can span phases (a
+metric in phase 4, its description in phase 6): once it is `applied` or `verified`, `plan` still plans its
+actions in phases not listed, so verifying the first part never drops the rest. Without the field, `plan`
+warns when an applied or verified finding spans phases.
 `phase` defaults from `category` (table above). Action kinds `plan` turns into commands:
 `create_conditional_metric`, `create_compound_metric`, `create_level_metric`,
 `create_weighted_average`, `delete_derived_metric`, `patch_model_object`, `patch_fact_metrics`, `publish`,
@@ -322,7 +330,11 @@ label column is listed as an attribute that no metric filters on.
   description}`, descriptions at most 250 characters): `plan` merges every item into one
   `build_mosaic.py rename-describe` command in phase 6 and ships its spec as `specs/rename_describe.json`.
   Takes effect at once, no republish; derived metrics take their description when they are created.
-  Use it for every rename and description change instead of a manual step.
+  Use it for every rename and description change instead of a manual step. Name the attribute, not a
+  connector form name (`<attribute>__<form>`): forms share the attribute's description, so write one
+  description that covers them. `plan` warns on form names and refuses a form rename or two different
+  descriptions for one attribute; the command checks every item before writing and reports all problems
+  at once. A description that quotes codes quotes them as stored after any type change ('01', not 1).
 - **Tests are not manual steps.** A manual step that only checks a result ("Test after republish:
   ...") becomes a `verify` note that `/verify-changes` handles; it doesn't stop the apply script. Write
   such checks as questions in the bank, linked through the finding's `tests`.

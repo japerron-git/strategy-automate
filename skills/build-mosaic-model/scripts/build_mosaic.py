@@ -6282,35 +6282,77 @@ def rename_describe_items(spec: dict | list) -> list[dict]:
 
 
 def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[list[tuple], list[str]]:
-    """-> (writes [(label, path, body)], notes). Already-applied items are skipped, so a rerun is harmless."""
+    """-> (writes [(label, path, body)], notes). Already-applied items are skipped, so a rerun is harmless.
+
+    A connector form name ('<attribute>__<form>', '<attribute> (<form>)') describes its attribute: a form has
+    no description of its own, and the connector shows the attribute's on every form. A form name can't be
+    renamed here. Every item is checked before anything is written, and all problems are reported together."""
     pools = {"attribute": ("attributes", model.get("attributes") or []),
              "fact_metric": ("factMetrics", model.get("factMetrics") or [])}
     by_name = {k: {(o.get("information") or {}).get("name", "").casefold(): o for o in objs}
                for k, (_, objs) in pools.items()}
-    writes, notes = [], []
+    writes, notes, problems = [], [], []
+    wanted: dict[str, dict] = {}             # objectId -> merged request for that object
+    renamed: dict[str, dict] = {k: {} for k in pools}
     for it in items:
-        seg, _ = pools[it["object_type"]]
-        names = by_name[it["object_type"]]
-        o = names.get(it["current_name"].casefold())
+        kind, cur = it["object_type"], it["current_name"]
+        names = by_name[kind]
+        o, via_form = names.get(cur.casefold()) or renamed[kind].get(cur.casefold()), False
+        if o is None and kind == "attribute":
+            for alt in attribute_name_candidates(cur)[1:]:
+                if alt in names:
+                    o, via_form = names[alt], True
+                    break
         if o is None:
             if it["new_name"] and it["new_name"].casefold() in names:
-                notes.append(f"{it['current_name']}: already renamed to '{it['new_name']}'")
+                notes.append(f"{cur}: already renamed to '{it['new_name']}'")
                 continue
-            die(f"{it['object_type']} '{it['current_name']}' not found")
+            other = "fact_metric" if kind == "attribute" else "attribute"
+            hint = (f" (it is a {other}: set object_type to {other})"
+                    if any(c in by_name[other] for c in attribute_name_candidates(cur)) else "")
+            problems.append(f"{kind} '{cur}' not found{hint}")
+            continue
         info = o["information"]
-        name = it["new_name"] or info["name"]
-        desc = info.get("description", "") if it["description"] is None else str(it["description"])
-        if name.casefold() != info["name"].casefold() and name.casefold() in names:
-            die(f"{info['name']}: another {it['object_type']} is already named '{name}'")
+        if via_form:
+            if it["new_name"]:
+                problems.append(f"'{cur}' is a form of attribute '{info['name']}': forms can't be renamed here; "
+                                f"rename the attribute, or leave new_name out")
+                continue
+            notes.append(f"'{cur}' is a form: its description is set on attribute '{info['name']}', which the "
+                         f"connector shows on every form")
+        if it["new_name"]:
+            renamed[kind][it["new_name"].casefold()] = o     # later items may use the new name
+        w = wanted.setdefault(info["objectId"], {"o": o, "kind": kind, "items": [], "name": None, "desc": None})
+        for key, val in (("name", it["new_name"]), ("desc", it["description"])):
+            if val is None:
+                continue
+            if w[key] is not None and str(w[key]) != str(val):
+                problems.append(f"{kind} '{info['name']}' gets two different {'names' if key == 'name' else 'descriptions'} "
+                                f"(items '{w['items'][-1]}' and '{cur}'); give it one (a form shares its "
+                                f"attribute's description)")
+            w[key] = val
+        w["items"].append(cur)
+    for w in wanted.values():
+        kind, o = w["kind"], w["o"]
+        info, names = o["information"], by_name[kind]
+        name = w["name"] or info["name"]
+        desc = info.get("description", "") if w["desc"] is None else str(w["desc"])
+        if name.casefold() != info["name"].casefold() and name.casefold() in names \
+                and names[name.casefold()] is not o:
+            problems.append(f"{info['name']}: another {kind} is already named '{name}'")
+            continue
         if name == info["name"] and desc == info.get("description", ""):
             notes.append(f"{info['name']}: unchanged")
             continue
         names[name.casefold()] = o
         what = " + ".join(x for x in ((f"rename -> '{name}'" if name != info["name"] else ""),
                                        ("description" if desc != info.get("description", "") else "")) if x)
-        writes.append((f"{it['object_type']} '{info['name']}': {what}",
-                       f"/api/model/dataModels/{mid}/{seg}/{info['objectId']}",
+        writes.append((f"{kind} '{info['name']}': {what}",
+                       f"/api/model/dataModels/{mid}/{pools[kind][0]}/{info['objectId']}",
                        {"information": {"name": name, "description": desc}}))
+    if problems:
+        die(f"rename-describe: {len(problems)} of {len(items)} item(s) can't be applied; nothing was written. "
+            f"Fix them and run again:\n  - " + "\n  - ".join(problems))
     return writes, notes
 
 

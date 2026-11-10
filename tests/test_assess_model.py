@@ -569,7 +569,9 @@ class ReplayTests(unittest.TestCase):
         runner = am.ReplayRunner(self.dir)
         out = am.run_bank(runner, "retail", _bank(), only="Q1")
         self.assertTrue(out["results"][0]["pending"])
-        self.assertEqual(len(runner.pending), 1)
+        self.assertEqual(sorted(runner.pending)[-1], "semantics")       # the model description is measured too
+        self.assertEqual(len(runner.pending), 2)
+        self.assertIsNone(out["semantics_cost"])
 
 
 class MaturityTests(unittest.TestCase):
@@ -828,6 +830,13 @@ class BestAnswerAndCostTests(unittest.TestCase):
                          ("Q2", "SELECT 'N' AS region, 1 AS n /* BX */ FROM [[MODEL]]"),
                          ("Q3", "SELECT region, 5 AS n /* BX */ FROM [[MODEL]] GROUP BY 1")):
             self.assertTrue(am.set_best_answer(bank, qid, sql=sql, reason_kind="initial", rationale="r", round_no=1)["ok"])
+
+    def test_model_description_size_is_tracked(self):
+        bank = self._bank()
+        res = am.run_bank(self._runner(4, 4), "retail", bank)
+        self.assertGreater(res["semantics_cost"]["chars"], 0)
+        graded = am.grade_bank(bank, res)
+        self.assertEqual(graded["summary"]["cost"]["model_description"], res["semantics_cost"])
 
     def test_cost_is_measured_per_query(self):
         c = am.query_cost("SELECT 1", "x" * 92)
@@ -1194,6 +1203,39 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         text = " | ".join(bad["problems"])
         self.assertIn("object_type must be attribute or fact_metric", text)
         self.assertIn("over 250 characters", text)
+
+    def test_connector_form_names_in_rename_describe(self):
+        def plan_for(items):
+            return am.build_plan({"findings": [_finding("F1", "description", actions=[
+                {"kind": "rename_describe", "args": {"items": items}}])]}, model_id="MID")
+        ok = plan_for([{"object_type": "attribute", "current_name": "site__latitude", "description": "Site, lat, long."}])
+        self.assertEqual(ok["problems"], [])
+        self.assertTrue(any("connector form name" in w and "'site'" in w for w in ok["warnings"]))
+        bad = plan_for([{"object_type": "attribute", "current_name": "site (code)", "new_name": "Site code"},
+                        {"object_type": "attribute", "current_name": "status__code", "description": "a"},
+                        {"object_type": "attribute", "current_name": "Status", "description": "b"}])
+        text = " | ".join(bad["problems"])
+        self.assertIn("forms can't be renamed", text)
+        self.assertIn("attribute 'status' gets 2 different descriptions", text)
+
+    def test_verified_finding_keeps_its_later_phase_actions(self):
+        describe = {"kind": "rename_describe", "args": {"items": [
+            {"object_type": "attribute", "current_name": "latest flag", "description": "1 = latest period."}]}}
+        lookup = {"kind": "manual", "steps": "add the lookup"}
+        f1 = _finding("F1", "missing_metric", status="verified", actions=[lookup, describe], applied_phases=[1, 2, 5])
+        plan = am.build_plan({"findings": [f1]}, model_id="MID")
+        self.assertEqual(plan["problems"], [])
+        self.assertEqual([p["phase"] for p in plan["phases"]], [6])                  # only the part still to do
+        self.assertEqual(plan["files"]["specs/rename_describe.json"]["items"][0]["current_name"], "latest flag")
+        self.assertEqual(plan["not_planned"], [])
+        self.assertTrue(any("still planned" in w for w in plan["warnings"]))
+        done = am.build_plan({"findings": [dict(f1, applied_phases=[5, 6])]}, model_id="MID")
+        self.assertEqual(done["phases"], [])
+        self.assertEqual(done["not_planned"], [{"id": "F1", "status": "verified"}])
+        unknown = am.build_plan({"findings": [dict(f1, applied_phases=None)]}, model_id="MID")
+        self.assertTrue(any("no applied_phases" in w for w in unknown["warnings"]))
+        self.assertTrue(any("applied_phases must be" in p for p in
+                            am.check_findings({"findings": [dict(f1, applied_phases=[9])]})["problems"]))
 
     def test_source_change_needs_a_change(self):
         plan = am.build_plan({"findings": [_finding("F1", "source_data", actions=[

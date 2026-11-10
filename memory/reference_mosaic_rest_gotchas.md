@@ -44,6 +44,11 @@ so a second pass to align them found nothing to write. `build_mosaic.py set-colu
 "description"}}` inside a changeset renames and/or describes; it takes effect on commit, with no republish.
 Descriptions over 250 characters are refused. Derived metrics need a full-body PUT instead.
 `build_mosaic.py rename-describe` sends this shape.
+- A form has no description of its own: the connector shows the attribute's description on every form
+  (`<attribute>__<form>`, `<attribute> (<form>)`). Describe the attribute once, covering its forms.
+  `rename-describe` maps a form name to its attribute for a description and refuses to rename one.
+- Not yet confirmed: whether the connector's `get_semantics` shows a new description before the next
+  republish. Check it after applying; republish if the old text still shows, and record the result here.
 
 ## Formula attributes (verified 2026-10-30/31)
 `POST /api/model/dataModels/{mid}/attributes` in a changeset, one ID form (system form id

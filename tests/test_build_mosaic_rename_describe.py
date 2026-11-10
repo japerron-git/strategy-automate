@@ -61,6 +61,41 @@ class WriteTests(unittest.TestCase):
         _dies(bm.rename_describe_writes, MODEL, "M1", bm.rename_describe_items(
             [{"object_type": "attribute", "current_name": "Nope", "description": "x"}]))
 
+    def test_connector_form_names_describe_their_attribute(self):
+        model = {"attributes": [{"information": {"objectId": "A1", "name": "Site", "description": ""}},
+                                {"information": {"objectId": "A2", "name": "Status", "description": ""}}],
+                 "factMetrics": [{"information": {"objectId": "F1", "name": "Amount", "description": ""}}]}
+        writes, notes = bm.rename_describe_writes(model, "M1", bm.rename_describe_items([
+            {"object_type": "attribute", "current_name": "site__latitude", "description": "Site: code, lat, long."},
+            {"object_type": "attribute", "current_name": "Site (longitude)", "description": "Site: code, lat, long."},
+            {"object_type": "attribute", "current_name": "status__code", "description": "Status code."}]))
+        self.assertEqual([(w[1], w[2]["information"]["description"]) for w in writes],
+                         [(f"{MP}/attributes/A1", "Site: code, lat, long."), (f"{MP}/attributes/A2", "Status code.")])
+        self.assertTrue(any("form" in n and "'Site'" in n for n in notes))
+
+    def test_all_problems_are_reported_before_any_write(self):
+        model = {"attributes": [{"information": {"objectId": "A1", "name": "Site", "description": ""}}],
+                 "factMetrics": [{"information": {"objectId": "F1", "name": "Amount", "description": ""}}]}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            bm.rename_describe_writes(model, "M1", bm.rename_describe_items([
+                {"object_type": "attribute", "current_name": "site__latitude", "new_name": "Lat"},     # form rename
+                {"object_type": "attribute", "current_name": "Nope", "description": "x"},             # unknown
+                {"object_type": "attribute", "current_name": "Amount", "description": "x"},           # wrong type
+                {"object_type": "attribute", "current_name": "Site", "description": "a"},
+                {"object_type": "attribute", "current_name": "site (code)", "description": "b"}]))    # conflict
+        text = err.getvalue()
+        self.assertIn("4 of 5 item(s)", text)
+        for part in ("forms can't be renamed", "'Nope' not found", "set object_type to fact_metric",
+                     "two different descriptions"):
+            self.assertIn(part, text)
+
+    def test_describe_by_new_name_after_rename_in_same_spec(self):
+        writes, _ = bm.rename_describe_writes(MODEL, "M1", bm.rename_describe_items([
+            {"object_type": "attribute", "current_name": "Region", "new_name": "Sales Region"},
+            {"object_type": "attribute", "current_name": "Sales Region", "description": "Where it sold."}]))
+        self.assertEqual(writes[0][2], {"information": {"name": "Sales Region", "description": "Where it sold."}})
+
     def test_flow_one_changeset_and_dry_run(self):
         d = tempfile.mkdtemp()
         spec = os.path.join(d, "spec.json")

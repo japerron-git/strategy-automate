@@ -594,10 +594,26 @@ def _execute(runner: Runner, project: str, sql: str, max_rows: int) -> dict[str,
             "seconds": round(time.monotonic() - t0, 3), "cost": parsed.get("cost") or query_cost(sql, "")}
 
 
+def model_description_cost(runner: Runner, project: str, model: str) -> dict[str, int] | None:
+    """Size of the get_semantics reply: what every analyst session reads before its first query. It grows with
+    each metric and description added, so it is tracked per round next to the answer costs."""
+    try:
+        reply = runner.call("get_semantics", {"project": project, "model": model})
+    except PendingReply:
+        return None
+    except Exception:  # network or MCP errors: the questions still run
+        return None
+    if reply.get("isError"):
+        return None
+    text = tool_text(reply)
+    return {"chars": len(text), "est_tokens": -(-len(text) // CHARS_PER_TOKEN)}
+
+
 def run_bank(runner: Runner, project: str, bank: dict, *, only: str = "", levels: str = "",
              max_rows: int = 1000, log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
     model = bank["model"]
     results = []
+    semantics_cost = model_description_cost(runner, project, model)
     questions = _select(bank.get("questions") or [], only, levels)
     for i, q in enumerate(questions):
         log(f"run {i + 1}/{len(questions)}: {q.get('id')}")
@@ -621,7 +637,7 @@ def run_bank(runner: Runner, project: str, bank: dict, *, only: str = "", levels
     ok = sum(1 for r in results if r.get("ok"))
     return {"version": 1, "project": project, "model": model, "generated": time.strftime("%Y-%m-%d %H:%M"),
             "summary": {"questions": len(results), "ok": ok, "errors": len(results) - ok},
-            "results": results}
+            "semantics_cost": semantics_cost, "results": results}
 
 
 # ── relationships ────────────────────────────────────────────────────────────────────────────
@@ -1306,6 +1322,7 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
         lvl = summary["cost"]["by_level"].setdefault(str(g["level"]), {"answers": add_costs(), "best_answers": add_costs()})
         lvl["answers"] = add_costs(lvl["answers"], g.get("cost"))
         lvl["best_answers"] = add_costs(lvl["best_answers"], g.get("best_cost"))
+    summary["cost"]["model_description"] = results.get("semantics_cost")
     summary["cost"]["note"] = (f"connector I/O only: SQL sent plus replies received, ~{CHARS_PER_TOKEN} characters "
                                f"per token; Claude's own reasoning is not included")
     summary["baseline"] = {}
@@ -1344,6 +1361,22 @@ def _phase_of(f: dict) -> int | None:
     if f.get("phase") in PHASES:
         return int(f["phase"])
     return CATEGORY_PHASE.get(str(f.get("category") or ""))
+
+
+def action_phase(f: dict, action: dict) -> int | None:
+    """The phase an action runs in: merged kinds have a fixed phase, the rest run in the finding's."""
+    return MERGED_KINDS.get(str(action.get("kind") or "")) or _phase_of(f)
+
+
+def pending_actions(f: dict) -> list[dict]:
+    """Actions of an applied or verified finding whose phase isn't in its `applied_phases` yet. A finding can
+    span phases (a metric in phase 4, its description in phase 6): verifying the first part must not drop the
+    rest from the plan."""
+    applied = f.get("applied_phases")
+    if f.get("status") not in ("applied", "verified") or not isinstance(applied, list):
+        return []
+    done = {int(p) for p in applied if str(p).isdigit()}
+    return [a for a in f.get("actions") or [] if action_phase(f, a) not in done]
 
 
 def _arg_list(value: Any) -> list[str]:
@@ -1552,6 +1585,15 @@ def _order(findings: list[dict], problems: list[str]) -> list[dict]:
     return ordered
 
 
+def form_base_name(name: str) -> str:
+    """'<attribute>__<form>' or '<attribute> (<form>)' (how the connector shows a form) -> '<attribute>', else ''."""
+    n = (name or "").strip()
+    if "__" in n:
+        return n.split("__", 1)[0].strip()
+    hit = re.match(r"^(.*\S)\s+\(([^()]+)\)$", n)
+    return hit.group(1) if hit else ""
+
+
 def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, ...] = PLANNED_STATUSES,
                python: str = "python3", quoting: str = "posix", project: str = "",
                bank: str = "question_bank.json") -> dict[str, Any]:
@@ -1561,6 +1603,19 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
     every = findings_doc.get("findings") or []
     by_id = {f.get("id"): f for f in every}
     chosen = [f for f in every if f.get("status") in statuses]
+    for f in every:   # applied or verified, with actions in phases not applied yet: plan the rest
+        rest = pending_actions(f)
+        if rest:
+            phases_left = sorted({action_phase(f, a) for a in rest if action_phase(f, a) is not None})
+            chosen.append({**f, "actions": rest, "phase": phases_left[0] if phases_left else f.get("phase")})
+            warnings.append(f"{f['id']} is {f.get('status')} (phases {sorted(f.get('applied_phases') or [])} applied); "
+                            f"its actions in phase(s) {phases_left} are still planned")
+        elif f.get("status") in ("applied", "verified") and not isinstance(f.get("applied_phases"), list):
+            spans = sorted({action_phase(f, a) for a in f.get("actions") or []} - {None})
+            if len(spans) > 1:
+                warnings.append(f"{f['id']} is {f.get('status')} and has actions in phases {spans}, but no "
+                                f"applied_phases: if a phase isn't applied yet, record applied_phases (the phases "
+                                f"that are) so the plan includes the rest")
     mid = model_id or "<MODEL_ID>"
     if not model_id:
         warnings.append("no --model-id: commands carry the <MODEL_ID> placeholder")
@@ -1629,6 +1684,29 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         dup = _dupes([f"{it.get('object_type')}:{str(it.get('current_name') or '').casefold()}" for it in items])
         if dup:
             problems.append(f"rename_describe: {dup} changed twice; merge them into one item")
+        # A connector form name ('<attribute>__<form>', '<attribute> (<form>)') stands for its attribute: forms
+        # share the attribute's description and can't be renamed by rename-describe.
+        by_attr: dict[str, list[dict]] = {}
+        for it in items:
+            if str(it.get("object_type") or "").lower() != "attribute":
+                continue
+            cur = str(it.get("current_name") or "")
+            base = form_base_name(cur)
+            if base:
+                if it.get("new_name"):
+                    problems.append(f"{it['finding']}: rename_describe renames '{cur}', a connector form name of "
+                                    f"'{base}'; forms can't be renamed. Rename the attribute or drop new_name")
+                else:
+                    warnings.append(f"{it['finding']}: '{cur}' looks like a connector form name; its description is "
+                                    f"set on attribute '{base}' (shown on every form). Write one description for the "
+                                    f"attribute that covers its forms")
+            by_attr.setdefault((base or cur).casefold(), []).append(it)
+        for key, group in by_attr.items():
+            texts = {str(it.get("description")) for it in group if it.get("description") is not None}
+            if len(group) > 1 and len(texts) > 1:
+                problems.append(f"rename_describe: attribute '{key}' gets {len(texts)} different descriptions "
+                                f"({', '.join(str(it.get('current_name')) for it in group)}); forms share the "
+                                f"attribute's description, so give it one item")
         files[RENAME_DESCRIBE_SPEC] = {"items": [{k: v for k, v in it.items() if k != "finding"} for it in items]}
         argv = [python, BUILD_SCRIPT, "rename-describe", "--model-id", mid, "--spec", RENAME_DESCRIBE_SPEC]
         merged_steps.setdefault(MERGED_KINDS["rename_describe"], []).append(
@@ -1829,7 +1907,8 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                        "regression": [cmd([a.replace("{n}", str(n)) for a in run_cmd]),
                                       cmd([a.replace("{n}", str(n)) for a in grade_cmd])],
                        "after": after})
-    skipped = [{"id": f.get("id"), "status": f.get("status")} for f in every if f not in chosen]
+    planned_ids = {f.get("id") for f in chosen}
+    skipped = [{"id": f.get("id"), "status": f.get("status")} for f in every if f.get("id") not in planned_ids]
     return {"version": 1, "model": findings_doc.get("model"), "model_id": model_id or None,
             "generated": time.strftime("%Y-%m-%d"), "statuses_planned": list(statuses),
             "phases": phases, "files": files, "not_planned": skipped, "problems": problems,
@@ -1946,6 +2025,9 @@ def check_findings(doc: dict) -> dict[str, Any]:
                 problems.append(f"{fid}: unknown category '{f.get('category')}' and no phase 1-7")
         if f.get("phase") is not None and f.get("phase") not in PHASES:
             problems.append(f"{fid}: phase must be 1-7")
+        ap = f.get("applied_phases")
+        if ap is not None and (not isinstance(ap, list) or any(p not in PHASES for p in ap)):
+            problems.append(f"{fid}: applied_phases must be a list of phases 1-7")
         for key, allowed in (("impact", IMPACTS), ("effort", EFFORTS), ("status", STATUSES)):
             if f.get(key) not in allowed:
                 problems.append(f"{fid}: {key} must be one of {', '.join(allowed)}")
