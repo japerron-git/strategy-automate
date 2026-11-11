@@ -453,7 +453,8 @@ def scope_model(runner: Runner, project: str, model: str, *, profile: bool = Tru
                                                                 if not a["description"]],
                                      "undescribed_metrics": [m["name"] for m in semantics["metrics"]
                                                              if not m["description"]]}}
-    if not profile:
+    if not profile:   # no attribute profiles, but still the anchor (one cheap COUNT query per eight metrics)
+        out["anchor"] = choose_anchor(runner, project, model, semantics["metrics"], where, profile_batch)
         out["maturity"] = maturity_signals(out)
         return out
     todo = semantics["attributes"][:max_attributes]

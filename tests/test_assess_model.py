@@ -141,7 +141,7 @@ class ScopeTests(unittest.TestCase):
     def test_no_profile_and_empty_semantics(self):
         runner = FakeRunner()
         out = am.scope_model(runner, "retail", "Store Sales", profile=False)
-        self.assertEqual([t for t, _ in runner.calls], ["get_semantics"])
+        self.assertEqual([t for t, _ in runner.calls], ["get_semantics", "query"])   # semantics + the anchor
         self.assertEqual(len(out["metrics"]), 2)
 
         class Empty(FakeRunner):
