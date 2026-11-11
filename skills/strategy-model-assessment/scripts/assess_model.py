@@ -1025,6 +1025,11 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
         wrapped = ", ".join(f"CAST(SUM({quote_ident(n)}) AS VARCHAR) AS m{i}" for i, n in enumerate(chunk))
         tot = rows_of(ask(f"SELECT {plain} FROM {M}{base}"))  # nosec B608
         tot_w = rows_of(ask(f"SELECT {wrapped} FROM {M}{base}"))  # nosec B608
+        averages = [(i, n) for i, n in enumerate(chunk)
+                    if (re.match(r"^\s*(\w+)\(", mets_by[n].get("formula") or "") or [None, ""])[1].lower()
+                    in ("avg", "average", "mean")]
+        tot_a = rows_of(ask("SELECT " + ", ".join(f"AVG({quote_ident(n)}) AS m{i}" for i, n in averages)  # nosec B608
+                            + f" FROM {M}{base}")) if averages else None
         by_t = rows_of(ask(f"SELECT CAST({quote_ident(period)} AS VARCHAR) AS g, {plain} FROM {M}{base} GROUP BY 1")) if period else None  # nosec B608
         by_f = (by_t if filt == period else
                 rows_of(ask(f"SELECT CAST({quote_ident(filt)} AS VARCHAR) AS g, {plain} FROM {M}{base} GROUP BY 1"))) if fcond else None  # nosec B608
@@ -1052,6 +1057,14 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
                 else:
                     item["issues"].append(text + ". If a total is meant, the aggregation is wrong; if not, say "
                                                  "what it returns in its description")
+            if tot_a is not None and agg in ("avg", "average", "mean"):
+                t_avg = _num(tot_a[0].get(key))
+                item["total_avg"] = t_avg
+                if t is not None and t_avg is not None and abs(t - t_avg) >= 0.05 and float(t).is_integer() \
+                        and int(t) == int(t_avg):
+                    item["issues"].append(f"plain SUM reads it as a whole number, truncated ({t:g} for {t_avg}): its "
+                                          f"data type ({m.get('type') or '?'}) drops the fraction. Set the metric's "
+                                          f"type to a decimal, or read it with AVG(...) until then")
             groups_t = [(r.get("g"), _num(r.get(key))) for r in by_t or []]
             filled_t = [v for _, v in groups_t if v not in (None, 0)]
             groups_f = [(r.get("g"), _num(r.get(key))) for r in by_f or []]

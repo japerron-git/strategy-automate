@@ -1574,6 +1574,8 @@ class ProbeTests(unittest.TestCase):
         if sql.startswith('SELECT CAST("region" AS VARCHAR) AS g'):
             return [["g"] + cols, ["a", "200", "653", "21", "735", "20"], ["b", "100", "653", "20", "742", "12"],
                     ["c", "100", "653", "19", "744", "10"]]
+        if sql.startswith("SELECT AVG("):
+            return [["m2"], ["49.5"]]
         if sql.startswith("SELECT CAST(SUM("):                              # wrapped: bypasses Max
             return [cols, ["1,000", "25,047,440.54", "49.5", "740", "42"]]
         if sql.startswith("SELECT SUM("):
@@ -1619,6 +1621,8 @@ class ProbeTests(unittest.TestCase):
                 return [["m0", "m1", "m2"], ["1000", "4,800", "0"]]
             if sql.startswith("SELECT SUM("):
                 return [["m0", "m1", "m2"], ["1000", "4.8", ""]]
+            if sql.startswith("SELECT AVG("):
+                return [["m1"], ["4.82"]]
             if sql.startswith('SELECT CAST("') and "AS g" in sql:
                 return [["g", "m0", "m1", "m2"]]
             return self.answer(sql)
@@ -1627,6 +1631,25 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(mets["avg rate"]["issues"], [])
         self.assertTrue(any("Expected for an average" in x for x in mets["avg rate"]["notes"]))
         self.assertEqual(mets["empty cost"]["issues"], [])
+
+    def test_truncated_average(self):
+        scope = dict(self.SCOPE, metrics=[{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
+                                          {"name": "avg score", "type": "bigint", "formula": "avg(t.csv.{SCORE})"}])
+
+        def answer(sql):
+            if sql.startswith("SELECT CAST(SUM("):
+                return [["m0", "m1"], ["1000", "746"]]
+            if sql.startswith("SELECT SUM("):
+                return [["m0", "m1"], ["1000", "746"]]
+            if sql.startswith("SELECT AVG("):
+                return [["m1"], ["746.868"]]
+            if sql.startswith('SELECT CAST("') and "AS g" in sql:
+                return [["g", "m0", "m1"]]
+            return self.answer(sql)
+        out = am.probe_objects(_SqlRunner(answer), "retail", scope, period="period", attributes=[])
+        issues = {m["name"]: m["issues"] for m in out["metrics"]}
+        self.assertTrue(any("truncated (746 for 746.868)" in x and "(bigint)" in x for x in issues["avg score"]))
+        self.assertEqual(issues["net sales"], [])
 
     def test_needs_an_anchor(self):
         with self.assertRaises(SystemExit):

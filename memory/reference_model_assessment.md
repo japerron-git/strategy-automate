@@ -101,9 +101,14 @@ Aggregates of fact metrics run on the fact. So:
   metrics whose own aggregation is not a sum (a Max on loss amounts, an average on a rate), plain
   `SUM("<metric>")` returned the governed value (the Max: one loan's amount; the rate's average), while
   `CAST(SUM("<metric>") AS VARCHAR)` returned the per-row sum ($25.0M against $653k). Not reproduced on a
-  model whose averages and ratios are derived metrics. So: read governed values plain, as analysts write
-  them (the connector's thousands separators are parsed by the engine), and use `CAST`, `ROUND` or
-  arithmetic around a metric only when a row-level value is meant. `probe` compares the two forms and
+  model whose averages and ratios are derived metrics. `1.0 * SUM("<metric>")` kept the governed average
+  there (shown with 1 decimal); `ROUND` is untested. So: read governed values plain, as analysts write
+  them (the connector's thousands separators are parsed by the engine), and never wrap a non-sum metric
+  in `CAST`; use `CAST` around a metric only when a row-level value is meant.
+- **Averages of an integer-typed metric are truncated** (same model): plain `SUM("<avg metric>")` read
+  FICO 746.87 as 746 and LTV 79.02 as 79 — truncated, not rounded — while `AVG("<avg metric>")` returned 3
+  decimals. The metric's data type (integer) drops the fraction. Set the metric's type to a decimal; until
+  then read it with `AVG(...)`. `probe` compares the two for every raw average metric. `probe` compares the two forms and
   flags a metric whose value changes (a Max or other non-sum aggregation as a warning; an average as a
   note, since that is expected; an empty column, NULL plain and 0 wrapped, as neither).
 - Ratios of summed metrics: `SUM(a) / SUM(b)` on decimals came back with 3 decimals on one model;
