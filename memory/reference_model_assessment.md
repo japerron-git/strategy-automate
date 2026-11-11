@@ -74,6 +74,33 @@ blocks; the parser joins them).
 - Sentinels ("not available" written as a number, such as -1, 99 or a run of 9s) inside scores and ratios inflate averages; check the
   profile `max` against the documented range.
 
+### Which rows a query reads: anchor on a fact metric (verified 2026-11-11 on two unrelated models)
+
+An aggregate over attributes only runs on the attributes' lookup tables — the explicit ones, or the
+narrow virtual lookup Mosaic makes per attribute when the model has none — not on the fact rows.
+Aggregates of fact metrics run on the fact. So:
+- `SUM(CASE WHEN <attribute condition> THEN 1 ELSE 0 END)` counted lookup rows: 1 (one matching status)
+  and 12 (promotions) where the fact had 869 and 216 rows. `COUNT(*)` counted fact rows alone, but
+  promotion-table rows (86) once a CASE on an attribute joined the query: never rely on it.
+- `AVG`/`SUM` of a numeric attribute averages or sums the lookup's values (a mapping table's 01-35
+  averaged to 18 where the per-entity answer was 9.6).
+- Queries with attributes only list the lookup's members, including members with no fact rows, and a
+  lookup that lacks a key drops those rows from any query that touches its attribute.
+- Counts that held: `COUNT(<fact metric>)` with the condition in `WHERE`, and
+  `COUNT(CASE WHEN <condition> THEN <fact metric> END)`; sums: `SUM(CASE WHEN <condition> THEN
+  <fact metric> END)`. A condition on a metric (`CASE WHEN <metric> > 100 THEN 1`) also counted fact rows.
+- `COUNT(<metric>)` skips blanks: count rows with the **anchor metric** — a raw fact metric filled on
+  every row (`scope` records the fullest one as `anchor`), or a governed count metric.
+- `GROUP BY` an arithmetic or cast expression of an attribute (`CAST(<period> / 100 AS INTEGER)`)
+  groups by the attribute itself, even when regrouped in an outer query: use a lookup with the parent
+  (year, quarter). CASE ranges in `GROUP BY` were reported to work (not re-tested).
+- Not reproduced on a model without mapping tables (treat as model-specific when seen): `COUNT(DISTINCT
+  CASE …)` / `FILTER` dropping `WHERE`, a metric inside `CASE` inside `SUM`, `IN (subquery)`, form
+  columns inside subqueries, `DATE_DIFF` on real date columns.
+- Models with several fact tables (user guidance, not yet tested here): a metric present in several
+  facts can be steered to one fact by adding a hint metric from that fact to the query; use one anchor
+  per fact table, and say in descriptions which hint metric to add.
+
 ## Question levels
 
 | Level | What it asks | Typical SQL | Default share |

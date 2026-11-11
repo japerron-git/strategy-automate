@@ -56,7 +56,7 @@ folder kept local — they hold tenant data). Script: `skills/strategy-model-ass
 the maturity estimate from step 1 sets the emphasis (see "Maturity levels" in the memory note).
 
 **Sessions where the script cannot sign in** (a cloud workspace with the Mosaic connector attached):
-add `--replies <folder>` to `scope`, `relationships`, `lookups` and `run`. The script then lists the
+add `--replies <folder>` to `scope`, `relationships`, `roles`, `lookups` and `run`. The script then lists the
 calls it needs in `<folder>/pending.json`; call each connector tool with the listed arguments, save
 the reply text to the listed file (start it with `ERROR:` if the tool failed), and run the same
 command again until nothing is pending (exit code 3 means "replies still needed").
@@ -73,6 +73,13 @@ each attribute with bounded queries: distinct count, min / max, sample values fo
 columns. On large models pass `--where` to scope profiling, or `--no-profile`. For the declared
 relationships, lookup tables and derived-metric definitions, add the REST view where it can run:
 `build_mosaic.py get-model-object --kind data_model --model-id <id>` and `validate-topology`.
+
+It also picks the **anchor metric**: the raw fact metric filled on the most rows. An aggregate over
+attributes only reads the attributes' lookups (real or virtual), not the fact rows, so every query
+that counts or conditions on fact rows — data checks, best answers, question SQL — counts with
+`COUNT(<anchor>)` or `COUNT(CASE WHEN <condition> THEN <anchor> END)` and sums a fact metric, never
+`COUNT(*)`, `SUM(CASE ... THEN 1)` or an aggregate of an attribute
+(`memory/reference_model_assessment.md`, "Which rows a query reads").
 
 `scope` also writes a **maturity estimate** (M0 raw build → M4 analyst-ready) from names,
 descriptions, formulas and profiles: default names, metrics that look like attributes (IDs or codes

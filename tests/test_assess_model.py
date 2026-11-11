@@ -539,11 +539,13 @@ class ReplayTests(unittest.TestCase):
             self.assertEqual(am.main(argv), 3)                             # now the profiling queries
         with open(os.path.join(self.dir, "pending.json"), encoding="utf-8") as f:
             calls = json.load(f)["calls"]
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 4)                                    # 3 profiles + the anchor
         for c in calls:
             sql = c["arguments"]["query"]
             self.assertEqual(c["file"], am.query_id(sql) + ".txt")
-            if '"region"' in sql:
+            if 'COUNT("net sales")' in sql:
+                self._save(c["file"], _md(["c0"], [["1,200"]]))
+            elif '"region"' in sql:
                 self._save(c["file"], _md(["distinct_values", "min_value", "max_value"], [[2, "East", "West"]]))
             elif '"months active"' in sql:
                 self._save(c["file"], "ERROR: column cannot be profiled")
@@ -565,6 +567,7 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(prof["region"]["values"], ["East", "West"])
         self.assertEqual(prof["snapshot month"]["distinct_values"], 38.0)
         self.assertIn("cannot be profiled", prof["months active"]["error"])
+        self.assertEqual((scope["anchor"]["metric"], scope["anchor"]["non_blank"]), ("net sales", 1200.0))
 
     def test_run_marks_unanswered_questions_pending(self):
         runner = am.ReplayRunner(self.dir)
@@ -1475,3 +1478,25 @@ class CommandRoutingTests(unittest.TestCase):
             self.assertEqual(am.main(argv), 3)                       # replies pending, no crash
         with open(os.path.join(d, "replies", "pending.json"), encoding="utf-8") as f:
             self.assertEqual(json.load(f)["count"], 2)               # profile + variation queries
+
+
+class AnchorTests(unittest.TestCase):
+    """Fact rows are counted with a fact metric: aggregates over attributes only read their lookups."""
+
+    def test_the_fullest_raw_fact_metric_is_the_anchor(self):
+        metrics = [{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
+                   {"name": "units", "type": "bigint", "formula": "sum(t.csv.{UNITS})"},
+                   {"name": "margin pct", "type": "double", "formula": "net sales / units"}]   # not raw
+        self.assertEqual(am.raw_fact_metrics(metrics), ["net sales", "units"])
+        runner = FakeRunner({'COUNT("net sales")': _table_reply([["c0", "c1"], ["900", "1,000"]])})
+        anchor = am.choose_anchor(runner, "retail", "Store Sales", metrics)
+        self.assertEqual((anchor["metric"], anchor["non_blank"]), ("units", 1000.0))
+        self.assertIsNone(am.choose_anchor(FakeRunner({}), "retail", "Store Sales", metrics[2:]))
+
+    def test_role_queries_count_with_metrics_not_constants(self):
+        prof = am.roles_profile_sql("M", ["units"])
+        self.assertIn('COUNT(CASE WHEN "units" <> FLOOR("units") THEN "units" END)', prof)
+        self.assertNotIn("THEN 1", prof)
+        var = am.roles_variation_sql("M", "store id", ["units"], anchor="net sales")
+        self.assertIn('COUNT("net sales") AS rows_', var)
+        self.assertNotIn("COUNT(*) AS rows_", var)

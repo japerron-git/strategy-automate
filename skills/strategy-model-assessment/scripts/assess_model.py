@@ -473,8 +473,52 @@ def scope_model(runner: Runner, project: str, model: str, *, profile: bool = Tru
     skipped = len(semantics["attributes"]) - max_attributes
     if skipped > 0:
         out["notes"]["unprofiled_attributes"] = skipped
+    out["anchor"] = choose_anchor(runner, project, model, semantics["metrics"], where, profile_batch)
     out["maturity"] = maturity_signals(out)
     return out
+
+
+def raw_fact_metrics(metrics: list[dict]) -> list[str]:
+    """Raw numeric fact metrics (one column, one aggregation): the ones that read fact rows directly."""
+    return [m["name"] for m in metrics if m.get("formula") and _RAW_METRIC.match(m["formula"].strip())
+            and (m.get("type") or "").lower() in _NUMERIC]
+
+
+def anchor_sql(model: str, metrics: list[str], where: str = "") -> str:
+    cols = ", ".join(f"CAST(COUNT({quote_ident(n)}) AS VARCHAR) AS c{i}" for i, n in enumerate(metrics))
+    clause = f" WHERE {where}" if where else ""
+    return f"SELECT {cols} FROM {quote_model(model)}{clause}"  # nosec B608  # identifiers are quoted; the connector is read-only
+
+
+def choose_anchor(runner: Runner, project: str, model: str, metrics: list[dict], where: str = "",
+                  batch: int = 8) -> dict[str, Any] | None:
+    """The fullest raw fact metric, to count fact rows with. An aggregate over attributes only runs on the
+    attributes' lookups (real or virtual), not on the fact, so row counts and conditions in generated SQL
+    use COUNT(<anchor>) / COUNT(CASE WHEN ... THEN <anchor> END). COUNT skips blanks, hence the fullest."""
+    names = raw_fact_metrics(metrics)
+    counts: dict[str, float] = {}
+    for start in range(0, len(names), max(batch, 1)):
+        chunk = names[start:start + max(batch, 1)]
+        try:
+            parsed = parse_query_result(runner.call("query", {"project": project,
+                                                              "query": anchor_sql(model, chunk, where)}))
+        except PendingReply:
+            continue
+        if parsed["ok"] and parsed["rows"]:
+            row = parsed["rows"][0]
+            for i, n in enumerate(chunk):
+                v = _num(row.get(f"c{i}"))
+                if v is not None:
+                    counts[n] = v
+    if not counts:
+        return None
+    best = max(counts.values())
+    name = next(n for n in names if counts.get(n) == best)    # first of the fullest, in model order
+    return {"metric": name, "non_blank": best,
+            "counts": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
+            "note": "Count fact rows with COUNT(<anchor>), and conditions with COUNT(CASE WHEN ... THEN <anchor> "
+                    "END). Aggregates over attributes only read the attributes' lookups, not the fact. A model "
+                    "with several fact tables needs one anchor per fact."}
 
 
 _RAW_METRIC = re.compile(r"^(sum|avg|min|max|count)\(\s*[^(){}]*\{[^{}]+\}\s*\)$", re.I)
@@ -573,18 +617,20 @@ def roles_profile_sql(model: str, metrics: list[str], where: str = "") -> str:
         col = quote_ident(name)
         parts += [f"CAST(MIN({col}) AS VARCHAR) AS n{i}", f"CAST(MAX({col}) AS VARCHAR) AS x{i}",
                   f"CAST(COUNT({col}) AS VARCHAR) AS c{i}",
-                  f"CAST(SUM(CASE WHEN {col} <> FLOOR({col}) THEN 1 ELSE 0 END) AS VARCHAR) AS f{i}"]
+                  f"CAST(COUNT(CASE WHEN {col} <> FLOOR({col}) THEN {col} END) AS VARCHAR) AS f{i}"]
     clause = f" WHERE {where}" if where else ""
     return f"SELECT {', '.join(parts)} FROM {quote_model(model)}{clause}"  # nosec B608  # identifiers are quoted; the connector is read-only
 
 
-def roles_variation_sql(model: str, entity: str, metrics: list[str], where: str = "") -> str:
-    """Entities, rows, and per metric the entities whose rows hold more than one value."""
+def roles_variation_sql(model: str, entity: str, metrics: list[str], where: str = "", anchor: str = "") -> str:
+    """Entities, fact rows (counted with the anchor metric), and per metric the entities whose rows hold more
+    than one value."""
     inner = ", ".join(f"MAX({quote_ident(n)}) - MIN({quote_ident(n)}) AS v{i}" for i, n in enumerate(metrics))
     outer = ", ".join(f"CAST(SUM(CASE WHEN v{i} > 0 THEN 1 ELSE 0 END) AS VARCHAR) AS v{i}" for i in range(len(metrics)))
     clause = f" WHERE {where}" if where else ""
     return (f"SELECT CAST(COUNT(*) AS VARCHAR) AS entities, CAST(SUM(rows_) AS VARCHAR) AS row_count, {outer} "  # nosec B608  # identifiers are quoted; the connector is read-only
-            f"FROM (SELECT {quote_ident(entity)} AS e_, COUNT(*) AS rows_, {inner} FROM {quote_model(model)}{clause} "
+            f"FROM (SELECT {quote_ident(entity)} AS e_, COUNT({quote_ident(anchor or metrics[0])}) AS rows_, {inner} "
+            f"FROM {quote_model(model)}{clause} "
             f"GROUP BY 1) t")
 
 
@@ -678,9 +724,8 @@ def review_roles(runner: Runner, project: str, scope: dict, *, entity: str = "",
                  low_span: int = ROLE_LOW_SPAN, log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
     model = scope["model"]
     entity = entity or guess_entity(scope)
-    names = [m["name"] for m in scope.get("metrics") or []
-             if m.get("formula") and _RAW_METRIC.match(m["formula"].strip())
-             and (m.get("type") or "").lower() in _NUMERIC]
+    names = raw_fact_metrics(scope.get("metrics") or [])
+    anchor = ((scope.get("anchor") or {}).get("metric")) or ""
     profiles: dict[str, dict[str, Any]] = {}
     variation: dict[str, Any] = {"varying": {}}
     pending = 0
@@ -688,7 +733,7 @@ def review_roles(runner: Runner, project: str, scope: dict, *, entity: str = "",
         chunk = names[start:start + max(batch, 1)]
         log(f"roles: profile {len(chunk)} measures")
         for kind, sql in (("profile", roles_profile_sql(model, chunk, where)),
-                          ("variation", roles_variation_sql(model, entity, chunk, where) if entity else "")):
+                          ("variation", roles_variation_sql(model, entity, chunk, where, anchor) if entity else "")):
             if not sql:
                 continue
             try:
