@@ -1042,10 +1042,16 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             t = _num(tot[0].get(key)) if tot else None
             t_w = _num(tot_w[0].get(key)) if tot_w else None
             item["total"], item["total_wrapped"] = t, t_w
-            if tot_w is not None and not _close(t, t_w):
-                item["issues"].append(f"wrapping changes its value: SUM gives {t}, CAST(SUM(...)) gives {t_w}. Its own "
-                                      f"aggregation is not a sum, and an expression around it bypasses that "
-                                      f"aggregation; state the intended value in its description")
+            item["notes"] = []
+            agg = (re.match(r"^\s*(\w+)\(", m.get("formula") or "") or [None, ""])[1].lower()
+            if tot_w is not None and not _close(t or 0, t_w or 0):   # an empty column: NULL plain, 0 wrapped
+                text = (f"wrapping changes its value: SUM gives {t}, CAST(SUM(...)) gives {t_w}; an expression "
+                        f"around it bypasses its own aggregation ({agg or 'not a sum'})")
+                if agg in ("avg", "average", "mean"):   # an average: expected; analysts must read it plain
+                    item["notes"].append(text + ". Expected for an average: read it plain")
+                else:
+                    item["issues"].append(text + ". If a total is meant, the aggregation is wrong; if not, say "
+                                                 "what it returns in its description")
             groups_t = [(r.get("g"), _num(r.get(key))) for r in by_t or []]
             filled_t = [v for _, v in groups_t if v not in (None, 0)]
             groups_f = [(r.get("g"), _num(r.get(key))) for r in by_f or []]
@@ -1053,8 +1059,8 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             item["filtered_total"] = f_total
             in_grouped = next((v for g, v in groups_f if str(g) == str(filt_value)), None)
             item["filter_row_in_grouped"] = in_grouped
-            if fcond and ftot is not None and by_f is not None and not _close(f_total, in_grouped) \
-                    and (f_total or in_grouped):
+            if fcond and ftot is not None and by_f is not None and f_total is not None and in_grouped is not None \
+                    and not _close(f_total, in_grouped):
                 item["issues"].append(f"depends on the query's shape: {f_total} when filtered to {filt} = {filt_value}, "
                                       f"{in_grouped} in that row of the query grouped by {filt}")
             filled_f = [v for _, v in groups_f if v not in (None, 0)]
@@ -1087,7 +1093,7 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
                                       f"the facts (fine if it is another fact table)")
             warnings += [f"metric '{n}': {x}" for x in item["issues"]]
             met_out.append(item)
-    return {"version": 3, "model": model, "generated": time.strftime("%Y-%m-%d"), "anchor": anchor,
+    return {"version": 4, "model": model, "generated": time.strftime("%Y-%m-%d"), "anchor": anchor,
             "total_rows": total, "entities": ent_total,
             "filter": {"attribute": filt or None, "value": filt_value, "rows": filt_rows, "entities": ent_filtered},
             "partner": partner or None, "gaps": gaps, "pending_queries": pending,

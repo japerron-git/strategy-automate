@@ -1609,6 +1609,25 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(mets["weighted score"]["issues"], [])            # loan-level value, all loans kept: fine
         self.assertTrue(any("one period only" in x for x in mets["active count"]["issues"]))
 
+    def test_wrapping_an_average_is_a_note_and_an_empty_column_is_not_a_bypass(self):
+        scope = dict(self.SCOPE, metrics=[{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
+                                          {"name": "avg rate", "type": "double", "formula": "avg(t.csv.{RATE})"},
+                                          {"name": "empty cost", "type": "double", "formula": "sum(t.csv.{COST})"}])
+
+        def answer(sql):
+            if sql.startswith("SELECT CAST(SUM("):
+                return [["m0", "m1", "m2"], ["1000", "4,800", "0"]]
+            if sql.startswith("SELECT SUM("):
+                return [["m0", "m1", "m2"], ["1000", "4.8", ""]]
+            if sql.startswith('SELECT CAST("') and "AS g" in sql:
+                return [["g", "m0", "m1", "m2"]]
+            return self.answer(sql)
+        out = am.probe_objects(_SqlRunner(answer), "retail", scope, period="period", attributes=[])
+        mets = {m["name"]: m for m in out["metrics"]}
+        self.assertEqual(mets["avg rate"]["issues"], [])
+        self.assertTrue(any("Expected for an average" in x for x in mets["avg rate"]["notes"]))
+        self.assertEqual(mets["empty cost"]["issues"], [])
+
     def test_needs_an_anchor(self):
         with self.assertRaises(SystemExit):
             am.probe_objects(_SqlRunner(self.answer), "retail", dict(self.SCOPE, anchor=None))

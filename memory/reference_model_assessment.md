@@ -104,7 +104,11 @@ Aggregates of fact metrics run on the fact. So:
   model whose averages and ratios are derived metrics. So: read governed values plain, as analysts write
   them (the connector's thousands separators are parsed by the engine), and use `CAST`, `ROUND` or
   arithmetic around a metric only when a row-level value is meant. `probe` compares the two forms and
-  flags a metric whose value changes.
+  flags a metric whose value changes (a Max or other non-sum aggregation as a warning; an average as a
+  note, since that is expected; an empty column, NULL plain and 0 wrapped, as neither).
+- Ratios of summed metrics: `SUM(a) / SUM(b)` on decimals came back with 3 decimals on one model;
+  `1.0 * SUM(a) / SUM(b)` kept full precision. Arithmetic is safe around summed metrics only: for a
+  non-sum metric, read each aggregate plain and divide afterwards.
 - Models with several fact tables (user guidance, not yet tested here): a metric present in several
   facts can be steered to one fact by adding a hint metric from that fact to the query; use one anchor
   per fact table, and say in descriptions which hint metric to add.
