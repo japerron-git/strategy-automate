@@ -773,6 +773,182 @@ def review_roles(runner: Runner, project: str, scope: dict, *, entity: str = "",
                       "rebuilt later."]}
 
 
+# ── probe: automatic checks on attributes and metrics ───────────────────────────────────────
+# Questions only find defects they happen to exercise. These checks exercise every chosen object the way it
+# commonly breaks, counting fact rows with the anchor metric (an aggregate over attributes only reads lookups):
+#   attribute: rows lost when grouped by it (a lookup without every key drops rows), values only in the lookup
+#   metric:    parts that don't add up to the total (summed metrics), one value repeated in every group (a Max
+#              where a Sum was meant, or a level rule that ignores the split), empty outside the latest period
+#   numeric attribute: aggregating it reads the lookup's values, not the facts
+
+PROBE_MAX_VALUES = 200
+_LATEST_WORDS = re.compile(r"\b(latest|current period|as of|point in time|most recent)\b", re.I)
+
+
+def changed_objects(old_scope: dict | None, new_scope: dict, findings: dict | None = None,
+                    phases: list[int] | None = None) -> dict[str, list[str]]:
+    """Attributes and metrics added or changed since the old scope, plus objects named by the actions of findings
+    applied in `phases`: what a phase touched, for verify-changes to probe."""
+    def index(scope, key):
+        return {o["name"]: (o.get("type"), o.get("formula"), o.get("description")) for o in (scope or {}).get(key) or []}
+    out: dict[str, list[str]] = {}
+    for key in ("attributes", "metrics"):
+        old, new = index(old_scope, key), index(new_scope, key)
+        out[key] = [n for n, sig in new.items() if old_scope is None or n not in old or old[n][:2] != sig[:2]]
+    names = {"attributes": {a["name"].lower(): a["name"] for a in new_scope.get("attributes") or []},
+             "metrics": {m["name"].lower(): m["name"] for m in new_scope.get("metrics") or []}}
+    for f in (findings or {}).get("findings") or []:
+        for a in f.get("actions") or []:
+            if phases and action_phase(f, a) not in phases:
+                continue
+            args = a.get("args") or {}
+            vals = [args.get(k) for k in ("name", "attribute", "column", "source_metric", "new_name")]
+            vals += [n.get("name") if isinstance(n, dict) else n for n in args.get("new_attributes") or []]
+            for v in vals:
+                for key in ("attributes", "metrics"):
+                    hit = names[key].get(str(v or "").lower())
+                    if hit and hit not in out[key]:
+                        out[key].append(hit)
+    return out
+
+
+def _split_attribute(scope: dict, period: str = "", split: str = "") -> str:
+    if split or period:
+        return split or period
+    for a in scope.get("attributes") or []:
+        d = _num((a.get("profile") or {}).get("distinct_values"))
+        if d and 3 <= d <= 30 and "__" not in a["name"] and a["name"] != guess_entity(scope):
+            return a["name"]
+    return ""
+
+
+def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list[str] | None = None,
+                  metrics: list[str] | None = None, period: str = "", split: str = "", where: str = "",
+                  max_values: int = PROBE_MAX_VALUES, batch: int = 6,
+                  log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
+    model = scope["model"]
+    anchor = (scope.get("anchor") or {}).get("metric")
+    if not anchor:
+        raise SystemExit("probe: scope.json has no anchor metric; run scope again (it picks one)")
+    entity = guess_entity(scope)
+    attrs_by = {a["name"]: a for a in scope.get("attributes") or []}
+    mets_by = {m["name"]: m for m in scope.get("metrics") or []}
+    if attributes is None:
+        attributes = [n for n, a in attrs_by.items()
+                      if "__" not in n and n != entity and
+                      0 < (_num((a.get("profile") or {}).get("distinct_values")) or 0) <= max_values]
+    if metrics is None:
+        metrics = list(mets_by)
+    clause = f" WHERE {where}" if where else ""
+    pending = 0
+    warnings: list[str] = []
+
+    def ask(sql: str) -> dict | None:
+        nonlocal pending
+        try:
+            parsed = parse_query_result(runner.call("query", {"project": project, "query": sql}))
+        except PendingReply:
+            pending += 1
+            return None
+        return parsed
+
+    total_q = ask(f"SELECT CAST(COUNT({quote_ident(anchor)}) AS VARCHAR) AS n FROM {quote_model(model)}{clause}")  # nosec B608
+    total = _num(total_q["rows"][0].get("n")) if total_q and total_q["ok"] and total_q["rows"] else None
+
+    # attribute-only distinct counts (what the lookup holds), batched
+    lookup_counts: dict[str, float | None] = {}
+    names = [n for n in attributes if n in attrs_by]
+    for start in range(0, len(names), max(batch, 1)):
+        chunk = names[start:start + max(batch, 1)]
+        res = ask(profile_batch_sql(model, chunk, where))
+        if res and res["ok"] and res["rows"]:
+            for i, n in enumerate(chunk):
+                lookup_counts[n] = _num(res["rows"][0].get(f"d{i}"))
+    attr_out = []
+    for n in names:
+        log(f"probe attribute {n}")
+        res = ask(f"SELECT CAST({quote_ident(n)} AS VARCHAR) AS v, CAST(COUNT({quote_ident(anchor)}) AS VARCHAR) AS n "  # nosec B608
+                  f"FROM {quote_model(model)}{clause} GROUP BY 1")
+        item: dict[str, Any] = {"name": n, "lookup_values": lookup_counts.get(n), "issues": []}
+        if res is None:
+            item["pending"] = True
+            attr_out.append(item)
+            continue
+        if not res["ok"]:
+            item["error"] = res["error"]
+            attr_out.append(item)
+            continue
+        counts = [_num(r.get("n")) or 0 for r in res["rows"]]
+        item["data_values"] = sum(1 for c in counts if c > 0)
+        item["rows_in_groups"] = sum(counts)
+        if total is not None:
+            lost = total - item["rows_in_groups"]
+            item["rows_lost"] = lost
+            if lost > 0:
+                item["issues"].append(f"grouping by it keeps {item['rows_in_groups']:,.0f} of {total:,.0f} fact rows: "
+                                      f"{lost:,.0f} rows have a key its lookup lacks (often blank)")
+        if item.get("lookup_values") is not None and item["lookup_values"] > item["data_values"]:
+            extra = item["lookup_values"] - item["data_values"]
+            item["issues"].append(f"{extra:,.0f} value(s) exist only in its lookup: listed by attribute-only queries, "
+                                  f"empty in any filter")
+        a = attrs_by[n]
+        if (a.get("type") or "").lower() in _NUMERIC and not _CODE_LIKE.search(_words(n)) \
+                and not looks_like_integer_date(a):
+            item["issues"].append("numeric attribute: AVG or SUM over it reads its lookup's values, not the facts; "
+                                  "a metric is needed to aggregate it")
+        warnings += [f"attribute '{n}': {x}" for x in item["issues"]]
+        attr_out.append(item)
+
+    split_by = _split_attribute(scope, period, split)
+    met_out = []
+    mnames = [n for n in metrics if n in mets_by]
+    for start in range(0, len(mnames), max(batch, 1)):
+        chunk = mnames[start:start + max(batch, 1)]
+        log(f"probe {len(chunk)} metrics")
+        cols = ", ".join(f"CAST(SUM({quote_ident(n)}) AS VARCHAR) AS m{i}" for i, n in enumerate(chunk))
+        tot = ask(f"SELECT {cols} FROM {quote_model(model)}{clause}")  # nosec B608
+        by = ask(f"SELECT CAST({quote_ident(split_by)} AS VARCHAR) AS g, {cols} FROM {quote_model(model)}{clause} "  # nosec B608
+                 f"GROUP BY 1") if split_by else None
+        for i, n in enumerate(chunk):
+            m = mets_by[n]
+            item = {"name": n, "split_by": split_by or None, "issues": []}
+            if tot is None or (split_by and by is None):
+                item["pending"] = True
+                met_out.append(item)
+                continue
+            if not tot["ok"] or (by is not None and not by["ok"]):
+                item["error"] = (tot.get("error") if not tot["ok"] else by.get("error"))
+                met_out.append(item)
+                continue
+            t = _num(tot["rows"][0].get(f"m{i}")) if tot["rows"] else None
+            item["total"] = t
+            if by is not None:
+                vals = [(r.get("g"), _num(r.get(f"m{i}"))) for r in by["rows"]]
+                filled = [v for _, v in vals if v not in (None, 0)]
+                item["groups"], item["groups_with_values"] = len(vals), len(filled)
+                additive = bool(m.get("formula") and re.match(r"^\s*sum\(", m["formula"], re.I)
+                                and _RAW_METRIC.match(m["formula"].strip()))
+                if additive and t is not None and filled and abs(sum(filled) - t) > max(1e-6 * abs(t), 1e-6):
+                    item["issues"].append(f"the groups by '{split_by}' add up to {sum(filled):,.2f}, not the total "
+                                          f"{t:,.2f}")
+                if len(filled) >= 3 and len(set(filled)) == 1:
+                    item["issues"].append(f"returns the same value ({filled[0]:,.2f}) in every group of '{split_by}': "
+                                          f"a Max where a Sum was meant, or a level rule that ignores the split; say "
+                                          f"which in its description")
+                if split_by == period and len(vals) >= 3 and len(filled) == 1 \
+                        and not _LATEST_WORDS.search(f"{n} {m.get('description') or ''}"):
+                    item["issues"].append("returns a value for one period only, and neither its name nor its "
+                                          "description says it is a latest-period metric")
+            warnings += [f"metric '{n}': {x}" for x in item["issues"]]
+            met_out.append(item)
+    return {"version": 1, "model": model, "generated": time.strftime("%Y-%m-%d"), "anchor": anchor,
+            "total_rows": total, "split_by": split_by or None, "pending_queries": pending,
+            "attributes": attr_out, "metrics": met_out, "warnings": warnings,
+            "notes": ["Fact rows are counted with the anchor metric; attribute-only queries read lookups.",
+                      "A warning is evidence to confirm, not a verdict: a metric with a deliberate level rule repeats "
+                      "its value by design (say so in its description)."]}
+
+
 # ── run ──────────────────────────────────────────────────────────────────────────────────────
 
 def _select(questions: list[dict], only: str = "", levels: str = "") -> list[dict]:
@@ -1415,7 +1591,8 @@ def baseline_check(q: dict, res: dict) -> dict[str, Any]:
             "baseline_comparison": cmp}
 
 
-BEST_ANSWER_REASONS = ("initial", "decision", "data_change", "sql_error")
+BEST_ANSWER_REASONS = ("initial", "decision", "definition", "data_change", "sql_error")
+# decision: the user decided a definition. definition: Claude chose one; the workbook asks the user to confirm.
 _WS = re.compile(r"\s+")
 
 
@@ -1434,7 +1611,8 @@ def set_best_answer(bank: dict, qid: str, *, sql: str = "", not_answerable: str 
         problems.append("give the best-answer SQL or a not-answerable reason, not both")
     current = q.get("best_answer")
     if reason_kind == "initial" and current:
-        problems.append(f"{qid} has a best answer; change it with reason kind decision, data_change or sql_error")
+        problems.append(f"{qid} has a best answer; change it with reason kind decision, definition, data_change "
+                        f"or sql_error")
     if reason_kind != "initial" and not current:
         problems.append(f"{qid} has no best answer yet; set it with reason kind initial")
     if reason_kind != "initial" and not reason.strip():
@@ -1452,6 +1630,47 @@ def set_best_answer(bank: dict, qid: str, *, sql: str = "", not_answerable: str 
                                           "round": round_no, "reason_kind": reason_kind, "reason": reason.strip() or None,
                                           "history": history}.items() if v not in (None, [])}
     return {"ok": True, "id": qid, "version": best_answer_version(q)}
+
+
+QUESTION_SQL_REASONS = ("new_object", "sql_error", "type_change", "decision")
+
+
+def set_question_sql(bank: dict, qid: str, *, sql: str = "", not_answerable: bool = False, reason_kind: str,
+                     reason: str, round_no: int | None = None, path: str = "") -> dict[str, Any]:
+    """Rewrite a question's governed SQL: a phase added the object that answers it (new_object), the SQL was
+    wrong (sql_error), a type change altered the values it filters on (type_change), or the user decided
+    (decision). The earlier SQL stays in `sql_history`, so the round it became answerable is on record."""
+    q = next((x for x in bank.get("questions") or [] if x.get("id") == qid), None)
+    if q is None:
+        return {"ok": False, "problems": [f"unknown question {qid}"]}
+    problems = []
+    if reason_kind not in QUESTION_SQL_REASONS:
+        problems.append(f"reason kind must be one of {', '.join(QUESTION_SQL_REASONS)}")
+    if not reason.strip():
+        problems.append("give --reason: the object that now answers it, or what was wrong")
+    if bool(sql.strip()) == bool(not_answerable):
+        problems.append("give the new SQL, or --not-answerable, not both")
+    if sql.strip() and _WS.sub(" ", sql.strip()).lower() == _WS.sub(" ", (q.get("sql") or "").strip()).lower():
+        problems.append("the SQL is unchanged")
+    best = (q.get("best_answer") or {}).get("sql") or ""
+    if sql.strip() and best and _WS.sub(" ", sql.strip()).lower() == _WS.sub(" ", best.strip()).lower():
+        problems.append("the question's SQL can't be its best answer: then the grade proves nothing")
+    if path and path not in PATHS:
+        problems.append(f"path must be one of {', '.join(PATHS)}")
+    if problems:
+        return {"ok": False, "problems": problems}
+    history = list(q.get("sql_history") or [])
+    history.append({"sql": q.get("sql") or None, "expected_path": q.get("expected_path"), "until_round": round_no,
+                    "reason_kind": reason_kind, "reason": reason.strip()})
+    q["sql_history"] = history
+    q["sql"] = sql.strip() if sql.strip() else ""
+    if not_answerable:
+        q["expected_path"] = "not_answerable"
+    elif path:
+        q["expected_path"] = path
+    elif q.get("expected_path") == "not_answerable":
+        q["expected_path"] = "governed_metric" if reason_kind == "new_object" else "simple_sql"
+    return {"ok": True, "id": qid, "expected_path": q.get("expected_path"), "versions": len(history) + 1}
 
 
 def freeze_baselines(bank: dict, results: dict, ids: list[str], *, round_no: int | None, note: str = "",
@@ -1503,6 +1722,7 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
         elif res.get("skipped"):
             item["verdict"] = "ungraded" if q.get("expected_path") == "not_answerable" else "error"
             item["note"] = res.get("error")
+            item["no_sql"] = True
         elif not res.get("ok"):
             item.update({"verdict": "error", "note": res.get("error")})
         else:
@@ -1575,6 +1795,25 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
                 overridden.append(g["id"])
         out["best_answer_moved"], out["best_answer_overridden"] = moved, overridden
         out["suspicious_agreement"] = suspicious
+        # Answerability: questions that could not run before and now do, and paths that got simpler.
+        rank = {p: i for i, p in enumerate(PATHS)}
+        runnable_before = {g.get("id") for g in previous.get("questions") or []
+                           if g.get("verdict") not in ("error", "not_run") and not g.get("no_sql")
+                           and not str(g.get("note") or "").startswith("no sql")}
+        newly, simpler = [], []
+        for g in graded:
+            p = prev.get(g["id"])
+            if not p:
+                continue
+            if g["id"] not in runnable_before and g.get("verdict") not in ("error", "not_run") and not g.get("no_sql"):
+                newly.append(g["id"])
+            before_path, after_path = p.get("expected_path"), g.get("expected_path")
+            if before_path in rank and after_path in rank and rank[after_path] < rank[before_path]:
+                simpler.append({"id": g["id"], "before": before_path, "after": after_path})
+        out["answerability"] = {"newly_runnable": newly, "simpler_path": simpler,
+                                "governed_now": sum(1 for g in graded if g.get("expected_path") == "governed_metric"),
+                                "governed_before": sum(1 for g in previous.get("questions") or []
+                                                       if g.get("expected_path") == "governed_metric")}
     return out
 
 
@@ -2415,6 +2654,35 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--low-span", type=int, default=ROLE_LOW_SPAN,
                     help=f"integer range treated as a code, band or small count (default {ROLE_LOW_SPAN})")
 
+    sp = sub.add_parser("probe", help="automatic checks on attributes and metrics: rows lost, values only in a "
+                                      "lookup, parts that don't add up, one value in every group, latest-only")
+    sp.add_argument("--project", required=True)
+    sp.add_argument("--scope", required=True, help="scope.json with profiles and an anchor metric")
+    sp.add_argument("--out", required=True)
+    sp.add_argument("--attributes", help="comma-separated names (default: every attribute with at most --max-values)")
+    sp.add_argument("--metrics", help="comma-separated names (default: every metric)")
+    sp.add_argument("--changed-since", help="previous scope.json: probe only what changed since (verify-changes)")
+    sp.add_argument("--findings", help="findings.json: also probe objects named by actions of --phases")
+    sp.add_argument("--phases", default="", help="comma-separated phases applied this round")
+    sp.add_argument("--period", default="", help="period attribute: metrics are also checked across periods")
+    sp.add_argument("--split", default="", help="attribute to split metrics by (default: the period, else a "
+                                                "3-30 value attribute)")
+    sp.add_argument("--where", default="")
+    sp.add_argument("--max-values", type=int, default=PROBE_MAX_VALUES)
+    sp.add_argument("--batch", type=int, default=6)
+
+    sp = sub.add_parser("question-sql", help="rewrite a question's governed SQL, keeping the earlier version")
+    sp.add_argument("--bank", required=True)
+    sp.add_argument("--id", required=True)
+    g2 = sp.add_mutually_exclusive_group(required=True)
+    g2.add_argument("--sql")
+    g2.add_argument("--sql-file")
+    g2.add_argument("--not-answerable", action="store_true")
+    sp.add_argument("--reason-kind", required=True, choices=QUESTION_SQL_REASONS)
+    sp.add_argument("--reason", required=True)
+    sp.add_argument("--path", default="", choices=("",) + PATHS)
+    sp.add_argument("--round", type=int, default=None)
+
     sp = sub.add_parser("lookups", help="recommend lookup tables and write CSV templates for them")
     sp.add_argument("--project", required=True)
     sp.add_argument("--scope", required=True)
@@ -2553,6 +2821,24 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
                           "candidates": {r: sum(1 for c in out["candidates"] if c["role"] == r)
                                          for r in sorted({c["role"] for c in out["candidates"]})}}, indent=2))
         return 0
+    if args.cmd == "probe":
+        scope = _load_json(args.scope)
+        attrs = [x.strip() for x in args.attributes.split(",") if x.strip()] if args.attributes else None
+        mets = [x.strip() for x in args.metrics.split(",") if x.strip()] if args.metrics else None
+        if args.changed_since or args.findings:
+            phases = [int(p) for p in args.phases.split(",") if p.strip().isdigit()]
+            changed = changed_objects(_load_json(args.changed_since) if args.changed_since else None, scope,
+                                      _load_json(args.findings) if args.findings else None, phases or None)
+            attrs = changed["attributes"] if attrs is None else attrs
+            mets = changed["metrics"] if mets is None else mets
+        out = probe_objects(runner(), args.project, scope, attributes=attrs, metrics=mets, period=args.period,
+                            split=args.split, where=args.where, max_values=args.max_values, batch=args.batch, log=log)
+        _write_json(args.out, out)
+        if _pending(runner):
+            return 3
+        print(json.dumps({"ok": True, "out": args.out, "attributes": len(out["attributes"]),
+                          "metrics": len(out["metrics"]), "warnings": len(out["warnings"])}, indent=2))
+        return 0
     if args.cmd == "lookups":
         scope = _load_json(args.scope)
         rel = _load_json(args.relationships) if args.relationships else None
@@ -2580,7 +2866,7 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
     return 2
 
 
-LIVE_COMMANDS = ("scope", "run", "relationships", "roles", "lookups")   # commands that query the model
+LIVE_COMMANDS = ("scope", "run", "relationships", "roles", "probe", "lookups")   # commands that query the model
 
 
 def _pending(runner: Callable[[], Runner]) -> bool:
@@ -2611,6 +2897,18 @@ def _offline(args: argparse.Namespace) -> int:
         out = set_best_answer(bank, args.id, sql=sql, not_answerable=args.not_answerable or "",
                               reason_kind=args.reason_kind, reason=args.reason, rationale=args.rationale,
                               round_no=args.round)
+        if out["ok"]:
+            _write_json(args.bank, bank)
+        print(json.dumps(out, indent=2))
+        return 0 if out["ok"] else 2
+    if args.cmd == "question-sql":
+        bank = _load_json(args.bank)
+        sql = args.sql or ""
+        if args.sql_file:
+            with open(args.sql_file, encoding="utf-8") as f:
+                sql = f.read()
+        out = set_question_sql(bank, args.id, sql=sql, not_answerable=bool(args.not_answerable),
+                               reason_kind=args.reason_kind, reason=args.reason, round_no=args.round, path=args.path)
         if out["ok"]:
             _write_json(args.bank, bank)
         print(json.dumps(out, indent=2))

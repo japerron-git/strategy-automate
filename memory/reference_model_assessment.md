@@ -135,12 +135,29 @@ model probably cannot answer.
   graded against: an outside reference (`inline`, `reference_file`) > the best answer > a plain
   same-model check. Where an outside reference exists, the best answer is checked against it too
   (`best_vs_reference`). Set it with `assess_model.py best-answer --reason-kind initial`; change it only as
-  an override with a recorded reason (`decision`: the user decided a definition; `data_change`: the source
-  changed; `sql_error`: the earlier SQL was wrong). The history keeps every version, and SQL identical to
+  an override with a recorded reason (`decision`: the user decided a definition; `definition`: the
+  assessor chose one, for the user to confirm; `data_change`: the source changed; `sql_error`: the
+  earlier SQL was wrong). The history keeps every version, and SQL identical to
   the question's own is refused. Grading flags `best_answer_moved` (same SQL, new result: the data or
   model changed under it), `best_answer_overridden`, and `suspicious_agreement` (the best answer moved
   and the question now passes: check that both didn't change for the same wrong reason). A best answer
   from the same model is the assessor's definition, not proof: prefer an outside reference when one exists.
+- **Question SQL versions:** when a phase adds the object that answers a question (or its SQL was wrong,
+  or a type change altered the values it filters on), rewrite it with `assess_model.py question-sql
+  --reason-kind new_object|sql_error|type_change|decision --reason ...`; the earlier SQL and path stay in
+  `sql_history`. Grading against the previous round reports `answerability`: questions that could not
+  run before and now do (`newly_runnable`), paths that got simpler (`simpler_path`, e.g. expert SQL →
+  governed metric) and the count answered by governed metrics before and after. Answerability gained is
+  a better progress signal than the pass rate alone.
+- **Probes** (`assess_model.py probe`): automatic checks that exercise objects the way they commonly
+  break, counting fact rows with the anchor metric — per attribute, rows lost when grouped by it (a
+  lookup missing a key, often the blank one) and values found only in its lookup; per metric, groups that
+  don't add up to the total (summed metrics), one value repeated in every group (a Max where a Sum was
+  meant, or a level rule that ignores the split), a value for one period only without "latest" in its name
+  or description; numeric attributes (aggregating one reads its lookup). The assessment probes every
+  attribute with at most 200 values and every metric; verify-changes probes what the phase added or
+  changed (`--changed-since <previous scope> --findings findings.json --phases N`), so a defect a phase
+  introduces is found even when no question exercises it. A warning is evidence, not a verdict.
 - **Cost** per question and round: queries, SQL characters sent, reply characters received and an
   estimated token count (characters / 4), for the governed answer and the best answer separately,
   totalled per level in the summary. It covers connector I/O only: a chat can't see its own token counts,

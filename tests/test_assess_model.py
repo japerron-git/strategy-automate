@@ -1500,3 +1500,86 @@ class AnchorTests(unittest.TestCase):
         var = am.roles_variation_sql("M", "store id", ["units"], anchor="net sales")
         self.assertIn('COUNT("net sales") AS rows_', var)
         self.assertNotIn("COUNT(*) AS rows_", var)
+
+
+class ProbeTests(unittest.TestCase):
+    """Automatic checks that exercise each object the way it commonly breaks."""
+
+    SCOPE = {"model": "Store Sales", "anchor": {"metric": "net sales"},
+             "attributes": [{"name": "region", "type": "varchar", "profile": {"distinct_values": 3}},
+                            {"name": "promo flag", "type": "varchar", "profile": {"distinct_values": 2}},
+                            {"name": "months open", "type": "bigint", "profile": {"distinct_values": 40}},
+                            {"name": "period", "type": "varchar", "profile": {"distinct_values": 3}}],
+             "metrics": [{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
+                         {"name": "largest sale", "type": "double", "formula": "max(t.csv.{SALE})"},
+                         {"name": "open stores", "type": "bigint", "formula": "Count(store){~, period}",
+                          "description": "Stores open."}]}
+
+    def _runner(self):
+        return FakeRunner({
+            'SELECT CAST(COUNT("net sales") AS VARCHAR) AS n FROM': _table_reply([["n"], ["1,000"]]),
+            'COUNT(DISTINCT "region")': _table_reply([["d0", "n0", "x0", "d1", "n1", "x1", "d2", "n2", "x2"],
+                                                      ["3", "a", "c", "4", "", "", "40", "1", "40"]]),
+            'CAST("region" AS VARCHAR) AS v': _table_reply([["v", "n"], ["a", "500"], ["b", "300"], ["c", "200"]]),
+            'CAST("promo flag" AS VARCHAR) AS v': _table_reply([["v", "n"], ["Y", "120"]]),       # blanks lost
+            'CAST("months open" AS VARCHAR) AS v': _table_reply([["v", "n"], ["1", "1,000"]]),
+            'AS g,': _table_reply([["g", "m0", "m1", "m2"], ["202401", "300", "9", ""], ["202402", "300", "9", ""],
+                                   ["202403", "300", "9", "42"]]),
+            'SELECT CAST(SUM("net sales") AS VARCHAR) AS m0,': _table_reply([["m0", "m1", "m2"], ["1,000", "9", "42"]]),
+        })
+
+    def test_checks(self):
+        out = am.probe_objects(self._runner(), "retail", self.SCOPE, attributes=["region", "promo flag", "months open"],
+                               period="period")
+        attrs = {a["name"]: a for a in out["attributes"]}
+        self.assertEqual(attrs["region"]["issues"], [])
+        self.assertEqual(attrs["promo flag"]["rows_lost"], 880)                      # the lookup lacks the blank key
+        self.assertTrue(any("only in its lookup" in x for x in attrs["promo flag"]["issues"]))
+        self.assertTrue(any("numeric attribute" in x for x in attrs["months open"]["issues"]))
+        mets = {m["name"]: m for m in out["metrics"]}
+        self.assertTrue(any("add up to 900.00" in x for x in mets["net sales"]["issues"]))
+        self.assertTrue(any("same value (9.00) in every group" in x for x in mets["largest sale"]["issues"]))
+        self.assertTrue(any("one period only" in x for x in mets["open stores"]["issues"]))
+        self.assertEqual(out["total_rows"], 1000.0)
+        self.assertTrue(out["warnings"])
+
+    def test_needs_an_anchor(self):
+        with self.assertRaises(SystemExit):
+            am.probe_objects(FakeRunner({}), "retail", dict(self.SCOPE, anchor=None))
+
+    def test_changed_objects(self):
+        old = {"attributes": [{"name": "region", "type": "varchar"}],
+               "metrics": [{"name": "net sales", "type": "double", "formula": "sum(x)"}]}
+        new = {"attributes": [{"name": "region", "type": "varchar"}, {"name": "region group", "type": "varchar"}],
+               "metrics": [{"name": "net sales", "type": "double", "formula": "max(x)"},
+                           {"name": "units", "type": "bigint", "formula": "sum(u)"}]}
+        findings = {"findings": [_finding("F1", "description", actions=[
+            {"kind": "rename_describe", "args": {"items": []}}]), _finding("F2", "attribute", actions=[
+            {"kind": "add_column_attribute", "args": {"name": "region", "column": "x"}}])]}
+        out = am.changed_objects(old, new, findings, [3])
+        self.assertEqual(out["attributes"], ["region group", "region"])          # new, then named by a phase-3 action
+        self.assertEqual(out["metrics"], ["net sales", "units"])                 # formula changed, new
+
+
+class QuestionSqlTests(unittest.TestCase):
+    def test_rewrite_keeps_history_and_tracks_answerability(self):
+        bank = {"questions": [{"id": "Q1", "sql": "", "expected_path": "not_answerable",
+                               "best_answer": {"sql": "SELECT 2"}}]}
+        bad = am.set_question_sql(bank, "Q1", sql="SELECT 2", reason_kind="new_object", reason="x")
+        self.assertIn("can't be its best answer", " ".join(bad["problems"]))
+        self.assertFalse(am.set_question_sql(bank, "Q1", sql="SELECT 1", reason_kind="new_object", reason="")["ok"])
+        ok = am.set_question_sql(bank, "Q1", sql="SELECT 1", reason_kind="new_object", reason="metric M added",
+                                 round_no=2)
+        self.assertEqual((ok["ok"], ok["expected_path"]), (True, "governed_metric"))
+        self.assertEqual(bank["questions"][0]["sql_history"][0]["expected_path"], "not_answerable")
+        previous = {"questions": [{"id": "Q1", "verdict": "ungraded", "no_sql": True, "expected_path": "not_answerable"}]}
+        graded = am.grade_bank(bank, {"results": [{"id": "Q1", "ok": True, "rows": [["1"]], "columns": ["x"]}]},
+                               previous=previous)
+        self.assertEqual(graded["answerability"]["newly_runnable"], ["Q1"])
+        self.assertEqual(graded["answerability"]["simpler_path"],
+                         [{"id": "Q1", "before": "not_answerable", "after": "governed_metric"}])
+
+    def test_definition_is_a_reason_kind(self):
+        bank = {"questions": [{"id": "Q1", "sql": "SELECT 1", "best_answer": {"sql": "SELECT 3"}}]}
+        out = am.set_best_answer(bank, "Q1", sql="SELECT 4", reason_kind="definition", reason="balance-weighted")
+        self.assertTrue(out["ok"])

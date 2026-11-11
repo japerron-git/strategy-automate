@@ -56,7 +56,7 @@ folder kept local — they hold tenant data). Script: `skills/strategy-model-ass
 the maturity estimate from step 1 sets the emphasis (see "Maturity levels" in the memory note).
 
 **Sessions where the script cannot sign in** (a cloud workspace with the Mosaic connector attached):
-add `--replies <folder>` to `scope`, `relationships`, `roles`, `lookups` and `run`. The script then lists the
+add `--replies <folder>` to `scope`, `relationships`, `roles`, `probe`, `lookups` and `run`. The script then lists the
 calls it needs in `<folder>/pending.json`; call each connector tool with the listed arguments, save
 the reply text to the listed file (start it with `ERROR:` if the tool failed), and run the same
 command again until nothing is pending (exit code 3 means "replies still needed").
@@ -131,6 +131,20 @@ each numeric attribute, and names the role the evidence points to:
 
 Evidence, not a verdict: confirm each against the domain notes. Fix roles early (phase 3), before
 metrics are built on these columns.
+
+### 1b3. Probes → `probes.json`
+
+```bash
+python3 assess_model.py probe --project "<project>" --scope scope.json --period "<period attribute>" \
+  --out probes.json
+```
+
+Exercises every attribute with at most 200 values and every metric the way they commonly break,
+counting fact rows with the anchor metric: rows lost when grouping by an attribute, values only in its
+lookup, numeric attributes, summed metrics whose groups don't add up, one value repeated in every group,
+a metric that returns one period only without saying it is latest-period. Each confirmed warning is a
+finding; a question cannot find what it doesn't exercise. After a phase, probe only what it touched:
+`--changed-since <previous scope.json> --findings findings.json --phases <N>`.
 
 ### 1c. Lookup tables → `lookups.json` and CSV templates
 
