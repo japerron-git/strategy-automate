@@ -326,6 +326,7 @@ class ReplayRunner:
         return reply
 
     def write_pending(self) -> str:
+        os.makedirs(self.folder, exist_ok=True)   # a first run into a new replies folder
         path = os.path.join(self.folder, "pending.json")
         _write_json(path, {"folder": self.folder, "count": len(self.pending),
                            "instructions": "Call each tool with its arguments; save the reply text to "
@@ -655,7 +656,7 @@ def classify_roles(scope: dict, profiles: dict[str, dict], variation: dict[str, 
     for a in scope.get("attributes") or []:
         prof = a.get("profile") or {}
         name, typ = a["name"], (a.get("type") or "").lower()
-        distinct = prof.get("distinct_values")
+        distinct = _num(prof.get("distinct_values"))   # a number, a "1,234" string, or an error text
         if typ not in _NUMERIC or name == entity or "__" in name or looks_like_integer_date(a):
             continue
         if _CODE_LIKE.search(_words(name)) or any(name.lower() in m for m in metric_names):
@@ -2447,7 +2448,7 @@ def main(argv: list[str] | None = None, runner_factory: Callable[[argparse.Names
         return r
     runner.made = made  # type: ignore[attr-defined]
 
-    if args.cmd in ("scope", "run", "relationships", "lookups"):
+    if args.cmd in LIVE_COMMANDS:
         try:
             code = _live(args, runner, log)
             pending = [r for r in made if getattr(r, "pending", None)]
@@ -2532,6 +2533,9 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
         print(json.dumps({"ok": True, "out": args.out, **out["summary"]}, indent=2))
         return 0
     return 2
+
+
+LIVE_COMMANDS = ("scope", "run", "relationships", "roles", "lookups")   # commands that query the model
 
 
 def _pending(runner: Callable[[], Runner]) -> bool:

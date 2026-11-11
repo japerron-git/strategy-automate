@@ -7,6 +7,7 @@ import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import _hermetic  # noqa: E402,F401  (scrub MSTR_*/proxy env, private secret store)
 
+import argparse
 import contextlib
 import copy
 import csv
@@ -1445,3 +1446,32 @@ class RoleTests(unittest.TestCase):
             {"kind": "add_column_attribute", "args": {"column": "status code", "name": "<status code as an attribute>"}}])]},
             model_id="MID")
         self.assertTrue(any("placeholder" in p for p in bad["problems"]))
+
+
+class CommandRoutingTests(unittest.TestCase):
+    """Every command that takes --project queries the model, so it must go through the live path (the roles
+    command once fell through to the offline path and crashed)."""
+
+    def test_every_project_command_is_live(self):
+        ap = am.build_parser()
+        subs = next(a for a in ap._actions if isinstance(a, argparse._SubParsersAction))
+        needs_model = {name for name, sp in subs.choices.items()
+                       if any("--project" in a.option_strings for a in sp._actions)}
+        self.assertEqual(needs_model - {"plan"}, set(am.LIVE_COMMANDS))   # plan only names the project
+
+    def test_roles_runs_from_the_command_line_in_replay_mode(self):
+        d = tempfile.mkdtemp(prefix="roles-cli-")
+        self.addCleanup(shutil.rmtree, d, True)
+        scope = {"model": "M", "attributes": [{"name": "store id", "type": "varchar", "profile": {"distinct_values": "1,234"}},
+                                              {"name": "price", "type": "double", "profile": {"distinct_values": "error"}}],
+                 "metrics": [{"name": "units", "type": "bigint", "formula": "sum(t.csv.{UNITS})"}]}
+        for name, obj in (("scope.json", scope), ("rel.json", {"entity": "store id"})):
+            with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+                json.dump(obj, f)
+        argv = ["--replies", os.path.join(d, "replies"), "roles", "--project", "P", "--scope",
+                os.path.join(d, "scope.json"), "--relationships", os.path.join(d, "rel.json"),
+                "--out", os.path.join(d, "roles.json")]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(am.main(argv), 3)                       # replies pending, no crash
+        with open(os.path.join(d, "replies", "pending.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["count"], 2)               # profile + variation queries
