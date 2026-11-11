@@ -149,15 +149,21 @@ model probably cannot answer.
   run before and now do (`newly_runnable`), paths that got simpler (`simpler_path`, e.g. expert SQL →
   governed metric) and the count answered by governed metrics before and after. Answerability gained is
   a better progress signal than the pass rate alone.
-- **Probes** (`assess_model.py probe`): automatic checks that exercise objects the way they commonly
-  break, counting fact rows with the anchor metric — per attribute, rows lost when grouped by it (a
-  lookup missing a key, often the blank one) and values found only in its lookup; per metric, groups that
-  don't add up to the total (summed metrics), one value repeated in every group (a Max where a Sum was
-  meant, or a level rule that ignores the split), a value for one period only without "latest" in its name
-  or description; numeric attributes (aggregating one reads its lookup). The assessment probes every
-  attribute with at most 200 values and every metric; verify-changes probes what the phase added or
-  changed (`--changed-since <previous scope> --findings findings.json --phases N`), so a defect a phase
-  introduces is found even when no question exercises it. A warning is evidence, not a verdict.
+- **Probes** (`assess_model.py probe`): automatic checks that compare query shapes, because the common
+  defects only show in some shapes (found on a live model: a probe that tested each object alone and
+  unfiltered missed three of four known defects). Shapes: alone; filtered to the latest period (or the
+  largest group of another attribute); grouped with a partner attribute (3-30 values). Attributes: fact
+  rows kept in each shape against the matching anchor count (a lookup missing a key drops rows once a
+  filter or second attribute joins); values an attribute-only query lists that have no fact rows, named;
+  a numeric attribute read from its lookup (COUNT over it far below the fact rows; one on the fact
+  table is fine). Metrics, of every kind: the filtered total differs from the filter's row in the
+  grouped query (a Max or level rule evaluated at different grains — a Max looks additive grouped and
+  returns one entity's value filtered); the filtered total equals the unfiltered one though the filter
+  drops most rows (reads a lookup, or a level rule ignoring the filter); the same value in every group,
+  grouped by the partner under the filter; summed metrics whose groups don't add up; a value for one
+  period only without "latest" in its name or description. The assessment probes every attribute with at
+  most 200 values and every metric; verify-changes probes what the phase touched (`--changed-since
+  <previous scope> --findings findings.json --phases N`). A warning is evidence, not a verdict.
 - **Cost** per question and round: queries, SQL characters sent, reply characters received and an
   estimated token count (characters / 4), for the governed answer and the best answer separately,
   totalled per level in the summary. It covers connector I/O only: a chat can't see its own token counts,

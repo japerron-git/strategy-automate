@@ -775,12 +775,21 @@ def review_roles(runner: Runner, project: str, scope: dict, *, entity: str = "",
 
 
 # ── probe: automatic checks on attributes and metrics ───────────────────────────────────────
-# Questions only find defects they happen to exercise. These checks exercise every chosen object the way it
-# commonly breaks, counting fact rows with the anchor metric (an aggregate over attributes only reads lookups):
-#   attribute: rows lost when grouped by it (a lookup without every key drops rows), values only in the lookup
-#   metric:    parts that don't add up to the total (summed metrics), one value repeated in every group (a Max
-#              where a Sum was meant, or a level rule that ignores the split), empty outside the latest period
-#   numeric attribute: aggregating it reads the lookup's values, not the facts
+# Questions only find defects they happen to exercise. The probe exercises each chosen object in several query
+# shapes and compares them, because the common defects only show in some shapes: a lookup missing a key drops
+# rows once a filter or a second attribute joins the query; a Max metric looks additive when grouped and returns
+# one entity's value once filtered; a metric on a mapping table ignores filters on the fact. Fact rows are
+# counted with the anchor metric (an aggregate over attributes only reads lookups). Shapes:
+#   filter  = WHERE <filter attribute> = <its latest or largest value>   (the period, when given)
+#   partner = a second attribute with 3-30 values, grouped together with the object
+# Checks:
+#   attribute: rows kept alone / with the filter / with the partner (each against the matching anchor count);
+#              values listed by an attribute-only query but with no fact rows (named, not counted);
+#              a numeric attribute that is read from its lookup (COUNT over it far below the fact rows)
+#   metric:    the filtered total differs from the filter's row in the grouped query (shape-dependent);
+#              the filtered total equals the unfiltered one though the filter drops most rows (ignores filters);
+#              the same value in every group, grouped and filtered; summed metrics whose groups don't add up;
+#              a value for one period only without "latest" in its name or description
 
 PROBE_MAX_VALUES = 200
 _LATEST_WORDS = re.compile(r"\b(latest|current period|as of|point in time|most recent)\b", re.I)
@@ -813,14 +822,35 @@ def changed_objects(old_scope: dict | None, new_scope: dict, findings: dict | No
     return out
 
 
-def _split_attribute(scope: dict, period: str = "", split: str = "") -> str:
-    if split or period:
-        return split or period
-    for a in scope.get("attributes") or []:
-        d = _num((a.get("profile") or {}).get("distinct_values"))
-        if d and 3 <= d <= 30 and "__" not in a["name"] and a["name"] != guess_entity(scope):
-            return a["name"]
-    return ""
+def _companion_attributes(scope: dict, period: str = "", split: str = "") -> tuple[str, str]:
+    """(filter attribute, partner attribute). The filter is the period when given (snapshot models are read
+    one period at a time); the partner is another attribute with 3-30 values."""
+    entity = guess_entity(scope)
+    small = [a["name"] for a in scope.get("attributes") or []
+             if "__" not in a["name"] and a["name"] != entity
+             and 3 <= (_num((a.get("profile") or {}).get("distinct_values")) or 0) <= 30]
+    filt = period or split or (small[0] if small else "")
+    partner = split if split and split != filt else next((n for n in small if n != filt), "")
+    return filt, partner
+
+
+def _close(a: float | None, b: float | None) -> bool:
+    if a is None or b is None:
+        return a == b
+    return abs(a - b) <= max(1e-6 * max(abs(a), abs(b)), 0.005)
+
+
+def _sql_literal(value: Any, typ: str = "") -> str:
+    """A literal for a value read back as text: unquoted only for a numeric column (a varchar holding digits
+    compared with a number is a type error)."""
+    text = str(value)
+    if (typ or "").lower() in _NUMERIC and re.fullmatch(r"-?\d+(\.\d+)?", text):
+        return text
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _blank(v: Any) -> bool:
+    return v is None or str(v).strip().lower() in ("", "null", "none")
 
 
 def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list[str] | None = None,
@@ -840,7 +870,12 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
                       0 < (_num((a.get("profile") or {}).get("distinct_values")) or 0) <= max_values]
     if metrics is None:
         metrics = list(mets_by)
-    clause = f" WHERE {where}" if where else ""
+    M, A = quote_model(model), quote_ident(anchor)
+    base = f" WHERE {where}" if where else ""
+
+    def cond(extra: str) -> str:
+        return f" WHERE {where} AND {extra}" if where else f" WHERE {extra}"
+
     pending = 0
     warnings: list[str] = []
 
@@ -853,101 +888,140 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             return None
         return parsed
 
-    total_q = ask(f"SELECT CAST(COUNT({quote_ident(anchor)}) AS VARCHAR) AS n FROM {quote_model(model)}{clause}")  # nosec B608
-    total = _num(total_q["rows"][0].get("n")) if total_q and total_q["ok"] and total_q["rows"] else None
+    def rows_of(res: dict | None) -> list[dict] | None:
+        return res["rows"] if res and res["ok"] else None
 
-    # attribute-only distinct counts (what the lookup holds), batched
-    lookup_counts: dict[str, float | None] = {}
-    names = [n for n in attributes if n in attrs_by]
-    for start in range(0, len(names), max(batch, 1)):
-        chunk = names[start:start + max(batch, 1)]
-        res = ask(profile_batch_sql(model, chunk, where))
-        if res and res["ok"] and res["rows"]:
-            for i, n in enumerate(chunk):
-                lookup_counts[n] = _num(res["rows"][0].get(f"d{i}"))
+    filt, partner = _companion_attributes(scope, period, split)
+    total_r = rows_of(ask(f"SELECT CAST(COUNT({A}) AS VARCHAR) AS n FROM {M}{base}"))  # nosec B608
+    total = _num(total_r[0].get("n")) if total_r else None
+    filt_value, filt_rows = None, None
+    if filt:
+        fr = rows_of(ask(f"SELECT CAST({quote_ident(filt)} AS VARCHAR) AS v, CAST(COUNT({A}) AS VARCHAR) AS n "  # nosec B608
+                         f"FROM {M}{base} GROUP BY 1"))
+        filled = [(r.get("v"), _num(r.get("n")) or 0) for r in fr or [] if not _blank(r.get("v")) and _num(r.get("n"))]
+        if filled:   # the latest period, or the largest group of another attribute
+            filt_value = (max(filled, key=lambda x: str(x[0])) if filt == period else max(filled, key=lambda x: x[1]))[0]
+    filt_type = (attrs_by.get(filt) or {}).get("type") or ""
+    fcond = cond(f"{quote_ident(filt)} = {_sql_literal(filt_value, filt_type)}") if filt_value is not None else ""
+    if fcond:   # the fact rows the filter keeps, counted directly
+        fr = rows_of(ask(f"SELECT CAST(COUNT({A}) AS VARCHAR) AS n FROM {M}{fcond}"))  # nosec B608
+        filt_rows = _num(fr[0].get("n")) if fr else None
+    if partner and total:   # a partner that drops rows itself would blame every attribute grouped with it
+        pr = rows_of(ask(f"SELECT CAST({quote_ident(partner)} AS VARCHAR) AS v, CAST(COUNT({A}) AS VARCHAR) AS n "  # nosec B608
+                         f"FROM {M}{base} GROUP BY 1"))
+        if pr is not None and sum(_num(r.get("n")) or 0 for r in pr) < total - 0.5:
+            warnings.append(f"attribute '{partner}': grouping by it alone loses fact rows; not used as a partner")
+            partner = ""
+
     attr_out = []
-    for n in names:
+    for n in [x for x in attributes if x in attrs_by]:
         log(f"probe attribute {n}")
-        res = ask(f"SELECT CAST({quote_ident(n)} AS VARCHAR) AS v, CAST(COUNT({quote_ident(anchor)}) AS VARCHAR) AS n "  # nosec B608
-                  f"FROM {quote_model(model)}{clause} GROUP BY 1")
-        item: dict[str, Any] = {"name": n, "lookup_values": lookup_counts.get(n), "issues": []}
-        if res is None:
-            item["pending"] = True
+        a, N = attrs_by[n], quote_ident(n)
+        item: dict[str, Any] = {"name": n, "issues": [], "shapes": {}}
+        listing = rows_of(ask(f"SELECT CAST({N} AS VARCHAR) AS v FROM {M}{base} GROUP BY 1"))  # nosec B608  # attribute only: the lookup
+        alone = rows_of(ask(f"SELECT CAST({N} AS VARCHAR) AS v, CAST(COUNT({A}) AS VARCHAR) AS n FROM {M}{base} GROUP BY 1"))  # nosec B608
+        shapes = [("alone", alone, total)]
+        if fcond and n != filt:
+            sql = f"SELECT CAST({N} AS VARCHAR) AS v, CAST(COUNT({A}) AS VARCHAR) AS n FROM {M}{fcond} GROUP BY 1"  # nosec B608  # identifiers are quoted; the connector is read-only
+            shapes.append((f"filtered to {filt} = {filt_value}", rows_of(ask(sql)), filt_rows))
+        if partner and n != partner:
+            P = quote_ident(partner)
+            sql = f"SELECT CAST({P} AS VARCHAR) AS p, CAST({N} AS VARCHAR) AS v, CAST(COUNT({A}) AS VARCHAR) AS n FROM {M}{base} GROUP BY 1, 2"  # nosec B608  # identifiers are quoted; the connector is read-only
+            shapes.append((f"grouped with {partner}", rows_of(ask(sql)), total))
+        if alone is None and listing is None:
+            item["pending" if pending else "error"] = True
             attr_out.append(item)
             continue
-        if not res["ok"]:
-            item["error"] = res["error"]
-            attr_out.append(item)
-            continue
-        counts = [_num(r.get("n")) or 0 for r in res["rows"]]
-        item["data_values"] = sum(1 for c in counts if c > 0)
-        item["rows_in_groups"] = sum(counts)
-        if total is not None:
-            lost = total - item["rows_in_groups"]
-            item["rows_lost"] = lost
-            if lost > 0:
-                item["issues"].append(f"grouping by it keeps {item['rows_in_groups']:,.0f} of {total:,.0f} fact rows: "
-                                      f"{lost:,.0f} rows have a key its lookup lacks (often blank)")
-        if item.get("lookup_values") is not None and item["lookup_values"] > item["data_values"]:
-            extra = item["lookup_values"] - item["data_values"]
-            item["issues"].append(f"{extra:,.0f} value(s) exist only in its lookup: listed by attribute-only queries, "
-                                  f"empty in any filter")
-        a = attrs_by[n]
+        for label, rows, expected in shapes:
+            if rows is None or expected is None:
+                continue
+            kept = sum(_num(r.get("n")) or 0 for r in rows)
+            item["shapes"][label] = {"rows": kept, "expected": expected}
+            if kept < expected - 0.5:
+                item["issues"].append(f"{label}: keeps {kept:,.0f} of {expected:,.0f} fact rows ({expected - kept:,.0f} "
+                                      f"lost: a key its lookup lacks, often the blank one)")
+        if listing is not None and alone is not None:
+            with_data = {str(r.get("v")) for r in alone if (_num(r.get("n")) or 0) > 0 and not _blank(r.get("v"))}
+            only_lookup = sorted({str(r.get("v")) for r in listing if not _blank(r.get("v"))} - with_data)
+            item["lookup_only_values"] = only_lookup
+            if only_lookup:
+                shown = ", ".join(only_lookup[:12]) + (f" and {len(only_lookup) - 12} more" if len(only_lookup) > 12 else "")
+                item["issues"].append(f"{len(only_lookup)} value(s) only in its lookup (listed, but no fact rows): {shown}")
         if (a.get("type") or "").lower() in _NUMERIC and not _CODE_LIKE.search(_words(n)) \
-                and not looks_like_integer_date(a):
-            item["issues"].append("numeric attribute: AVG or SUM over it reads its lookup's values, not the facts; "
-                                  "a metric is needed to aggregate it")
+                and not looks_like_integer_date(a) and total:
+            cr = rows_of(ask(f"SELECT CAST(COUNT({N}) AS VARCHAR) AS n FROM {M}{base}"))  # nosec B608
+            counted = _num(cr[0].get("n")) if cr else None
+            item["count_over_attribute"] = counted
+            if counted is not None and counted < 0.5 * total:
+                item["issues"].append(f"numeric attribute read from its lookup: COUNT over it gives {counted:,.0f}, the "
+                                      f"fact has {total:,.0f} rows, so AVG or SUM over it averages the lookup's values")
         warnings += [f"attribute '{n}': {x}" for x in item["issues"]]
         attr_out.append(item)
 
-    split_by = _split_attribute(scope, period, split)
     met_out = []
     mnames = [n for n in metrics if n in mets_by]
     for start in range(0, len(mnames), max(batch, 1)):
         chunk = mnames[start:start + max(batch, 1)]
         log(f"probe {len(chunk)} metrics")
         cols = ", ".join(f"CAST(SUM({quote_ident(n)}) AS VARCHAR) AS m{i}" for i, n in enumerate(chunk))
-        tot = ask(f"SELECT {cols} FROM {quote_model(model)}{clause}")  # nosec B608
-        by = ask(f"SELECT CAST({quote_ident(split_by)} AS VARCHAR) AS g, {cols} FROM {quote_model(model)}{clause} "  # nosec B608
-                 f"GROUP BY 1") if split_by else None
+        tot = rows_of(ask(f"SELECT {cols} FROM {M}{base}"))  # nosec B608
+        by_f = rows_of(ask(f"SELECT CAST({quote_ident(filt)} AS VARCHAR) AS g, {cols} FROM {M}{base} GROUP BY 1")) if filt else None  # nosec B608
+        ftot = rows_of(ask(f"SELECT {cols} FROM {M}{fcond}")) if fcond else None  # nosec B608
+        by_p = rows_of(ask(f"SELECT CAST({quote_ident(partner)} AS VARCHAR) AS g, {cols} FROM {M}{fcond or base} "  # nosec B608
+                           f"GROUP BY 1")) if partner else None
         for i, n in enumerate(chunk):
             m = mets_by[n]
-            item = {"name": n, "split_by": split_by or None, "issues": []}
-            if tot is None or (split_by and by is None):
-                item["pending"] = True
+            key = f"m{i}"
+            item = {"name": n, "issues": [], "filter": f"{filt} = {filt_value}" if fcond else None, "partner": partner or None}
+            if tot is None:
+                item["pending" if pending else "error"] = True
                 met_out.append(item)
                 continue
-            if not tot["ok"] or (by is not None and not by["ok"]):
-                item["error"] = (tot.get("error") if not tot["ok"] else by.get("error"))
-                met_out.append(item)
-                continue
-            t = _num(tot["rows"][0].get(f"m{i}")) if tot["rows"] else None
+            t = _num(tot[0].get(key)) if tot else None
             item["total"] = t
-            if by is not None:
-                vals = [(r.get("g"), _num(r.get(f"m{i}"))) for r in by["rows"]]
-                filled = [v for _, v in vals if v not in (None, 0)]
-                item["groups"], item["groups_with_values"] = len(vals), len(filled)
-                additive = bool(m.get("formula") and re.match(r"^\s*sum\(", m["formula"], re.I)
-                                and _RAW_METRIC.match(m["formula"].strip()))
-                if additive and t is not None and filled and abs(sum(filled) - t) > max(1e-6 * abs(t), 1e-6):
-                    item["issues"].append(f"the groups by '{split_by}' add up to {sum(filled):,.2f}, not the total "
-                                          f"{t:,.2f}")
-                if len(filled) >= 3 and len(set(filled)) == 1:
-                    item["issues"].append(f"returns the same value ({filled[0]:,.2f}) in every group of '{split_by}': "
-                                          f"a Max where a Sum was meant, or a level rule that ignores the split; say "
-                                          f"which in its description")
-                if split_by == period and len(vals) >= 3 and len(filled) == 1 \
-                        and not _LATEST_WORDS.search(f"{n} {m.get('description') or ''}"):
-                    item["issues"].append("returns a value for one period only, and neither its name nor its "
-                                          "description says it is a latest-period metric")
+            groups = [(r.get("g"), _num(r.get(key))) for r in by_f or []]
+            filled = [v for _, v in groups if v not in (None, 0)]
+            f_total = _num(ftot[0].get(key)) if ftot else None
+            item["filtered_total"] = f_total
+            in_grouped = next((v for g, v in groups if str(g) == str(filt_value)), None)
+            item["filter_row_in_grouped"] = in_grouped
+            if fcond and ftot is not None and by_f is not None and not _close(f_total, in_grouped) \
+                    and (f_total or in_grouped):
+                item["issues"].append(f"depends on the query's shape: {f_total} when filtered to {filt} = {filt_value}, "
+                                      f"{in_grouped} in that row of the query grouped by {filt} (a Max or level rule "
+                                      f"evaluated at different grains)")
+            if fcond and t and f_total is not None and _close(f_total, t) and total and filt_rows \
+                    and filt_rows < 0.5 * total and len(filled) >= 2:   # one filled group = latest-only, not this
+                item["issues"].append(f"ignores a filter that keeps {filt_rows / total:.0%} of fact rows: same value "
+                                      f"({t}) with and without {filt} = {filt_value} (reads a lookup, or a level "
+                                      f"rule that ignores {filt}; say so in its description if deliberate)")
+            additive = bool(m.get("formula") and re.match(r"^\s*sum\(", m["formula"], re.I)
+                            and _RAW_METRIC.match(m["formula"].strip()))
+            if additive and t is not None and filled and not _close(sum(filled), t):
+                item["issues"].append(f"the groups by '{filt}' add up to {sum(filled):,.2f}, not the total {t:,.2f}")
+            if len(filled) >= 3 and len(set(filled)) == 1:
+                item["issues"].append(f"returns the same value ({filled[0]:,.2f}) in every group of '{filt}'")
+            p_vals = [_num(r.get(key)) for r in by_p or []]
+            p_filled = [v for v in p_vals if v not in (None, 0)]
+            if len(p_filled) >= 3 and len(set(p_filled)) == 1:
+                item["issues"].append(f"returns the same value ({p_filled[0]:,.2f}) in every group of '{partner}'"
+                                      + (f" when filtered to {filt} = {filt_value}" if fcond else "")
+                                      + " (a Max where a Sum was meant, or a level rule that ignores the split)")
+            if filt and filt == period and len(groups) >= 3 and len(filled) == 1 \
+                    and not _LATEST_WORDS.search(f"{n} {m.get('description') or ''}"):
+                item["issues"].append("returns a value for one period only, and neither its name nor its description "
+                                      "says it is a latest-period metric")
             warnings += [f"metric '{n}': {x}" for x in item["issues"]]
             met_out.append(item)
-    return {"version": 1, "model": model, "generated": time.strftime("%Y-%m-%d"), "anchor": anchor,
-            "total_rows": total, "split_by": split_by or None, "pending_queries": pending,
+    return {"version": 2, "model": model, "generated": time.strftime("%Y-%m-%d"), "anchor": anchor,
+            "total_rows": total, "filter": {"attribute": filt or None, "value": filt_value, "rows": filt_rows},
+            "partner": partner or None, "pending_queries": pending,
             "attributes": attr_out, "metrics": met_out, "warnings": warnings,
-            "notes": ["Fact rows are counted with the anchor metric; attribute-only queries read lookups.",
+            "notes": ["Each object is checked in several query shapes (alone, filtered, with a second attribute) "
+                      "because the common defects only show in some of them.",
+                      "Fact rows are counted with the anchor metric; attribute-only queries read lookups.",
                       "A warning is evidence to confirm, not a verdict: a metric with a deliberate level rule repeats "
-                      "its value by design (say so in its description)."]}
+                      "its value or ignores a filter by design (say so in its description)."]}
 
 
 # ── run ──────────────────────────────────────────────────────────────────────────────────────

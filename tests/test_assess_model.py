@@ -1502,50 +1502,94 @@ class AnchorTests(unittest.TestCase):
         self.assertNotIn("COUNT(*) AS rows_", var)
 
 
+class _SqlRunner:
+    """Answers each query from a function of its SQL (the probe issues many shapes of query)."""
+
+    def __init__(self, answer):
+        self.answer, self.calls = answer, []
+
+    def call(self, tool, args):
+        self.calls.append((tool, args))
+        return _table_reply(self.answer(args["query"]))
+
+
 class ProbeTests(unittest.TestCase):
-    """Automatic checks that exercise each object the way it commonly breaks."""
+    """Defects that show in some query shapes only: the probe compares shapes."""
 
     SCOPE = {"model": "Store Sales", "anchor": {"metric": "net sales"},
-             "attributes": [{"name": "region", "type": "varchar", "profile": {"distinct_values": 3}},
-                            {"name": "promo flag", "type": "varchar", "profile": {"distinct_values": 2}},
+             "attributes": [{"name": "period", "type": "varchar", "profile": {"distinct_values": 3}},
+                            {"name": "region", "type": "varchar", "profile": {"distinct_values": 3}},
+                            {"name": "exit type", "type": "varchar", "profile": {"distinct_values": 4}},
+                            {"name": "promo flag", "type": "varchar", "profile": {"distinct_values": 3}},
                             {"name": "months open", "type": "bigint", "profile": {"distinct_values": 40}},
-                            {"name": "period", "type": "varchar", "profile": {"distinct_values": 3}}],
+                            {"name": "term months", "type": "bigint", "profile": {"distinct_values": 5}}],
              "metrics": [{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
-                         {"name": "largest sale", "type": "double", "formula": "max(t.csv.{SALE})"},
-                         {"name": "open stores", "type": "bigint", "formula": "Count(store){~, period}",
+                         {"name": "largest proceeds", "type": "double", "formula": "max(t.csv.{PROCEEDS})"},
+                         {"name": "months delinquent", "type": "double", "formula": "avg(map.csv.{MONTHS})"},
+                         {"name": "active count", "type": "bigint", "formula": "Count(store){~, period}",
                           "description": "Stores open."}]}
 
-    def _runner(self):
-        return FakeRunner({
-            'SELECT CAST(COUNT("net sales") AS VARCHAR) AS n FROM': _table_reply([["n"], ["1,000"]]),
-            'COUNT(DISTINCT "region")': _table_reply([["d0", "n0", "x0", "d1", "n1", "x1", "d2", "n2", "x2"],
-                                                      ["3", "a", "c", "4", "", "", "40", "1", "40"]]),
-            'CAST("region" AS VARCHAR) AS v': _table_reply([["v", "n"], ["a", "500"], ["b", "300"], ["c", "200"]]),
-            'CAST("promo flag" AS VARCHAR) AS v': _table_reply([["v", "n"], ["Y", "120"]]),       # blanks lost
-            'CAST("months open" AS VARCHAR) AS v': _table_reply([["v", "n"], ["1", "1,000"]]),
-            'AS g,': _table_reply([["g", "m0", "m1", "m2"], ["202401", "300", "9", ""], ["202402", "300", "9", ""],
-                                   ["202403", "300", "9", "42"]]),
-            'SELECT CAST(SUM("net sales") AS VARCHAR) AS m0,': _table_reply([["m0", "m1", "m2"], ["1,000", "9", "42"]]),
-        })
+    @staticmethod
+    def answer(sql):
+        latest = "\"period\" = '202403'" in sql
+        if sql.startswith('SELECT CAST(COUNT("net sales") AS VARCHAR) AS n FROM'):
+            return [["n"], ["400" if latest else "1000"]]
+        if 'COUNT("months open")' in sql:
+            return [["n"], ["40"]]                                      # read from its lookup
+        if 'COUNT("term months")' in sql:
+            return [["n"], ["1000"]]                                    # a fact column
+        if sql.startswith('SELECT CAST("period" AS VARCHAR) AS v, CAST(COUNT'):
+            return [["v", "n"], ["202401", "300"], ["202402", "300"], ["202403", "400"]]
+        if sql.startswith('SELECT CAST("region" AS VARCHAR) AS v, CAST(COUNT'):
+            return [["v", "n"], ["a", "500"], ["b", "300"], ["c", "200"]]
+        for attr, values in (("exit type", ["sold", "paid", "closed", "transfer"]), ("promo flag", ["Y", "N", "Unknown"]),
+                             ("months open", ["1", "2"]), ("term months", ["360"])):
+            q = f'CAST("{attr}" AS VARCHAR) AS v'
+            if sql.startswith(f"SELECT {q} FROM"):                       # attribute only: the lookup
+                return [["v"]] + [[v] for v in values]
+            if f'CAST("region" AS VARCHAR) AS p, {q}' in sql:
+                return [["p", "v", "n"], ["a", values[0], "1000"]]
+            if sql.startswith(f"SELECT {q}, CAST(COUNT"):
+                if attr == "exit type" and latest:
+                    return [["v", "n"], ["sold", "250"]]                 # active rows (blank key) dropped
+                if attr == "promo flag":
+                    return [["v", "n"], ["Y", "400" if latest else "600"], ["N", "0" if latest else "400"]]
+                return [["v", "n"], [values[0], "400" if latest else "1000"]]
+        cols = ["m0", "m1", "m2", "m3"]
+        if sql.startswith('SELECT CAST("period" AS VARCHAR) AS g'):
+            return [["g"] + cols, ["202401", "300", "1500", "4950", ""], ["202402", "300", "1500", "4950", ""],
+                    ["202403", "400", "2000", "4950", "42"]]
+        if sql.startswith('SELECT CAST("region" AS VARCHAR) AS g'):
+            return [["g"] + cols, ["a", "200", "653", "4950", "20"], ["b", "100", "653", "4950", "12"],
+                    ["c", "100", "653", "4950", "10"]]
+        if sql.startswith("SELECT CAST(SUM("):
+            return [cols, ["400", "653", "4950", "42"]] if latest else [cols, ["1000", "5000", "4950", "42"]]
+        raise AssertionError(sql)
 
-    def test_checks(self):
-        out = am.probe_objects(self._runner(), "retail", self.SCOPE, attributes=["region", "promo flag", "months open"],
-                               period="period")
+    def test_shape_dependent_defects_are_caught(self):
+        runner = _SqlRunner(self.answer)
+        out = am.probe_objects(runner, "retail", self.SCOPE, period="period",
+                               attributes=["exit type", "promo flag", "months open", "term months"])
+        self.assertEqual((out["filter"]["value"], out["filter"]["rows"], out["partner"]), ("202403", 400.0, "region"))
         attrs = {a["name"]: a for a in out["attributes"]}
-        self.assertEqual(attrs["region"]["issues"], [])
-        self.assertEqual(attrs["promo flag"]["rows_lost"], 880)                      # the lookup lacks the blank key
-        self.assertTrue(any("only in its lookup" in x for x in attrs["promo flag"]["issues"]))
-        self.assertTrue(any("numeric attribute" in x for x in attrs["months open"]["issues"]))
+        self.assertTrue(any("filtered to period = 202403: keeps 250 of 400" in x for x in attrs["exit type"]["issues"]))
+        self.assertEqual(attrs["promo flag"]["lookup_only_values"], ["Unknown"])          # named, not counted
+        self.assertTrue(any("read from its lookup" in x for x in attrs["months open"]["issues"]))
+        self.assertEqual(attrs["term months"]["issues"], [])                              # on the fact: fine
         mets = {m["name"]: m for m in out["metrics"]}
-        self.assertTrue(any("add up to 900.00" in x for x in mets["net sales"]["issues"]))
-        self.assertTrue(any("same value (9.00) in every group" in x for x in mets["largest sale"]["issues"]))
-        self.assertTrue(any("one period only" in x for x in mets["open stores"]["issues"]))
-        self.assertEqual(out["total_rows"], 1000.0)
-        self.assertTrue(out["warnings"])
+        self.assertEqual(mets["net sales"]["issues"], [])
+        self.assertTrue(any("depends on the query's shape: 653.0 when filtered" in x
+                            for x in mets["largest proceeds"]["issues"]))
+        self.assertTrue(any("same value (653.00) in every group of 'region' when filtered" in x
+                            for x in mets["largest proceeds"]["issues"]))
+        self.assertTrue(any("ignores a filter that keeps 40%" in x for x in mets["months delinquent"]["issues"]))
+        active = mets["active count"]["issues"]
+        self.assertTrue(any("one period only" in x for x in active))
+        self.assertFalse(any("ignores a filter" in x for x in active))                    # latest-only is not this
 
     def test_needs_an_anchor(self):
         with self.assertRaises(SystemExit):
-            am.probe_objects(FakeRunner({}), "retail", dict(self.SCOPE, anchor=None))
+            am.probe_objects(_SqlRunner(self.answer), "retail", dict(self.SCOPE, anchor=None))
 
     def test_changed_objects(self):
         old = {"attributes": [{"name": "region", "type": "varchar"}],
