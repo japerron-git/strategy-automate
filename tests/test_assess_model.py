@@ -1514,10 +1514,14 @@ class _SqlRunner:
 
 
 class ProbeTests(unittest.TestCase):
-    """Defects that show in some query shapes only: the probe compares shapes."""
+    """Defects that show in some query shapes only, reproduced from a live run: the probe compares shapes,
+    reads metrics plain (as analysts write them), filters on the latest-period flag, measures what a filter
+    keeps in entities, and looks for gaps."""
 
     SCOPE = {"model": "Store Sales", "anchor": {"metric": "net sales"},
-             "attributes": [{"name": "period", "type": "varchar", "profile": {"distinct_values": 3}},
+             "attributes": [{"name": "store id", "type": "bigint", "profile": {"distinct_values": 100}},
+                            {"name": "period", "type": "varchar", "profile": {"distinct_values": 3}},
+                            {"name": "latest flag", "type": "varchar", "profile": {"distinct_values": 2}},
                             {"name": "region", "type": "varchar", "profile": {"distinct_values": 3}},
                             {"name": "exit type", "type": "varchar", "profile": {"distinct_values": 4}},
                             {"name": "promo flag", "type": "varchar", "profile": {"distinct_values": 3}},
@@ -1526,66 +1530,84 @@ class ProbeTests(unittest.TestCase):
              "metrics": [{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
                          {"name": "largest proceeds", "type": "double", "formula": "max(t.csv.{PROCEEDS})"},
                          {"name": "months delinquent", "type": "double", "formula": "avg(map.csv.{MONTHS})"},
+                         {"name": "weighted score", "type": "double", "formula": "score x / score w"},
                          {"name": "active count", "type": "bigint", "formula": "Count(store){~, period}",
                           "description": "Stores open."}]}
 
     @staticmethod
     def answer(sql):
-        latest = "\"period\" = '202403'" in sql
+        flt = "\"latest flag\" = 'Y'" in sql
         if sql.startswith('SELECT CAST(COUNT("net sales") AS VARCHAR) AS n FROM'):
-            return [["n"], ["400" if latest else "1000"]]
+            return [["n"], ["400" if flt else "1000"]]
+        if sql.startswith("SELECT CAST(COUNT(*) AS VARCHAR) AS n FROM (SELECT"):
+            return [["n"], ["100"]]                                      # every store is in the latest period
         if 'COUNT("months open")' in sql:
-            return [["n"], ["40"]]                                      # read from its lookup
+            return [["n"], ["40"]]
         if 'COUNT("term months")' in sql:
-            return [["n"], ["1000"]]                                    # a fact column
-        if sql.startswith('SELECT CAST("period" AS VARCHAR) AS v, CAST(COUNT'):
-            return [["v", "n"], ["202401", "300"], ["202402", "300"], ["202403", "400"]]
+            return [["n"], ["1000"]]
+        if sql.startswith('SELECT CAST("latest flag" AS VARCHAR) AS v, CAST(COUNT'):
+            return [["v", "n"], ["N", "600"], ["Y", "400"]]
         if sql.startswith('SELECT CAST("region" AS VARCHAR) AS v, CAST(COUNT'):
             return [["v", "n"], ["a", "500"], ["b", "300"], ["c", "200"]]
+        if 'CAST("region" AS VARCHAR) AS p, CAST("period" AS VARCHAR) AS t' in sql:
+            return [["p", "t", "n"], ["a", "202401", "200"], ["a", "202403", "300"], ["b", "202401", "100"],
+                    ["b", "202402", "300"], ["c", "202403", "100"]]          # a lacks 202402
         for attr, values in (("exit type", ["sold", "paid", "closed", "transfer"]), ("promo flag", ["Y", "N", "Unknown"]),
                              ("months open", ["1", "2"]), ("term months", ["360"])):
             q = f'CAST("{attr}" AS VARCHAR) AS v'
-            if sql.startswith(f"SELECT {q} FROM"):                       # attribute only: the lookup
+            if sql.startswith(f"SELECT {q} FROM"):
                 return [["v"]] + [[v] for v in values]
             if f'CAST("region" AS VARCHAR) AS p, {q}' in sql:
                 return [["p", "v", "n"], ["a", values[0], "1000"]]
             if sql.startswith(f"SELECT {q}, CAST(COUNT"):
-                if attr == "exit type" and latest:
-                    return [["v", "n"], ["sold", "250"]]                 # active rows (blank key) dropped
+                if attr == "exit type" and flt:
+                    return [["v", "n"], ["sold", "250"]]                 # the latest-flag filter drops blank keys
                 if attr == "promo flag":
-                    return [["v", "n"], ["Y", "400" if latest else "600"], ["N", "0" if latest else "400"]]
-                return [["v", "n"], [values[0], "400" if latest else "1000"]]
-        cols = ["m0", "m1", "m2", "m3"]
+                    return [["v", "n"], ["Y", "400" if flt else "600"], ["N", "0" if flt else "400"]]
+                return [["v", "n"], [values[0], "400" if flt else "1000"]]
+        cols = ["m0", "m1", "m2", "m3", "m4"]
         if sql.startswith('SELECT CAST("period" AS VARCHAR) AS g'):
-            return [["g"] + cols, ["202401", "300", "1500", "4950", ""], ["202402", "300", "1500", "4950", ""],
-                    ["202403", "400", "2000", "4950", "42"]]
+            return [["g"] + cols, ["202401", "300", "653", "18", "738", ""], ["202402", "300", "653", "19", "741", ""],
+                    ["202403", "400", "653", "20", "740", "42"]]
+        if sql.startswith('SELECT CAST("latest flag" AS VARCHAR) AS g'):
+            return [["g"] + cols, ["N", "600", "653", "19", "739", ""], ["Y", "400", "653", "20", "740", "42"]]
         if sql.startswith('SELECT CAST("region" AS VARCHAR) AS g'):
-            return [["g"] + cols, ["a", "200", "653", "4950", "20"], ["b", "100", "653", "4950", "12"],
-                    ["c", "100", "653", "4950", "10"]]
-        if sql.startswith("SELECT CAST(SUM("):
-            return [cols, ["400", "653", "4950", "42"]] if latest else [cols, ["1000", "5000", "4950", "42"]]
+            return [["g"] + cols, ["a", "200", "653", "21", "735", "20"], ["b", "100", "653", "20", "742", "12"],
+                    ["c", "100", "653", "19", "744", "10"]]
+        if sql.startswith("SELECT CAST(SUM("):                              # wrapped: bypasses Max
+            return [cols, ["1,000", "25,047,440.54", "49.5", "740", "42"]]
+        if sql.startswith("SELECT SUM("):
+            return [cols, ["400", "653", "20", "740", "42"]] if flt else [cols, ["1,000", "653", "49.5", "740", "42"]]
         raise AssertionError(sql)
 
-    def test_shape_dependent_defects_are_caught(self):
-        runner = _SqlRunner(self.answer)
-        out = am.probe_objects(runner, "retail", self.SCOPE, period="period",
-                               attributes=["exit type", "promo flag", "months open", "term months"])
-        self.assertEqual((out["filter"]["value"], out["filter"]["rows"], out["partner"]), ("202403", 400.0, "region"))
-        attrs = {a["name"]: a for a in out["attributes"]}
-        self.assertTrue(any("filtered to period = 202403: keeps 250 of 400" in x for x in attrs["exit type"]["issues"]))
-        self.assertEqual(attrs["promo flag"]["lookup_only_values"], ["Unknown"])          # named, not counted
+    def _run(self):
+        return am.probe_objects(_SqlRunner(self.answer), "retail", self.SCOPE, period="period",
+                                attributes=["exit type", "promo flag", "months open", "term months"])
+
+    def test_filter_partner_entities_and_gaps(self):
+        out = self._run()
+        self.assertEqual((out["filter"]["attribute"], out["filter"]["value"]), ("latest flag", "Y"))
+        self.assertEqual((out["filter"]["rows"], out["filter"]["entities"], out["entities"]), (400.0, 100.0, 100.0))
+        self.assertEqual(out["partner"], "region")
+        self.assertEqual(out["gaps"], [{"partner": "a", "missing": ["202402"]}])
+
+    def test_attribute_checks(self):
+        attrs = {a["name"]: a for a in self._run()["attributes"]}
+        self.assertTrue(any("filtered to latest flag = Y: keeps 250 of 400" in x for x in attrs["exit type"]["issues"]))
+        self.assertEqual(attrs["promo flag"]["lookup_only_values"], ["Unknown"])
         self.assertTrue(any("read from its lookup" in x for x in attrs["months open"]["issues"]))
-        self.assertEqual(attrs["term months"]["issues"], [])                              # on the fact: fine
-        mets = {m["name"]: m for m in out["metrics"]}
+        self.assertEqual(attrs["term months"]["issues"], [])
+
+    def test_metric_checks(self):
+        mets = {m["name"]: m for m in self._run()["metrics"]}
         self.assertEqual(mets["net sales"]["issues"], [])
-        self.assertTrue(any("depends on the query's shape: 653.0 when filtered" in x
-                            for x in mets["largest proceeds"]["issues"]))
-        self.assertTrue(any("same value (653.00) in every group of 'region' when filtered" in x
-                            for x in mets["largest proceeds"]["issues"]))
-        self.assertTrue(any("ignores a filter that keeps 40%" in x for x in mets["months delinquent"]["issues"]))
-        active = mets["active count"]["issues"]
-        self.assertTrue(any("one period only" in x for x in active))
-        self.assertFalse(any("ignores a filter" in x for x in active))                    # latest-only is not this
+        largest = " | ".join(mets["largest proceeds"]["issues"])
+        self.assertIn("wrapping changes its value: SUM gives 653.0, CAST(SUM(...)) gives 25047440.54", largest)
+        self.assertIn("same value (653.00) in every group of 'region' when filtered to latest flag = Y", largest)
+        self.assertNotIn("ignores a filter", largest)                    # the filter keeps every store
+        self.assertTrue(any("reads table 'map.csv'" in x for x in mets["months delinquent"]["issues"]))
+        self.assertEqual(mets["weighted score"]["issues"], [])            # loan-level value, all loans kept: fine
+        self.assertTrue(any("one period only" in x for x in mets["active count"]["issues"]))
 
     def test_needs_an_anchor(self):
         with self.assertRaises(SystemExit):

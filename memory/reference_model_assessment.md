@@ -97,6 +97,14 @@ Aggregates of fact metrics run on the fact. So:
 - Not reproduced on a model without mapping tables (treat as model-specific when seen): `COUNT(DISTINCT
   CASE …)` / `FILTER` dropping `WHERE`, a metric inside `CASE` inside `SUM`, `IN (subquery)`, form
   columns inside subqueries, `DATE_DIFF` on real date columns.
+- **Wrapping a metric's aggregate can change its value** (seen on one model, 2026-11-11): for fact
+  metrics whose own aggregation is not a sum (a Max on loss amounts, an average on a rate), plain
+  `SUM("<metric>")` returned the governed value (the Max: one loan's amount; the rate's average), while
+  `CAST(SUM("<metric>") AS VARCHAR)` returned the per-row sum ($25.0M against $653k). Not reproduced on a
+  model whose averages and ratios are derived metrics. So: read governed values plain, as analysts write
+  them (the connector's thousands separators are parsed by the engine), and use `CAST`, `ROUND` or
+  arithmetic around a metric only when a row-level value is meant. `probe` compares the two forms and
+  flags a metric whose value changes.
 - Models with several fact tables (user guidance, not yet tested here): a metric present in several
   facts can be steered to one fact by adding a hint metric from that fact to the query; use one anchor
   per fact table, and say in descriptions which hint metric to add.
@@ -150,20 +158,24 @@ model probably cannot answer.
   governed metric) and the count answered by governed metrics before and after. Answerability gained is
   a better progress signal than the pass rate alone.
 - **Probes** (`assess_model.py probe`): automatic checks that compare query shapes, because the common
-  defects only show in some shapes (found on a live model: a probe that tested each object alone and
-  unfiltered missed three of four known defects). Shapes: alone; filtered to the latest period (or the
-  largest group of another attribute); grouped with a partner attribute (3-30 values). Attributes: fact
-  rows kept in each shape against the matching anchor count (a lookup missing a key drops rows once a
-  filter or second attribute joins); values an attribute-only query lists that have no fact rows, named;
-  a numeric attribute read from its lookup (COUNT over it far below the fact rows; one on the fact
-  table is fine). Metrics, of every kind: the filtered total differs from the filter's row in the
-  grouped query (a Max or level rule evaluated at different grains — a Max looks additive grouped and
-  returns one entity's value filtered); the filtered total equals the unfiltered one though the filter
-  drops most rows (reads a lookup, or a level rule ignoring the filter); the same value in every group,
-  grouped by the partner under the filter; summed metrics whose groups don't add up; a value for one
-  period only without "latest" in its name or description. The assessment probes every attribute with at
-  most 200 values and every metric; verify-changes probes what the phase touched (`--changed-since
-  <previous scope> --findings findings.json --phases N`). A warning is evidence, not a verdict.
+  defects only show in some (two live rounds on one model: a probe that tested each object alone and
+  unfiltered, or filtered on the period value, or read metrics through CAST, missed the defects).
+  Shapes: alone; filtered with the filter analysts use — a latest-period flag (two values, "latest" or
+  "current" in its name) when the model has one, else the latest period, or `--filter "<attr>=<value>"`;
+  grouped with a partner attribute (3-30 values, `--split`). Attributes: fact rows kept in each shape
+  against the matching anchor count (a lookup missing a key drops rows once a filter or second attribute
+  joins); values an attribute-only query lists that have no fact rows, named; a numeric attribute read
+  from its lookup (COUNT over it far below the fact rows). Metrics, every kind, read plain: the CAST form
+  differs from the plain one (an expression bypasses the metric's own aggregation); the filtered total
+  differs from the filter's row in the grouped query; the filtered total equals the unfiltered one
+  though the filter drops most **entities** (entity-level values can't change when every entity is kept,
+  so rows are the wrong measure); the same value in every group of the period, and of the partner under
+  the filter; summed metrics whose period groups don't add up; one period only without "latest" in the
+  name or description; a raw metric reading a different table from the anchor's (a lookup or mapping
+  table, unless it is another fact). Gaps: periods with no fact rows inside a partner value's range.
+  The assessment probes every attribute with at most 200 values and every metric; verify-changes
+  probes what the phase touched (`--changed-since <previous scope> --findings findings.json --phases N`).
+  A warning is evidence, not a verdict.
 - **Cost** per question and round: queries, SQL characters sent, reply characters received and an
   estimated token count (characters / 4), for the governed answer and the best answer separately,
   totalled per level in the summary. It covers connector I/O only: a chat can't see its own token counts,

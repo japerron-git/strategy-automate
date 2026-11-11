@@ -140,11 +140,13 @@ python3 assess_model.py probe --project "<project>" --scope scope.json --period 
 ```
 
 Checks every attribute with at most 200 values and every metric in several query shapes — alone,
-filtered to the latest period, grouped with a second attribute — and compares them, because the common
-defects show only in some shapes: rows lost once a filter or second attribute joins, values only in a
-lookup, numeric attributes read from their lookup, metrics whose value depends on the query's shape or
-ignores a filter, one value in every group, summed metrics whose groups don't add up, latest-only metrics
-that don't say so. Each confirmed warning is a finding. After a phase, probe only what it touched:
+filtered the way analysts filter (a latest-period flag when the model has one, else the latest period;
+`--filter` to choose), grouped with a second attribute (`--split`) — and compares them, because the
+common defects show only in some shapes: rows lost once a filter or second attribute joins, values only
+in a lookup, numeric attributes read from their lookup, metrics whose value changes when wrapped in
+CAST, depends on the query's shape, or ignores a filter that drops most entities, one value in every
+group, summed metrics whose groups don't add up, metrics on a lookup table, gaps in a partner's periods,
+latest-only metrics that don't say so. Each confirmed warning is a finding. After a phase, probe only what it touched:
 `--changed-since <previous scope.json> --findings findings.json --phases <N>`.
 
 ### 1c. Lookup tables → `lookups.json` and CSV templates
