@@ -1464,13 +1464,15 @@ def review_relationships(runner: Runner, project: str, scope: dict, *, entity: s
 
     entity_level = [t["parent"] for t in tests if t["kind"] == "entity" and t["verdict"].startswith("entity_level")]
     varying = [t["parent"] for t in tests if t["kind"] == "entity" and t["verdict"] == "varies_within_entity"]
-    one_to_one = [{"a": t["child"], "b": t["parent"], "evidence": t["evidence"]} for t in tests
+    one_to_one = [{"a": t["child"], "b": t["parent"], "evidence": t.get("evidence")} for t in tests
                   if t["kind"] == "pair" and t["verdict"] == "one_to_one"]
     m2o = [(t["child"], t["parent"]) for t in tests if t["kind"] == "pair" and t["verdict"] == "many_to_one"]
-    evidence = {(t["child"], t["parent"]): t["evidence"] for t in tests if t["kind"] == "pair"}
+    evidence = {(t["child"], t["parent"]): t.get("evidence") for t in tests   # a failed query has none
+                if t["kind"] == "pair" and t.get("verdict") != "error"}
     direct = [{"child": c, "parent": p, "evidence": evidence[(c, p)]} for c, p in _reduce(m2o)]
     out: dict[str, Any] = {"version": 1, "model": model, "entity": entity, "generated": time.strftime("%Y-%m-%d"),
                            "tested_pairs": pairs_tested, "pending_queries": pending, "tests": tests,
+                           "failed_queries": sorted({t.get("error") or "" for t in tests if t.get("verdict") == "error"}),
                            "suggestions": {"parent_child": direct, "same_entity_one_to_one": one_to_one,
                                            "entity_level_attributes": entity_level,
                                            "attributes_varying_within_entity": varying},
@@ -1533,14 +1535,98 @@ def _entity_table_suggestion(relationships: dict) -> list[dict[str, Any]]:
     return out
 
 
+_CODE_TOKEN = re.compile(r"^[A-Z0-9][A-Z0-9_\-./+]{0,9}$")
+
+
+def looks_like_codes(values: list[str], description: str = "") -> bool:
+    """Values that need a lookup to be read: short, upper-case or numeric tokens, or explained only in the
+    description text. Words ("High", "Prepaid", "REO sale") are readable as they are."""
+    vals = [str(v).strip() for v in values if str(v).strip()]
+    if not vals:
+        return False
+    if all(_CODE_TOKEN.match(v) or len(v) <= 2 for v in vals):   # "01", "XX", "R", "PREPAID" — not "High", "Low"
+        return True
+    return bool(re.search(r"\b\w{1,4}\s*[=:]\s*\w", description or ""))   # "01 = current, 02 = 30 days"
+
+
+def existing_lookup_tables(scope: dict, *, relationships: dict | None = None, probes: dict | None = None,
+                           export: dict | None = None) -> dict[str, dict[str, Any]]:
+    """Lookup and mapping tables the model already has: {table: {attributes, key, columns, source, evidence}}.
+    From a model export (definitive: each attribute's lookup table, the fact tables being those its fact
+    metrics read), else inferred: attributes that list values with no fact rows (probe), grouped by the
+    parent-child relationships between them (relationships). The key is the most detailed attribute: one that
+    determines the others in its table."""
+    names = {a["name"].casefold(): a["name"] for a in scope.get("attributes") or []}
+    edges = [(str(r["child"]), str(r["parent"])) for r in ((relationships or {}).get("suggestions") or {})
+             .get("parent_child") or []]
+    groups: dict[str, dict[str, Any]] = {}
+    model = ((export or {}).get("model") or [None])[0] if isinstance((export or {}).get("model"), list) else (export or {}).get("model")
+    if model:
+        tables = {(t.get("information") or {}).get("name"): t for t in model.get("tables") or []}
+        fact_tables = {str(tb.get("name")) for fm in model.get("factMetrics") or []
+                       for e in (fm.get("fact") or fm).get("expressions") or [] for tb in e.get("tables") or []}
+        by_table: dict[str, list[str]] = {}
+        for a in model.get("attributes") or []:
+            t = (a.get("attributeLookupTable") or {}).get("name")
+            n = names.get(str((a.get("information") or {}).get("name") or "").casefold())
+            if t and n:
+                by_table.setdefault(t, []).append(n)
+        if not fact_tables and by_table:   # no metrics read in the export: the table most attributes use is the fact
+            fact_tables = {max(by_table, key=lambda t: len(by_table[t]))}
+        for t, attrs in by_table.items():
+            if t in fact_tables:
+                continue
+            cols = [c.get("columnName") or (c.get("information") or {}).get("name")
+                    for c in ((tables.get(t) or {}).get("physicalTable") or {}).get("columns") or []]
+            groups[t] = {"attributes": attrs, "columns": [c for c in cols if c], "source": "model export",
+                         "evidence": ["each attribute's lookup table in the model export"]}
+    else:
+        lookup_only = {a["name"]: a.get("lookup_only_values") or [] for a in (probes or {}).get("attributes") or []
+                       if a.get("lookup_only_values")}
+        members = set(lookup_only)
+        for c, p in edges:   # a parent or child of a lookup-only attribute is in the same table, as a rule
+            if c in members or p in members:
+                members |= {c, p}
+        seen: set[str] = set()
+        for start in sorted(members):
+            if start in seen:
+                continue
+            comp, todo = set(), [start]
+            while todo:
+                x = todo.pop()
+                if x in comp:
+                    continue
+                comp.add(x)
+                todo += [p for c, p in edges if c == x and p in members] + [c for c, p in edges if p == x and c in members]
+            seen |= comp
+            ev = [f"'{n}' lists {len(lookup_only[n])} value(s) with no fact rows" for n in sorted(comp) if n in lookup_only]
+            ev += [f"'{c}' determines '{p}'" for c, p in edges if c in comp and p in comp]
+            groups[f"<inferred: {start}>"] = {"attributes": sorted(comp), "columns": [], "source": "inferred",
+                                              "evidence": ev}
+    for g in groups.values():
+        attrs = g["attributes"]
+        parents = {p for c, p in edges if c in attrs and p in attrs}
+        children = [a for a in attrs if a not in parents]
+        prof = {a["name"]: _distinct(a) or 0 for a in scope.get("attributes") or []}
+        g["key"] = max(children or attrs, key=lambda n: prof.get(n, 0))
+        g["determined"] = [a for a in attrs if a != g["key"]]
+    return groups
+
+
 def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 200,
-                       relationships: dict | None = None, time_attributes: bool = True) -> list[dict[str, Any]]:
-    """Lookups and calendar parents. Calendar parents (year, quarter, month) come from time attributes on a date
+                       relationships: dict | None = None, time_attributes: bool = True,
+                       probes: dict | None = None, export: dict | None = None) -> list[dict[str, Any]]:
+    """Lookups and calendar parents. Existing lookup or mapping tables (from a model export, else inferred from
+    the probe's lookup-only values and the relationships) are extended rather than duplicated: one CSV per table,
+    keyed on its most detailed code, carrying the existing columns plus descriptions. Calendar parents (year, quarter, month) come from time attributes on a date
     (converting a number stored as a date first); with time_attributes=False they come from lookup CSVs instead,
     the fallback when a column can't be converted."""
     attrs = scope.get("attributes") or []
     names = [a["name"] for a in attrs]
     out: list[dict[str, Any]] = []
+    existing = existing_lookup_tables(scope, relationships=relationships, probes=probes, export=export)
+    in_table = {n: t for t, g in existing.items() for n in g["attributes"]}
+    extend: dict[str, list[str]] = {}
     for a in attrs:
         prof = a.get("profile") or {}
         d = prof.get("distinct_values")
@@ -1556,10 +1642,15 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
         values = [str(v) for v in prof.get("values") or [] if v is not None]
         if values and {v.lower() for v in values} <= _YES_NO:
             continue   # readable as it is
+        if values and not looks_like_codes(values, a.get("description") or ""):
+            continue   # words, readable as they are: a missing definition is a description change, not a lookup
         short_codes = bool(values) and all(len(v) <= 4 for v in values)
-        if not (_CODE_NAME.search(_words(a["name"])) or short_codes):
+        if not (_CODE_NAME.search(_words(a["name"])) or short_codes or values):
             continue
         desc = (a.get("description") or "").lower()
+        if a["name"] in in_table:   # the model already has its table: extend it, keyed on the most detailed code
+            extend.setdefault(in_table[a["name"]], []).append(a["name"])
+            continue
         out.append({"id": f"L-{_slug(a['name'])}", "kind": "code_lookup", "attribute": a["name"],
                     "distinct_values": d,
                     "reason": "coded values with no description form or attribute"
@@ -1567,6 +1658,18 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                                  else ""),
                     "columns": [a["name"], f"{a['name']} description", "source"],
                     "new_forms": [f"{a['name']} description"], "new_attributes": []})
+    for table, coded in extend.items():
+        g = existing[table]
+        descs = [f"{n} description" for n in [g["key"]] + g["determined"] if n in coded]   # key first
+        out.append({"id": f"X-{_slug(g['key'])}", "kind": "extend_lookup", "attribute": g["key"],
+                    "table": table, "table_source": g["source"], "evidence": g["evidence"],
+                    "keep_columns": [g["key"]] + g["determined"], "physical_columns": g["columns"],
+                    "reason": f"the model already has this table ({g['source']}): add descriptions to it, keyed on its "
+                              f"most detailed code '{g['key']}', instead of a new table and a second join"
+                              + ("" if g["source"] == "model export" else
+                                 "; the table name is inferred: confirm it (model export, or ask the user)"),
+                    "columns": [g["key"]] + g["determined"] + descs + ["source"],
+                    "new_forms": descs, "new_attributes": []})
     period_attr = period
     if not period_attr:
         dated = [a for a in attrs if (a.get("type", "").lower() in ("date", "timestamp") or looks_like_stored_date(a))
@@ -1659,7 +1762,7 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
     known: dict[str, Any] = {}
     wanted: dict[str, float] = {}
     for sug in suggestions:
-        if sug["kind"] in ("entity_table", "time_attributes"):
+        if sug["kind"] in ("entity_table", "time_attributes", "extend_lookup"):
             continue
         prof = profiles.get(sug["attribute"], {})
         if prof.get("values") is not None and prof.get("distinct_values") is not None \
@@ -1675,6 +1778,10 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
             continue
         if sug["kind"] == "time_attributes":
             done.append({**sug, "csv": None, "note": "no CSV: a type change (if needed) and add_time_attributes"})
+            continue
+        blank = _blank_key_rows(runner, project, scope, sug["attribute"], where)
+        if sug["kind"] == "extend_lookup":
+            done.append(_extend_template(runner, project, model, sug, csv_dir, where, blank))
             continue
         got = known.get(sug["attribute"])
         if got == "pending":
@@ -1696,12 +1803,60 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
             latest = max(values) if values else None
             parts = (lambda v: _period_parts(v)) if len(sug["columns"]) > 2 else (lambda v: ())
             _write_csv(path, sug["columns"], [[v, *parts(v), "Y" if v == latest else "N"] for v in values])
-        entry = {**sug, "csv": path, "rows": len(values)}
+        entry = {**sug, "csv": path, "rows": len(values), **_blank_note(blank, sug["attribute"])}
         if dropped:
             entry["note"] = (f"dropped {sorted(dropped)}: outside the attribute's min/max, so a NULL rendered as a "
                              f"number by CAST — represent 'no value' explicitly if users need it")
         done.append(entry)
     return done
+
+
+def _blank_key_rows(runner: Runner, project: str, scope: dict, attribute: str, where: str = "") -> float | None:
+    """Fact rows whose key is blank, counted with the anchor metric. A lookup row can't match a blank key, so
+    those rows vanish from any query that joins the lookup (a filter or a second attribute)."""
+    anchor = (scope.get("anchor") or {}).get("metric")
+    if not anchor:
+        return None
+    k = quote_ident(attribute)
+    cond = f"({k} IS NULL OR CAST({k} AS VARCHAR) = '')" + (f" AND ({where})" if where else "")
+    sql = f"SELECT CAST(COUNT({quote_ident(anchor)}) AS VARCHAR) AS n FROM {quote_model(scope['model'])} WHERE {cond}"  # nosec B608  # identifiers are quoted; the connector is read-only
+    try:
+        parsed = parse_query_result(runner.call("query", {"project": project, "query": sql}))
+    except PendingReply:
+        return None
+    return _num(parsed["rows"][0].get("n")) if parsed["ok"] and parsed["rows"] else None
+
+
+def _blank_note(blank: float | None, attribute: str) -> dict[str, Any]:
+    if not blank:
+        return {}
+    return {"blank_key_fact_rows": blank,
+            "blank_key_warning": f"{blank:,.0f} fact rows have a blank '{attribute}': no lookup row can match a blank "
+                                 f"key, so they drop out of queries that use this lookup's columns. Give blank a code "
+                                 f"in the source (source_change), then a lookup row for that code."}
+
+
+def _extend_template(runner: Runner, project: str, model: str, sug: dict, csv_dir: str, where: str,
+                     blank: float | None) -> dict[str, Any]:
+    """The existing table's rows (an attribute-only query reads the lookup itself), every existing column kept,
+    description columns blank to fill from cited sources."""
+    keep = sug["keep_columns"]
+    cols = ", ".join(f"CAST({quote_ident(c)} AS VARCHAR) AS c{i}" for i, c in enumerate(keep))
+    clause = f" WHERE {where}" if where else ""
+    sql = f"SELECT {cols} FROM {quote_model(model)}{clause} GROUP BY {', '.join(str(i + 1) for i in range(len(keep)))}"  # nosec B608  # identifiers are quoted; the connector is read-only
+    try:
+        parsed = parse_query_result(runner.call("query", {"project": project, "query": sql}))
+    except PendingReply:
+        return {**sug, "csv": None, "pending": True}
+    if not parsed["ok"]:
+        return {**sug, "csv": None, "error": parsed["error"] or "the table's rows could not be read"}
+    rows = sorted([[r.get(f"c{i}") or "" for i in range(len(keep))] for r in parsed["rows"]], key=lambda r: r)
+    extra = len(sug["columns"]) - len(keep)
+    path = os.path.join(csv_dir, f"{_slug(sug['attribute'])}_lookup.csv")
+    _write_csv(path, sug["columns"], [r + [""] * extra for r in rows])
+    return {**sug, "csv": path, "rows": len(rows), **_blank_note(blank, sug["attribute"]),
+            "note": "starts from the existing table's rows, every existing column kept; descriptions to fill from "
+                    "cited sources (or 'model data' when derived from the table itself)"}
 
 
 def _null_artifacts(values: list, prof: dict, scope: dict, attribute: str) -> set:
@@ -1719,6 +1874,14 @@ def _null_artifacts(values: list, prof: dict, scope: dict, attribute: str) -> se
     return out
 
 
+def _csv_header(path: str) -> list[str]:
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            return next(csv.reader(f), [])
+    except OSError:
+        return []
+
+
 def lookup_steps(args: dict) -> str:
     """Manual steps for adding a lookup table. `new_attributes` become attributes of their own (related
     to the key attribute): anything a metric filters on, such as a flag, must be an attribute, because
@@ -1727,9 +1890,15 @@ def lookup_steps(args: dict) -> str:
     key = args.get("key_attribute") or "<key attribute>"
     attrs = list(args.get("new_attributes") or [])
     forms = list(args.get("new_forms") or [])
-    steps = [f"Add {args.get('csv') or '<csv file>'} to the model as a new table.",
-             f"Map its key column to the EXISTING attribute '{key}' — keep the attribute; deleting or replacing it "
-             f"deletes the derived metrics that filter on it."]
+    if args.get("extends_table"):
+        steps = [f"Replace the data of the existing table '{args['extends_table']}' with {args.get('csv') or '<csv file>'} "
+                 f"(it keeps {', '.join(args.get('keep_columns') or [])}): its attributes keep their columns, so the "
+                 f"metrics that filter on them keep working.",
+                 f"Then re-run the questions and metrics that filter on attributes of '{args['extends_table']}'."]
+    else:
+        steps = [f"Add {args.get('csv') or '<csv file>'} to the model as a new table.",
+                 f"Map its key column to the EXISTING attribute '{key}' — keep the attribute; deleting or replacing it "
+                 f"deletes the derived metrics that filter on it."]
     if attrs:
         steps.append(f"Create {', '.join(repr(a) for a in attrs)} as attributes of their own (not forms), each "
                      f"related to '{key}', with business names and descriptions: metrics filter on them, and an "
@@ -1753,7 +1922,9 @@ def lookups_checklist(items: list[tuple[dict, bool]]) -> str:
     lines = []
     for i, (a, retyped) in enumerate(items, 1):
         key = a.get("key_attribute") or "<key attribute>"
-        bits = [f"{a.get('csv') or '<csv file>'} -> key '{key}'"]
+        bits = [f"{a.get('csv') or '<csv file>'} -> key '{key}'"
+                + (f" (REPLACES the data of existing table '{a['extends_table']}', keeping "
+                   f"{', '.join(a.get('keep_columns') or [])})" if a.get("extends_table") else "")]
         if a.get("new_attributes"):
             bits.append("attributes: " + ", ".join(a["new_attributes"]))
         if a.get("new_forms"):
@@ -2300,6 +2471,16 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "add_lookup_table":
         need("csv", "key_attribute")
+        if a.get("extends_table"):   # replacing an existing table's data: it must keep every column read from it
+            keep = [str(c) for c in a.get("keep_columns") or []]
+            cols = [str(c) for c in a.get("columns") or []] or _csv_header(str(a.get("csv") or ""))
+            if not keep:
+                problems.append(f"{kind}: extends_table needs keep_columns (the columns its attributes read)")
+            elif cols:
+                lost = [c for c in keep if c.casefold() not in {x.casefold() for x in cols}]
+                if lost:
+                    problems.append(f"{kind}: the CSV for '{a['extends_table']}' drops {lost}, which attributes still "
+                                    f"read; add them back or the attributes lose their source")
         return {"dry_run": None, "apply": None, "manual": lookup_steps(a), "problems": problems}
     if kind == "publish":
         return {"dry_run": None, "apply": base + ["publish", "--model-id", model_id] + PUBLISH_WAIT, "manual": None,
@@ -2988,6 +3169,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--round", type=int, default=None)
 
     sp = sub.add_parser("lookups", help="recommend lookup tables and write CSV templates for them")
+    sp.add_argument("--probes", help="probes.json: attributes listing values with no fact rows point to existing tables")
+    sp.add_argument("--model-export", help="the model's export JSON (build_mosaic.py export-model): its lookup tables, "
+                                           "definitive; without it they are inferred")
     sp.add_argument("--calendar-lookups", action="store_true",
                     help="calendar parents from lookup CSVs instead of time attributes (when a date column can't be "
                          "converted)")
@@ -3151,7 +3335,9 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
         scope = _load_json(args.scope)
         rel = _load_json(args.relationships) if args.relationships else None
         sugg = lookup_suggestions(scope, period=args.period, max_code_values=args.max_code_values, relationships=rel,
-                                  time_attributes=not args.calendar_lookups)
+                                  time_attributes=not args.calendar_lookups,
+                                  probes=_load_json(args.probes) if args.probes else None,
+                                  export=_load_json(args.model_export) if args.model_export else None)
         built = build_lookups(runner(), args.project, scope, sugg, args.csv_dir, where=args.where)
         _write_json(args.out, {"version": 1, "model": scope.get("model"), "lookups": built})
         if _pending(runner):

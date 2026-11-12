@@ -151,6 +151,10 @@ latest-only metrics that don't say so. Each confirmed warning is a finding. Afte
 
 ### 1c. Lookup tables → `lookups.json` and CSV templates
 
+Run it after the probe, with `--probes probes.json` and, when REST can run, `--model-export` (from
+`build_mosaic.py export-model`): it then extends the tables the model already has instead of adding
+new ones. In replay mode without an export, the table names are inferred: ask the user to confirm them.
+
 ```bash
 python3 assess_model.py lookups --project "<project>" --scope scope.json \
   --relationships relationships.json --csv-dir lookups/ --out lookups.json

@@ -4862,6 +4862,21 @@ def _expression_params(args) -> dict:
     return params
 
 
+def cmd_export_model(m: MSTR, args):
+    """The model's full definition (tables, columns, attributes with their lookup tables, metrics) to a private
+    file: what assess_model.py lookups --model-export reads to name existing lookup tables."""
+    m.login(identity=False)
+    r = m.post(f"/api/model/dataModels/{args.model_id}/export")
+    if not r.ok:
+        die(f"export-model: {format_mstr_error(r)}")
+    _write_private(args.out, r.json())
+    body = r.json()
+    model = (body.get("model") or [{}])[0] if isinstance(body.get("model"), list) else body.get("model") or {}
+    print(json.dumps({"ok": True, "saved_to": args.out, "tables": len(model.get("tables") or []),
+                      "attributes": len(model.get("attributes") or []),
+                      "note": "holds IDs of your tenant: keep it out of repos"}, indent=2))
+
+
 def cmd_get_model_object(m: MSTR, args):
     path, _ = _model_object_path(args.kind, args.model_id, args.object_id)
     m.login(identity=False)
@@ -7105,6 +7120,10 @@ def build_parser():
     sp.add_argument("--raw", action="store_true")
 
     object_kinds = sorted(MODEL_OBJECT_KINDS)
+    sp = sub.add_parser("export-model", help="save the model's full definition (for lookups --model-export)")
+    sp.add_argument("--model-id", required=True)
+    sp.add_argument("--out", required=True)
+
     sp = sub.add_parser("get-model-object")
     sp.add_argument("--kind", required=True, choices=object_kinds,
                     help="Mosaic-contained kind, or project_/legacy_ kind for classic schema objects")
@@ -7581,6 +7600,7 @@ def main():
             "create-formula-attribute": cmd_create_formula_attribute,
             "add-column-attribute": cmd_create_formula_attribute,
             "add-time-attributes": cmd_add_time_attributes,
+            "export-model": cmd_export_model,
             "set-column-types": cmd_set_column_types,
             "patch-fact-metrics": cmd_patch_fact_metrics,
             "attach-transformation": cmd_attach_transformation,

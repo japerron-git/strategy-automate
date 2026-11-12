@@ -42,7 +42,17 @@ must be an ancestor of the report rows, `reference_mosaic_derived_metrics.md` §
 
 ## Lookup tables
 
-`assess_model.py lookups` recommends: **code lookups** (coded text attributes with no description
+`assess_model.py lookups` first looks for the model's **existing lookup and mapping tables** — named by
+a model export (`build_mosaic.py export-model`, then `lookups --model-export`), else inferred from the
+probe (attributes listing values with no fact rows) and the relationships between them — and proposes
+**extending** each one (`extend_lookup`: one CSV per table keyed on its most detailed code, starting
+from the table's own rows and keeping every existing column, plus description columns) instead of a
+new table and a second join. A replacement must keep every column its attributes read (`plan` refuses
+one that drops a column: `add_lookup_table` with `extends_table` and `keep_columns`). It skips values
+readable as they are (words such as "High", "Prepaid"; a missing definition there is a description
+change), and counts fact rows with a blank key: no lookup row matches a blank, so those rows drop out
+of any query using the lookup — fix it with a code for blank in the source. Then it recommends:
+**code lookups** (coded text attributes with no description
 form or attribute), **time attributes** for every date (a date stored as a number or text — yyyyMM,
 yyyyMMdd, text yyyy-MM — is converted first; detected only when every sampled value and the min and max
 are real dates of one pattern AND the name (date, period, month, as of, effective) or description says

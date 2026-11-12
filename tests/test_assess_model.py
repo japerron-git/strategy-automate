@@ -1758,3 +1758,105 @@ class TimeAttributePlanTests(unittest.TestCase):
         bad = am.build_plan({"findings": [_finding("F1", "data_type", actions=[
             {"kind": "add_time_attributes", "args": {"attribute": "x", "intervals": ["fortnight"]}}])]}, model_id="MID")
         self.assertTrue(any("unknown" in p for p in bad["problems"]))
+
+
+class ExistingTableTests(unittest.TestCase):
+    """Lookups on a model that already has mapping tables: extend them, keyed on the most detailed code."""
+
+    SCOPE = {"model": "Store Sales", "anchor": {"metric": "net sales"}, "attributes": [
+        {"name": "store id", "type": "bigint", "profile": {"distinct_values": 100}},
+        {"name": "status code", "type": "varchar", "profile": {"distinct_values": 12, "values": ["00", "01", "02", "XX"]}},
+        {"name": "status bucket", "type": "varchar", "profile": {"distinct_values": 4, "values": ["0", "1", "2", "9"]}},
+        {"name": "late flag", "type": "varchar", "profile": {"distinct_values": 2, "values": ["Y", "N"]}},
+        {"name": "risk level", "type": "varchar", "profile": {"distinct_values": 2, "values": ["High", "Low"]}},
+        {"name": "exit type", "type": "varchar", "profile": {"distinct_values": 3,
+                                                             "values": ["Prepaid", "REO sale", "Note sale"]}},
+        {"name": "channel code", "type": "varchar", "profile": {"distinct_values": 3, "values": ["R", "B", "C"]}}],
+        "metrics": []}
+    REL = {"suggestions": {"parent_child": [{"child": "status code", "parent": "status bucket"},
+                                            {"child": "status code", "parent": "late flag"}]}}
+    PROBES = {"attributes": [{"name": "status bucket", "lookup_only_values": ["9"]},
+                             {"name": "status code", "lookup_only_values": ["XX"]}]}
+
+    def test_readable_values_need_no_lookup(self):
+        self.assertTrue(am.looks_like_codes(["00", "01", "XX"]))
+        self.assertTrue(am.looks_like_codes(["PREPAID", "REO_SALE"]))
+        self.assertFalse(am.looks_like_codes(["High", "Low"]))
+        self.assertFalse(am.looks_like_codes(["Prepaid", "REO sale"]))
+        self.assertTrue(am.looks_like_codes(["Alpha", "Beta"], "Alpha = first lien, Beta = second lien"))
+        kinds = {s["attribute"]: s["kind"] for s in am.lookup_suggestions(self.SCOPE, time_attributes=False)}
+        self.assertNotIn("risk level", kinds)
+        self.assertNotIn("exit type", kinds)
+        self.assertEqual(kinds["channel code"], "code_lookup")
+
+    def test_inferred_table_is_extended_once_keyed_on_the_most_detailed_code(self):
+        tables = am.existing_lookup_tables(self.SCOPE, relationships=self.REL, probes=self.PROBES)
+        (t,) = tables.values()
+        self.assertEqual((t["key"], sorted(t["determined"]), t["source"]), ("status code", ["late flag", "status bucket"],
+                                                                            "inferred"))
+        sugg = am.lookup_suggestions(self.SCOPE, relationships=self.REL, probes=self.PROBES, time_attributes=False)
+        ext = [s for s in sugg if s["kind"] == "extend_lookup"]
+        self.assertEqual(len(ext), 1)
+        self.assertEqual(ext[0]["keep_columns"], ["status code", "late flag", "status bucket"])
+        self.assertEqual(ext[0]["new_forms"], ["status code description", "status bucket description"])
+        self.assertIn("confirm it", ext[0]["reason"])
+        self.assertNotIn("status bucket", [s["attribute"] for s in sugg if s["kind"] == "code_lookup"])
+
+    def test_model_export_names_the_table(self):
+        export = {"model": [{"tables": [{"information": {"name": "facts.csv"}},
+                                        {"information": {"name": "status_map.csv"},
+                                         "physicalTable": {"columns": [{"columnName": "STATUS"}, {"columnName": "BUCKET"}]}}],
+                             "factMetrics": [{"expressions": [{"tables": [{"name": "facts.csv"}]}]}],
+                             "attributes": [{"information": {"name": "Store ID"}, "attributeLookupTable": {"name": "facts.csv"}},
+                                            {"information": {"name": "Status Code"}, "attributeLookupTable": {"name": "status_map.csv"}},
+                                            {"information": {"name": "Status Bucket"}, "attributeLookupTable": {"name": "status_map.csv"}}]}]}
+        tables = am.existing_lookup_tables(self.SCOPE, relationships=self.REL, export=export)
+        self.assertEqual(list(tables), ["status_map.csv"])
+        self.assertEqual((tables["status_map.csv"]["key"], tables["status_map.csv"]["columns"]),
+                         ("status code", ["STATUS", "BUCKET"]))
+
+    def test_template_from_the_table_and_blank_keys(self):
+        d = tempfile.mkdtemp(prefix="extend-")
+        self.addCleanup(shutil.rmtree, d, True)
+        sugg = [s for s in am.lookup_suggestions(self.SCOPE, relationships=self.REL, probes=self.PROBES,
+                                                 time_attributes=False) if s["kind"] == "extend_lookup"]
+
+        def answer(sql):
+            if "IS NULL OR CAST" in sql:
+                return [["n"], ["136,699"]]
+            if "GROUP BY 1, 2, 3" in sql:
+                return [["c0", "c1", "c2"], ["01", "N", "1"], ["00", "N", "0"], ["XX", "N", "9"]]
+            raise AssertionError(sql)
+        (built,) = am.build_lookups(_SqlRunner(answer), "retail", self.SCOPE, sugg, d)
+        with open(built["csv"], encoding="utf-8", newline="") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(rows[0], ["status code", "late flag", "status bucket", "status code description",
+                                   "status bucket description", "source"])
+        self.assertEqual(rows[1], ["00", "N", "0", "", "", ""])
+        self.assertEqual(built["blank_key_fact_rows"], 136699.0)
+        self.assertIn("blank", built["blank_key_warning"])
+
+    def test_plan_refuses_a_replacement_that_drops_a_column(self):
+        def plan(cols):
+            return am.build_plan({"findings": [_finding("F1", "lookup", actions=[
+                {"kind": "add_lookup_table", "args": {"csv": "lookups/status_code_lookup.csv", "key_attribute": "status code",
+                                                      "extends_table": "status_map.csv",
+                                                      "keep_columns": ["status code", "late flag"], "columns": cols,
+                                                      "new_forms": ["status code description"]}}])]}, model_id="MID")
+        self.assertTrue(any("drops ['late flag']" in p for p in plan(["status code", "status code description"])["problems"]))
+        ok = plan(["status code", "late flag", "status code description"])
+        self.assertEqual(ok["problems"], [])
+        self.assertIn("REPLACES the data of existing table 'status_map.csv'", json.dumps(ok))
+
+
+class RelationshipErrorTests(unittest.TestCase):
+    def test_a_failed_query_does_not_crash_the_summary(self):
+        class R:
+            def call(self, tool, args):
+                return {"content": [{"type": "text", "text": "Query failed: per-job memory limit"}], "isError": True}
+        scope = {"model": "S", "attributes": [{"name": "store id", "type": "bigint", "profile": {"distinct_values": 100}},
+                                              {"name": "region", "type": "varchar", "profile": {"distinct_values": 3}},
+                                              {"name": "city", "type": "varchar", "profile": {"distinct_values": 10}}],
+                 "metrics": []}
+        out = am.review_relationships(R(), "p", scope, entity="store id")
+        self.assertEqual(out["failed_queries"], ["Query failed: per-job memory limit"])
