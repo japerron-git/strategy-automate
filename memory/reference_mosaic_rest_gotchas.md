@@ -184,6 +184,12 @@ Always tell the helper how to sign in per tenant: `MSTR_AUTH_METHOD` (`sso` for 
 - Write: `PUT /api/model/dataModels/{id}/attributes/{attributeId}/smartAttributes` in a changeset, body
   `{"smartAttributes": [{"subType": "attribute_smart", "name": "<attribute> (Month)", "objectId"?: <existing>, "definition":
   {"smartAttributeType": "month_interval", "parameters": [], "ascending": true}}]}`. It replaces the whole
-  set: send existing ones with their objectId. `build_mosaic.py add-time-attributes` does this. Not yet run
-  live (documented REST shape + export shape); republish afterwards.
+  set: send existing ones with their objectId. Each entry needs a `name` (refused without:
+  8004c901 "Json input missing the following field: name"); Studio's are "<attribute> (Year)".
+  `build_mosaic.py add-time-attributes` does this. **Verified live 2026-11-12** on a scratch model:
+  `set-column-types ... date yyyyMM` on an integer yyyyMM column, republish, `add-time-attributes
+  --intervals year,quarter,month`, republish, certify. The connector showed the column as a date,
+  `(month)__id` = the old integer, quarters grouping 3 months, and a yyyyMM filter on `(month)__id` working.
+- After a conversion, a description that says how the value was stored ("stored as YYYYMM integer") is
+  wrong: change it in the same finding (`rename_describe`).
 
