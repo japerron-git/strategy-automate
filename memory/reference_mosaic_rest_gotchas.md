@@ -182,7 +182,7 @@ Always tell the helper how to sign in per tenant: `MSTR_AUTH_METHOD` (`sso` for 
   2022-Q1, desc "2022-Q1"; year id 2022. Grouping by them aggregates correctly (unlike GROUP BY an
   expression of the number). No 15-minute interval appears for a date base.
 - Write: `PUT /api/model/dataModels/{id}/attributes/{attributeId}/smartAttributes` in a changeset, body
-  `{"smartAttributes": [{"subType": "attribute_smart", "objectId"?: <existing>, "definition":
+  `{"smartAttributes": [{"subType": "attribute_smart", "name": "<attribute> (Month)", "objectId"?: <existing>, "definition":
   {"smartAttributeType": "month_interval", "parameters": [], "ascending": true}}]}`. It replaces the whole
   set: send existing ones with their objectId. `build_mosaic.py add-time-attributes` does this. Not yet run
   live (documented REST shape + export shape); republish afterwards.

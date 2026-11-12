@@ -6434,8 +6434,10 @@ def time_attribute_body(attr: dict, intervals: list[str]) -> tuple[dict | None, 
     if not added:
         return None, [], []
     def entry(t, e=None):
-        out = {"subType": "attribute_smart", "definition": {"smartAttributeType": t, "parameters": [],
-                                                            "ascending": (e or {}).get("ascending", True)}}
+        label = t.replace("_interval", "").capitalize()             # Studio names them '<attribute> (Year)'
+        out = {"subType": "attribute_smart",
+               "name": (e or {}).get("name") or ((e or {}).get("information") or {}).get("name") or f"{name} ({label})",
+               "definition": {"smartAttributeType": t, "parameters": [], "ascending": (e or {}).get("ascending", True)}}
         if e and ((e.get("information") or {}).get("objectId") or e.get("objectId")):
             out["objectId"] = (e.get("information") or {}).get("objectId") or e.get("objectId")
         return out
