@@ -625,10 +625,33 @@ class MaturityTests(unittest.TestCase):
             {"name": "month date (month)__id", "type": "bigint"}], "metrics": []})
         self.assertEqual((converted["dates_stored_as_numbers"], converted["dates_without_time_attributes"]), ([], []))
 
-    def test_date_pattern(self):
-        self.assertEqual(am.date_pattern({"profile": {"min": "201,901", "max": "202,201"}}), "yyyyMM")
-        self.assertEqual(am.date_pattern({"profile": {"max": "20220131"}}), "yyyyMMdd")
-        self.assertEqual(am.date_pattern({"description": "stored as YYYYMM integer"}), "yyyyMM")
+    def test_stored_dates_need_valid_values_and_a_second_signal(self):
+        def a(name, values, typ="bigint", desc=""):
+            return {"name": name, "type": typ, "description": desc,
+                    "profile": {"values": values, "min": min(values) if values else None,
+                                "max": max(values) if values else None}}
+        p = am.stored_date_pattern
+        self.assertEqual(p(a("reporting period", ["201,901", "202,112", "202,201"])), "yyyyMM")
+        self.assertEqual(p(a("close date", ["20190131", "20220228"])), "yyyyMMdd")
+        self.assertEqual(p(a("first payment month", ["201901", "0", "202201"])), "yyyyMM")       # NULL as 0 ignored
+        # values alone are not enough: an identifier, or a name with no date meaning
+        self.assertEqual(p(a("account id", ["200001", "201212"])), "")
+        self.assertEqual(p(a("batch", ["200001", "201212"])), "")
+        self.assertEqual(p(a("period key", ["200001", "201212"], desc="Reporting month as YYYYMM.")), "yyyyMM")
+        # every value must be a real date, not only the extremes
+        self.assertEqual(p(a("reporting period", ["201901", "201913", "202201"])), "")
+        self.assertEqual(p(a("close date", ["20120131", "20123456"])), "")                     # day 34
+        # text
+        self.assertEqual(p(a("activity month", ["202112", "202201"], typ="varchar")), "yyyyMM")
+        self.assertEqual(p(a("as of", ["2021-12", "2022-01"], typ="varchar")), "yyyy-MM")
+        self.assertEqual(p(a("status", ["202112", "202201"], typ="varchar")), "")
+        # a description alone, with no values profiled
+        self.assertEqual(p({"name": "activity month key", "type": "bigint",
+                            "description": "Reporting month, stored as YYYYMM integer."}), "yyyyMM")
+        self.assertEqual(am.date_pattern(a("close date", ["20190131", "20220228"])), "yyyyMMdd")
+        m = am.maturity_signals({"attributes": [a("activity month", ["202112", "202201"], typ="varchar"),
+                                                a("reporting period", ["202112", "202201"])], "metrics": []})
+        self.assertEqual((m["dates_stored_as_numbers"], m["dates_stored_as_text"]), (["reporting period"], ["activity month"]))
 
 
 def _snapshot_rows():

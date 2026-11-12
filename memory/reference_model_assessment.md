@@ -43,8 +43,10 @@ must be an ancestor of the report rows, `reference_mosaic_derived_metrics.md` §
 ## Lookup tables
 
 `assess_model.py lookups` recommends: **code lookups** (coded text attributes with no description
-form or attribute), **time attributes** for every date (a number stored as a date — yyyyMM, yyyyMMdd —
-is converted first; calendar parents then come from year/quarter/month intervals, no CSV), a **period
+form or attribute), **time attributes** for every date (a date stored as a number or text — yyyyMM,
+yyyyMMdd, text yyyy-MM — is converted first; detected only when every sampled value and the min and max
+are real dates of one pattern AND the name (date, period, month, as of, effective) or description says
+so, an identifier-like name needing the description; calendar parents then come from year/quarter/month intervals, no CSV), a **period
 lookup** for the latest-period flag only (when no flag exists; time attributes give no "latest"),
 and, optionally, an **entity table** (many attributes fixed per entity). It writes CSV templates with
 the key values from the data; description columns are filled only from cited sources (user documents,

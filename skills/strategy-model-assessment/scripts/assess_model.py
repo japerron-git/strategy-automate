@@ -27,6 +27,7 @@ import argparse
 import copy
 import csv
 import hashlib
+import datetime
 import json
 import os
 import re
@@ -537,18 +538,68 @@ def _plain_number(value: Any) -> str:
     return str(value or "").replace(",", "").strip()
 
 
-def looks_like_integer_date(attr: dict) -> bool:
-    """A numeric attribute holding YYYYMM or YYYYMMDD values (from profile min / max or description)."""
-    if attr.get("type", "").lower() not in _NUMERIC:
-        return False
-    if re.search(r"\bYYYY-?MM", attr.get("description") or ""):
-        return True
+_TEXT_TYPES = ("varchar", "char", "string", "text")
+_DATE_NAME = re.compile(r"\b(date|period|month|day|as of|asof|effective|yyyymm|dt|yearmonth|year month)\b", re.I)
+_ID_NAME = re.compile(r"\b(id|key|number|no|nbr|num|code|sequence|seq)\b", re.I)
+_DATE_TEXT = re.compile(r"\b(date|month|period|YYYY-?MM(-?DD)?)\b", re.I)
+
+
+def _value_pattern(value: str, numeric: bool) -> str:
+    """The date pattern one value follows, checked as a real calendar date; '' when it isn't one."""
+    v = _plain_number(value) if numeric else str(value).strip()
+    if numeric and re.fullmatch(r"\d+\.0+", v):
+        v = v.split(".")[0]
+    for pattern, rx, fmt in (("yyyyMM", r"\d{6}", "%Y%m"), ("yyyyMMdd", r"\d{8}", "%Y%m%d"),
+                             ("yyyy-MM", r"\d{4}-\d{2}", "%Y-%m"), ("yyyy-MM-dd", r"\d{4}-\d{2}-\d{2}", "%Y-%m-%d")):
+        if numeric and "-" in pattern:
+            continue
+        if re.fullmatch(rx, v):
+            try:
+                d = datetime.datetime.strptime(v, fmt)
+            except ValueError:
+                return ""
+            return pattern if 1900 <= d.year <= 2199 else ""
+    return ""
+
+
+def stored_date_pattern(attr: dict) -> str:
+    """The pattern of a date stored as a number or as text (yyyyMM, yyyyMMdd; text also yyyy-MM, yyyy-MM-dd),
+    or ''. Every sampled value and the min and max must be valid dates of one pattern (a 6- or 8-digit code
+    can match at its extremes only by chance), and a second signal is needed: a date-like name (date,
+    period, month, as of, effective), or a description that says it is a date. A name that reads as an
+    identifier (id, key, number, code, sequence) needs the description."""
+    typ = (attr.get("type") or "").lower()
+    numeric, text = typ in _NUMERIC, typ in _TEXT_TYPES
+    if not (numeric or text):
+        return ""
+    desc = attr.get("description") or ""
+    words = _words(attr.get("name") or "")
+    described = bool(_DATE_TEXT.search(desc))
+    named = bool(_DATE_NAME.search(words)) and not _ID_NAME.search(words)
     prof = attr.get("profile") or {}
-    lo, hi = _plain_number(prof.get("min")), _plain_number(prof.get("max"))
-    def ok(v):
-        return (len(v) == 6 and v.isdigit() and 1900 <= int(v[:4]) <= 2199 and 1 <= int(v[4:]) <= 12) or \
-               (len(v) == 8 and v.isdigit() and 1900 <= int(v[:4]) <= 2199 and 1 <= int(v[4:6]) <= 12)
-    return bool(lo and hi and ok(lo) and ok(hi))
+    values = [v for v in list(prof.get("values") or []) + [prof.get("min"), prof.get("max")]
+              if v not in (None, "") and str(v).strip().lower() not in ("null", "none")]
+    if numeric:   # a NULL rendered as 0 by CAST is not a value
+        values = [v for v in values if _plain_number(v) not in ("0", "0.0")]
+    patterns = {_value_pattern(v, numeric) for v in values}
+    if values and len(patterns) == 1 and "" not in patterns and len({str(v) for v in values}) >= 2:
+        return next(iter(patterns)) if (named or described) else ""
+    hit = re.search(r"\bYYYY-?MM(-?DD)?\b", desc)
+    if not values and hit and (named or described):
+        return ("yyyyMMdd" if hit.group(1) else "yyyyMM") if numeric else ("yyyy-MM-dd" if hit.group(1) and "-" in hit.group(0)
+                                                                          else "yyyyMMdd" if hit.group(1) else
+                                                                          "yyyy-MM" if "-" in hit.group(0) else "yyyyMM")
+    return ""
+
+
+def looks_like_integer_date(attr: dict) -> bool:
+    """A number stored as a date (see stored_date_pattern)."""
+    return (attr.get("type") or "").lower() in _NUMERIC and bool(stored_date_pattern(attr))
+
+
+def looks_like_stored_date(attr: dict) -> bool:
+    """A date stored as a number or as text."""
+    return bool(stored_date_pattern(attr))
 
 
 _HELPER_METRIC = re.compile(r"\b(numerator|denominator|helper)\s*$", re.I)
@@ -563,13 +614,8 @@ def has_time_attributes(name: str, all_names: list[str]) -> bool:
 
 
 def date_pattern(attr: dict) -> str:
-    """The pattern a number stored as a date follows (for set-column-types), from its profile or description."""
-    prof = attr.get("profile") or {}
-    v = _plain_number(prof.get("max")) or _plain_number(prof.get("min"))
-    if v and v.isdigit():
-        return "yyyyMM" if len(v) == 6 else "yyyyMMdd" if len(v) == 8 else ""
-    hit = re.search(r"\bYYYY-?MM(-?DD)?\b", attr.get("description") or "", re.I)
-    return ("yyyyMMdd" if hit.group(1) else "yyyyMM") if hit else ""
+    """The pattern a date stored as a number or text follows (for set-column-types ... date <pattern>)."""
+    return stored_date_pattern(attr)
 
 
 def maturity_signals(scope: dict) -> dict[str, Any]:
@@ -594,11 +640,12 @@ def maturity_signals(scope: dict) -> dict[str, Any]:
     # takes time attributes (year, quarter, month intervals) that group correctly and enable time-intelligence
     # metrics; lookups for its parents are the fallback when it can't be converted.
     integer_dates = [a["name"] for a in attrs if looks_like_integer_date(a)]
+    text_dates = [a["name"] for a in attrs if (a.get("type") or "").lower() in _TEXT_TYPES and looks_like_stored_date(a)]
     summed_nonadditive = [m["name"] for m in metrics if m.get("formula") and
                           re.match(r"^sum\(", m["formula"].strip(), re.I) and _SUMMED_NONADDITIVE.search(_words(m["name"]))]
     text_metrics = [m["name"] for m in metrics if m.get("type", "").lower() in ("varchar", "char", "string", "text")]
     share = round(described / total, 3)
-    structural = len(summed_nonadditive) >= 3 or len(integer_dates) >= 2 or bool(text_metrics)
+    structural = len(summed_nonadditive) >= 3 or len(integer_dates) + len(text_dates) >= 2 or bool(text_metrics)
     if not derived:
         level = "M0" if share < 0.5 or structural else "M1"
     elif len(derived) < 5:
@@ -612,10 +659,10 @@ def maturity_signals(scope: dict) -> dict[str, Any]:
             "metrics_that_look_like_attributes": attribute_like_metrics,
             "numeric_attributes": numeric_attributes, "decoded_codes": decoded,
             "latest_period_flag": latest_flag, "single_value_attributes": constants,
-            "dates_stored_as_numbers": integer_dates,
+            "dates_stored_as_numbers": integer_dates, "dates_stored_as_text": text_dates,
             "dates_without_time_attributes": [a["name"] for a in attrs if "__" not in a["name"]
                                               and (a.get("type", "").lower() in ("date", "timestamp")
-                                                   or looks_like_integer_date(a))
+                                                   or looks_like_stored_date(a))
                                               and not has_time_attributes(a["name"], [x["name"] for x in attrs])],
             "summed_rates_scores_or_ages": summed_nonadditive,
             "metrics_stored_as_text": text_metrics,
@@ -1497,7 +1544,7 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
     for a in attrs:
         prof = a.get("profile") or {}
         d = prof.get("distinct_values")
-        is_text = a.get("type", "").lower() in ("varchar", "char", "string", "text")
+        is_text = a.get("type", "").lower() in ("varchar", "char", "string", "text") and not looks_like_stored_date(a)
         is_numeric_code = a.get("type", "").lower() in _NUMERIC and bool(_CODE_NAME.search(_words(a["name"]))) \
             and not looks_like_integer_date(a)
         if not (is_text or is_numeric_code) or not d or d < 2:
@@ -1522,7 +1569,7 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                     "new_forms": [f"{a['name']} description"], "new_attributes": []})
     period_attr = period
     if not period_attr:
-        dated = [a for a in attrs if (a.get("type", "").lower() in ("date", "timestamp") or looks_like_integer_date(a))
+        dated = [a for a in attrs if (a.get("type", "").lower() in ("date", "timestamp") or looks_like_stored_date(a))
                  and _PERIOD_NAME.search(_words(a["name"])) and (_distinct(a) or 0) >= 2]
         if dated:
             preferred = re.compile(r"\b(period|reporting|snapshot|as of|activity|month)\b", re.I)
@@ -1534,7 +1581,7 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
             if "__" in a["name"] or (_distinct(a) or 0) < 2:
                 continue
             is_date = a.get("type", "").lower() in ("date", "timestamp")
-            if not (is_date or looks_like_integer_date(a)) or has_time_attributes(a["name"], names):
+            if not (is_date or looks_like_stored_date(a)) or has_time_attributes(a["name"], names):
                 continue
             pattern = "" if is_date else date_pattern(a)
             month_grain = pattern == "yyyyMM"
@@ -1542,7 +1589,8 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                         "convert": {"type": "date", "date_format": pattern} if pattern else None,
                         "intervals": ["year", "quarter", "month"] if month_grain or is_date
                         else ["year", "quarter", "month", "day"],
-                        "reason": ("a date stored as a number: convert it to a date (change_column_type, "
+                        "reason": (f"a date stored as {'text' if (a.get('type') or '').lower() in _TEXT_TYPES else 'a number'}: "
+                                   "convert it to a date (change_column_type, "
                                    f"date_format {pattern}), then add time attributes" if pattern else
                                    "a date without time attributes") +
                                   " (add_time_attributes): year, quarter and month intervals that group correctly, "
@@ -1568,7 +1616,7 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
     for a in attrs:
         if a["name"] == period_attr or (_distinct(a) or 0) < 2:
             continue
-        if not (a.get("type", "").lower() in ("date", "timestamp") or looks_like_integer_date(a)):
+        if not (a.get("type", "").lower() in ("date", "timestamp") or looks_like_stored_date(a)):
             continue
         year = f"{a['name']} year"
         if any(n.lower() in (year.lower(), f"{a['name']} yr".lower()) for n in names):
