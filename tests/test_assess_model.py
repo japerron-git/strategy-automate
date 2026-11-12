@@ -1780,7 +1780,9 @@ class ExistingTableTests(unittest.TestCase):
 
     def test_readable_values_need_no_lookup(self):
         self.assertTrue(am.looks_like_codes(["00", "01", "XX"]))
-        self.assertTrue(am.looks_like_codes(["PREPAID", "REO_SALE"]))
+        self.assertFalse(am.looks_like_codes(["PREPAID", "REO_SALE"]))      # upper-case words read as they are
+        self.assertFalse(am.looks_like_codes(["19DNA1", "19HQA2"]))          # identifiers analysts already use
+        self.assertTrue(am.looks_like_codes(["RA", "XX", "01", "P"]))
         self.assertFalse(am.looks_like_codes(["High", "Low"]))
         self.assertFalse(am.looks_like_codes(["Prepaid", "REO sale"]))
         self.assertTrue(am.looks_like_codes(["Alpha", "Beta"], "Alpha = first lien, Beta = second lien"))
@@ -1799,7 +1801,8 @@ class ExistingTableTests(unittest.TestCase):
         self.assertEqual(len(ext), 1)
         self.assertEqual(ext[0]["keep_columns"], ["status code", "late flag", "status bucket"])
         self.assertEqual(ext[0]["new_forms"], ["status code description", "status bucket description"])
-        self.assertIn("confirm it", ext[0]["reason"])
+        self.assertIn("export the model", ext[0]["reason"])
+        self.assertEqual(ext[0]["headers"], "connector names")
         self.assertNotIn("status bucket", [s["attribute"] for s in sugg if s["kind"] == "code_lookup"])
 
     def test_model_export_names_the_table(self):
@@ -1825,7 +1828,8 @@ class ExistingTableTests(unittest.TestCase):
             if "IS NULL OR CAST" in sql:
                 return [["n"], ["136,699"]]
             if "GROUP BY 1, 2, 3" in sql:
-                return [["c0", "c1", "c2"], ["01", "N", "1"], ["00", "N", "0"], ["XX", "N", "9"]]
+                self.assertIn("CASE WHEN \"status code\" IS NULL THEN '' ELSE CAST", sql)   # blanks stay blank
+                return [["c0", "c1", "c2"], ["01", "N", "1"], ["00", "N", "0"], ["XX", "", "9"]]
             raise AssertionError(sql)
         (built,) = am.build_lookups(_SqlRunner(answer), "retail", self.SCOPE, sugg, d)
         with open(built["csv"], encoding="utf-8", newline="") as f:
@@ -1833,8 +1837,70 @@ class ExistingTableTests(unittest.TestCase):
         self.assertEqual(rows[0], ["status code", "late flag", "status bucket", "status code description",
                                    "status bucket description", "source"])
         self.assertEqual(rows[1], ["00", "N", "0", "", "", ""])
+        self.assertEqual(rows[3], ["XX", "", "9", "", "", ""])
         self.assertEqual(built["blank_key_fact_rows"], 136699.0)
-        self.assertIn("blank", built["blank_key_warning"])
+        self.assertIn("kept them", built["blank_key_note"])                  # no probe evidence of loss: a note
+
+    EXPORT = {"model": [{"tables": [
+        {"information": {"name": "facts.csv"}},
+        {"information": {"name": "status_map.csv"}, "physicalTable": {"columns": [
+            {"columnName": "STATUS"}, {"columnName": "BUCKET SORT"}, {"columnName": "BUCKET"},
+            {"columnName": "MONTHS LATE"}, {"columnName": "UNUSED"}]}}],
+        "factMetrics": [{"expressions": [{"tables": [{"name": "facts.csv"}]}]}],
+        "attributes": [
+            {"information": {"name": "Store ID"}, "attributeLookupTable": {"name": "facts.csv"}},
+            {"information": {"name": "Status Code"}, "attributeLookupTable": {"name": "status_map.csv"},
+             "keyForm": {"id": "K"}, "forms": [{"id": "K", "name": "ID", "category": "ID",
+                                                "expressions": [{"expression": {"text": "[STATUS]"}}]}]},
+            {"information": {"name": "Status Bucket"}, "attributeLookupTable": {"name": "status_map.csv"},
+             "keyForm": {"id": "K"}, "forms": [
+                 {"id": "K", "name": "ID", "category": "ID", "expressions": [{"expression": {"text": "[BUCKET SORT]"}}]},
+                 {"id": "L", "name": "Status Bucket", "category": "Bucket Sort Order None",
+                  "expressions": [{"expression": {"text": "[BUCKET]"}}]},
+                 {"id": "D", "name": "DESC", "category": "DESC", "expressions": [{"expression": {"text": "[BUCKET]"}}]}]},
+            {"information": {"name": "Late Flag"}, "attributeLookupTable": {"name": "status_map.csv"},
+             "keyForm": {"id": "K"}, "forms": [{"id": "K", "name": "ID", "category": "ID",
+                                                "expressions": [{"expression": {"text": "[MONTHS LATE]"}}]}]}]}]}
+
+    def test_with_the_export_headers_are_the_tables_and_every_column_is_kept(self):
+        scope = dict(self.SCOPE, attributes=self.SCOPE["attributes"] + [{"name": "status bucket__desc", "type": "varchar"}])
+        sugg = am.lookup_suggestions(scope, relationships=self.REL, export=self.EXPORT, time_attributes=False)
+        (ext,) = [s for s in sugg if s["kind"] == "extend_lookup"]
+        self.assertEqual(ext["keep_columns"], ["STATUS", "BUCKET SORT", "BUCKET", "MONTHS LATE", "UNUSED"])
+        self.assertEqual(ext["new_forms"], ["status code description"])        # the bucket already has a label
+        self.assertEqual(ext["read_as"]["BUCKET"], "status bucket__desc")
+        self.assertEqual(ext["headers"], "table columns")
+        hidden = [s for s in sugg if s["kind"] == "hidden_form"]
+        self.assertEqual([(h["attribute"], h["form"], h["query_as"]) for h in hidden],
+                         [("status bucket", "Status Bucket", "status bucket (status bucket)")])
+
+        def answer(sql):
+            if "IS NULL OR CAST" in sql:
+                return [["n"], ["0"]]
+            return [["c0", "c1", "c2", "c3"], ["01", "1", "30-59 days", "1"], ["RA", "5", "180+ days", ""]]
+        d = tempfile.mkdtemp(prefix="extend-x-")
+        self.addCleanup(shutil.rmtree, d, True)
+        built = next(b for b in am.build_lookups(_SqlRunner(answer), "retail", scope, [ext], d))
+        with open(built["csv"], encoding="utf-8", newline="") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(rows[0], ["STATUS", "BUCKET SORT", "BUCKET", "MONTHS LATE", "UNUSED",
+                                   "status code description", "source"])
+        self.assertEqual(rows[2], ["RA", "5", "180+ days", "", "", "", ""])   # a blank stays blank, not 0
+        self.assertEqual(built["unreadable_columns"], ["UNUSED"])
+
+    def test_rows_lost_through_a_described_attribute_still_reported(self):
+        probes = {"attributes": [{"name": "late flag", "issues": [
+            "filtered to latest flag = Y: keeps 341,684 of 478,383 fact rows (136,699 lost: ...)"]}]}
+        sugg = am.lookup_suggestions(self.SCOPE, probes=probes, time_attributes=False)
+        (b,) = [s for s in sugg if s["kind"] == "blank_key"]
+        self.assertEqual(b["attribute"], "late flag")
+
+        def answer(sql):
+            return [["n"], ["9,771,371"]]
+        d = tempfile.mkdtemp(prefix="blank-")
+        self.addCleanup(shutil.rmtree, d, True)
+        (built,) = am.build_lookups(_SqlRunner(answer), "retail", self.SCOPE, [b], d)
+        self.assertIn("probe saw rows lost", built["blank_key_warning"])
 
     def test_plan_refuses_a_replacement_that_drops_a_column(self):
         def plan(cols):

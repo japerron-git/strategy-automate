@@ -50,8 +50,18 @@ from the table's own rows and keeping every existing column, plus description co
 new table and a second join. A replacement must keep every column its attributes read (`plan` refuses
 one that drops a column: `add_lookup_table` with `extends_table` and `keep_columns`). It skips values
 readable as they are (words such as "High", "Prepaid"; a missing definition there is a description
-change), and counts fact rows with a blank key: no lookup row matches a blank, so those rows drop out
-of any query using the lookup — fix it with a code for blank in the source. Then it recommends:
+change; longer tokens such as deal names are identifiers, not codes), and reports rows the probe saw
+lost through an attribute's lookup (`blank_key`, with the blank count), whether or not the attribute
+gets a CSV; blank keys the probe saw kept are a note only. With the export it also writes the template
+under the **table's own column names**, keeps **every physical column** (a form such as a bucket's sort
+id reads a column the connector names differently), reads blanks as blanks (`CAST` alone turns a NULL
+into 0, which a reload would write into the table), lists columns no attribute reads (copy them from
+the source file), adds no description column for an attribute that already has a description or label
+form, and reports **hidden forms** (`hidden_form`: forms the export has but get_semantics omits; they
+answer as `"<attribute> (<form>)"`; make them visible instead of duplicating them). Without the export
+the headers are connector names: don't replace a table from such a CSV. Time-attribute suggestions name
+the table the column lives in (converting it changes the table for every model reading that file).
+Then it recommends:
 **code lookups** (coded text attributes with no description
 form or attribute), **time attributes** for every date (a date stored as a number or text — yyyyMM,
 yyyyMMdd, text yyyy-MM — is converted first; detected only when every sampled value and the min and max

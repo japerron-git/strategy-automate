@@ -1518,7 +1518,8 @@ def _has_description_sibling(name: str, names: list[str]) -> bool:
             continue
         if _form_base(o) == base and any(w in o for w in ("description", "desc", "name", "label")):
             return True
-        if stem and stem in o and any(w in o for w in ("description", "desc", " name", "label")):
+        # "status description" describes "status code"; "status bucket__desc" describes the bucket, not the code
+        if stem and re.fullmatch(rf"{re.escape(stem)}\s*(\(|__)?\s*(description|desc|name|label)\)?", o):
             return True
     return False
 
@@ -1539,14 +1540,61 @@ _CODE_TOKEN = re.compile(r"^[A-Z0-9][A-Z0-9_\-./+]{0,9}$")
 
 
 def looks_like_codes(values: list[str], description: str = "") -> bool:
-    """Values that need a lookup to be read: short, upper-case or numeric tokens, or explained only in the
-    description text. Words ("High", "Prepaid", "REO sale") are readable as they are."""
+    """Values that need a lookup to be read: short tokens (up to 4 characters, digits or upper case: "01",
+    "XX", "RA", "P"), or values explained only in the description text. Words ("High", "Prepaid", "REO sale")
+    are readable, and longer tokens ("19DNA1", "PREPAID") are names or identifiers analysts already use."""
     vals = [str(v).strip() for v in values if str(v).strip()]
     if not vals:
         return False
-    if all(_CODE_TOKEN.match(v) or len(v) <= 2 for v in vals):   # "01", "XX", "R", "PREPAID" — not "High", "Low"
+    if all(len(v) <= 2 or (len(v) <= 4 and (v.isupper() or any(ch.isdigit() for ch in v))) for v in vals):
         return True
     return bool(re.search(r"\b\w{1,4}\s*[=:]\s*\w", description or ""))   # "01 = current, 02 = 30 days"
+
+
+_DESC_FORM = re.compile(r"\b(desc|description|label|name|text)\b", re.I)
+
+
+def _export_model(export: dict | None) -> dict | None:
+    m = (export or {}).get("model")
+    return (m[0] if m else None) if isinstance(m, list) else m
+
+
+def export_forms(scope: dict, export: dict | None) -> dict[str, dict[str, Any]]:
+    """Per connector attribute: its table, and each form with its physical column, whether the connector lists
+    it, and the name to query it by. The connector shows a key form as the attribute and other forms as
+    '<attribute>__<form>' or '<attribute> (<form>)'; a form listed by neither is hidden from analysts (it can
+    still be queried as '<attribute> (<form>)')."""
+    model = _export_model(export)
+    if not model:
+        return {}
+    listed = {a["name"].casefold() for a in scope.get("attributes") or []}
+    out: dict[str, dict[str, Any]] = {}
+    for a in model.get("attributes") or []:
+        mname = str((a.get("information") or {}).get("name") or "")
+        cname = mname.lower()
+        if cname.casefold() not in listed:
+            continue
+        key_id = (a.get("keyForm") or {}).get("id")
+        forms = []
+        for f in a.get("forms") or []:
+            text = ((f.get("expressions") or [{}])[0].get("expression") or {}).get("text") or ""
+            col = text[1:-1] if re.fullmatch(r"\[[^\[\]]+\]", text.strip()) else ""
+            fname = str(f.get("name") or "").lower()
+            is_key = f.get("id") == key_id
+            cands = [cname] if is_key else [f"{cname}__{fname}", f"{cname} ({fname})"]
+            visible = next((c for c in cands if c.casefold() in listed), None)
+            forms.append({"form": f.get("name"), "category": f.get("category"), "column": col, "key": is_key,
+                          "visible": bool(visible), "query_as": visible or (cname if is_key else f"{cname} ({fname})"),
+                          "describes": not is_key and bool(_DESC_FORM.search(f"{f.get('name')} {f.get('category')}"))})
+        out[cname] = {"table": (a.get("attributeLookupTable") or {}).get("name"), "forms": forms}
+    return out
+
+
+def hidden_forms(scope: dict, export: dict | None) -> list[dict[str, Any]]:
+    """Forms the model has but the connector doesn't list (get_semantics omits them, so analysts and agents never
+    see them). A label hidden this way looks like a missing description."""
+    return [{"attribute": n, "form": f["form"], "category": f["category"], "query_as": f["query_as"]}
+            for n, a in export_forms(scope, export).items() for f in a["forms"] if not f["visible"] and not f["key"]]
 
 
 def existing_lookup_tables(scope: dict, *, relationships: dict | None = None, probes: dict | None = None,
@@ -1560,7 +1608,8 @@ def existing_lookup_tables(scope: dict, *, relationships: dict | None = None, pr
     edges = [(str(r["child"]), str(r["parent"])) for r in ((relationships or {}).get("suggestions") or {})
              .get("parent_child") or []]
     groups: dict[str, dict[str, Any]] = {}
-    model = ((export or {}).get("model") or [None])[0] if isinstance((export or {}).get("model"), list) else (export or {}).get("model")
+    model = _export_model(export)
+    forms = export_forms(scope, export)
     if model:
         tables = {(t.get("information") or {}).get("name"): t for t in model.get("tables") or []}
         fact_tables = {str(tb.get("name")) for fm in model.get("factMetrics") or []
@@ -1578,7 +1627,12 @@ def existing_lookup_tables(scope: dict, *, relationships: dict | None = None, pr
                 continue
             cols = [c.get("columnName") or (c.get("information") or {}).get("name")
                     for c in ((tables.get(t) or {}).get("physicalTable") or {}).get("columns") or []]
+            read_as = {f["column"]: f["query_as"] for n in attrs for f in (forms.get(n.lower()) or {}).get("forms", [])
+                       if f["column"]}
             groups[t] = {"attributes": attrs, "columns": [c for c in cols if c], "source": "model export",
+                         "read_as": read_as,
+                         "described": [n for n in attrs if any(f["describes"] for f in (forms.get(n.lower()) or {})
+                                                               .get("forms", []))],
                          "evidence": ["each attribute's lookup table in the model export"]}
     else:
         lookup_only = {a["name"]: a.get("lookup_only_values") or [] for a in (probes or {}).get("attributes") or []
@@ -1660,16 +1714,40 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                     "new_forms": [f"{a['name']} description"], "new_attributes": []})
     for table, coded in extend.items():
         g = existing[table]
-        descs = [f"{n} description" for n in [g["key"]] + g["determined"] if n in coded]   # key first
+        described = set(g.get("described") or [])
+        need = [n for n in [g["key"]] + g["determined"] if n in coded and n not in described]
+        if not need:
+            continue   # every coded attribute of the table already has a description form (maybe hidden)
+        from_export = g["source"] == "model export"
+        keep = g["columns"] if from_export and g["columns"] else [g["key"]] + g["determined"]
+        descs = [f"{n} description" for n in need]
         out.append({"id": f"X-{_slug(g['key'])}", "kind": "extend_lookup", "attribute": g["key"],
                     "table": table, "table_source": g["source"], "evidence": g["evidence"],
-                    "keep_columns": [g["key"]] + g["determined"], "physical_columns": g["columns"],
+                    "keep_columns": keep, "read_as": g.get("read_as") or {c: c for c in keep},
+                    "headers": "table columns" if from_export else "connector names",
                     "reason": f"the model already has this table ({g['source']}): add descriptions to it, keyed on its "
                               f"most detailed code '{g['key']}', instead of a new table and a second join"
-                              + ("" if g["source"] == "model export" else
-                                 "; the table name is inferred: confirm it (model export, or ask the user)"),
-                    "columns": [g["key"]] + g["determined"] + descs + ["source"],
-                    "new_forms": descs, "new_attributes": []})
+                              + ("" if from_export else
+                                 "; the table and its columns are inferred, and the headers are connector names: "
+                                 "export the model (export-model, --model-export) before replacing the table"),
+                    "columns": keep + descs + ["source"], "new_forms": descs, "new_attributes": []})
+    lost_by = {a["name"]: [x for x in a.get("issues") or [] if "keeps" in x and "fact rows" in x]
+               for a in (probes or {}).get("attributes") or []}
+    for n, lost in lost_by.items():
+        if lost and n in names:   # rows lost through an attribute's lookup, whether or not it gets a CSV
+            out.append({"id": f"B-{_slug(n)}", "kind": "blank_key", "attribute": n, "rows_lost": lost,
+                        "reason": "the probe saw fact rows lost through this attribute's lookup (often a blank key "
+                                  "that no lookup row matches): give blank a code in the source, then a lookup row "
+                                  "for it",
+                        "columns": [], "new_forms": [], "new_attributes": []})
+    for h in hidden_forms(scope, export):
+        out.append({"id": f"H-{_slug(h['attribute'])}-{_slug(str(h['form']))}", "kind": "hidden_form",
+                    "attribute": h["attribute"], "form": h["form"], "category": h["category"],
+                    "query_as": h["query_as"],
+                    "reason": f"the model has the form '{h['form']}' (category {h['category']}) but the connector doesn't "
+                              f"list it, so analysts and agents never see it; it answers as \"{h['query_as']}\". Make it "
+                              f"visible instead of adding a column that duplicates it",
+                    "columns": [], "new_forms": [], "new_attributes": []})
     period_attr = period
     if not period_attr:
         dated = [a for a in attrs if (a.get("type", "").lower() in ("date", "timestamp") or looks_like_stored_date(a))
@@ -1688,7 +1766,11 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                 continue
             pattern = "" if is_date else date_pattern(a)
             month_grain = pattern == "yyyyMM"
+            home = (export_forms(scope, export).get(a["name"].lower()) or {}).get("table")
             out.append({"id": f"T-{_slug(a['name'])}", "kind": "time_attributes", "attribute": a["name"],
+                        "table": home,
+                        "shared_table_note": (f"the column lives in '{home}': converting its type changes the table, so "
+                                              f"check whether other models read the same file") if home else None,
                         "convert": {"type": "date", "date_format": pattern} if pattern else None,
                         "intervals": ["year", "quarter", "month"] if month_grain or is_date
                         else ["year", "quarter", "month", "day"],
@@ -1762,7 +1844,7 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
     known: dict[str, Any] = {}
     wanted: dict[str, float] = {}
     for sug in suggestions:
-        if sug["kind"] in ("entity_table", "time_attributes", "extend_lookup"):
+        if sug["kind"] in ("entity_table", "time_attributes", "extend_lookup", "blank_key", "hidden_form"):
             continue
         prof = profiles.get(sug["attribute"], {})
         if prof.get("values") is not None and prof.get("distinct_values") is not None \
@@ -1778,6 +1860,13 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
             continue
         if sug["kind"] == "time_attributes":
             done.append({**sug, "csv": None, "note": "no CSV: a type change (if needed) and add_time_attributes"})
+            continue
+        if sug["kind"] in ("blank_key", "hidden_form"):
+            extra = {}
+            if sug["kind"] == "blank_key":
+                b = _blank_key_rows(runner, project, scope, sug["attribute"], where)
+                extra = _blank_note(b, sug["attribute"], sug.get("rows_lost")) if b else {}
+            done.append({**sug, **extra, "csv": None})
             continue
         blank = _blank_key_rows(runner, project, scope, sug["attribute"], where)
         if sug["kind"] == "extend_lookup":
@@ -1827,36 +1916,50 @@ def _blank_key_rows(runner: Runner, project: str, scope: dict, attribute: str, w
     return _num(parsed["rows"][0].get("n")) if parsed["ok"] and parsed["rows"] else None
 
 
-def _blank_note(blank: float | None, attribute: str) -> dict[str, Any]:
+def _blank_note(blank: float | None, attribute: str, lost: list[str] | None = None) -> dict[str, Any]:
     if not blank:
         return {}
+    if lost:
+        return {"blank_key_fact_rows": blank, "rows_lost": lost,
+                "blank_key_warning": f"{blank:,.0f} fact rows have a blank '{attribute}', and the probe saw rows lost "
+                                     f"through it ({'; '.join(lost)}): give blank a code in the source "
+                                     f"(source_change), then a lookup row for that code."}
     return {"blank_key_fact_rows": blank,
-            "blank_key_warning": f"{blank:,.0f} fact rows have a blank '{attribute}': no lookup row can match a blank "
-                                 f"key, so they drop out of queries that use this lookup's columns. Give blank a code "
-                                 f"in the source (source_change), then a lookup row for that code."}
+            "blank_key_note": f"{blank:,.0f} fact rows have a blank '{attribute}'; the probe's shapes kept them (a "
+                              f"blank matches no lookup row, but this join keeps them). Re-check after any lookup "
+                              f"change."}
 
 
 def _extend_template(runner: Runner, project: str, model: str, sug: dict, csv_dir: str, where: str,
                      blank: float | None) -> dict[str, Any]:
-    """The existing table's rows (an attribute-only query reads the lookup itself), every existing column kept,
-    description columns blank to fill from cited sources."""
-    keep = sug["keep_columns"]
-    cols = ", ".join(f"CAST({quote_ident(c)} AS VARCHAR) AS c{i}" for i, c in enumerate(keep))
+    """The existing table's rows (an attribute-only query reads the lookup itself), every column kept under the
+    table's own names, description columns blank to fill from cited sources. Blanks stay blank: CAST alone
+    turns a NULL into 0, which a reload would write into the table."""
+    keep, read_as = sug["keep_columns"], sug.get("read_as") or {}
+    readable = [c for c in keep if read_as.get(c)]
+    cols = ", ".join(f"CASE WHEN {quote_ident(read_as[c])} IS NULL THEN '' ELSE CAST({quote_ident(read_as[c])} AS VARCHAR) "
+                     f"END AS c{i}" for i, c in enumerate(readable))
     clause = f" WHERE {where}" if where else ""
-    sql = f"SELECT {cols} FROM {quote_model(model)}{clause} GROUP BY {', '.join(str(i + 1) for i in range(len(keep)))}"  # nosec B608  # identifiers are quoted; the connector is read-only
+    sql = f"SELECT {cols} FROM {quote_model(model)}{clause} GROUP BY {', '.join(str(i + 1) for i in range(len(readable)))}"  # nosec B608  # identifiers are quoted; the connector is read-only
     try:
         parsed = parse_query_result(runner.call("query", {"project": project, "query": sql}))
     except PendingReply:
         return {**sug, "csv": None, "pending": True}
     if not parsed["ok"]:
         return {**sug, "csv": None, "error": parsed["error"] or "the table's rows could not be read"}
-    rows = sorted([[r.get(f"c{i}") or "" for i in range(len(keep))] for r in parsed["rows"]], key=lambda r: r)
+    pos = {c: i for i, c in enumerate(readable)}
+    rows = sorted([[(r.get(f"c{pos[c]}") or "") if c in pos else "" for c in keep] for r in parsed["rows"]])
     extra = len(sug["columns"]) - len(keep)
     path = os.path.join(csv_dir, f"{_slug(sug['attribute'])}_lookup.csv")
     _write_csv(path, sug["columns"], [r + [""] * extra for r in rows])
-    return {**sug, "csv": path, "rows": len(rows), **_blank_note(blank, sug["attribute"]),
-            "note": "starts from the existing table's rows, every existing column kept; descriptions to fill from "
-                    "cited sources (or 'model data' when derived from the table itself)"}
+    unread = [c for c in keep if c not in pos]
+    note = ("starts from the existing table's rows, every column kept under the table's own names; descriptions to "
+            "fill from cited sources (or 'model data' when derived from the table itself)")
+    if unread:
+        note += (f". Columns no attribute reads through the connector are left blank: {unread} — copy them from the "
+                 f"source file before reloading")
+    return {**sug, "csv": path, "rows": len(rows), "unreadable_columns": unread, **_blank_note(blank, sug["attribute"]),
+            "note": note}
 
 
 def _null_artifacts(values: list, prof: dict, scope: dict, attribute: str) -> set:
