@@ -32,6 +32,7 @@ Subcommands:
   set-column-types           Change column types in the model (table + pipeline), no reload; republish after.
   create-formula-attribute   Attribute computed from columns (prefer a lookup table); republish after.
   add-column-attribute       Attribute that reads one existing column (e.g. a fact metric's) as-is; republish after.
+  add-time-attributes        Year / quarter / month (week, day) intervals on a date attribute; republish after.
   rename-describe            Rename / describe attributes and fact metrics by name; no republish.
 
 Authentication
@@ -6028,9 +6029,13 @@ def column_type_object_writes(model: dict, mid: str, cols: dict[str, tuple[str, 
                 col = _simple_column(f["expressions"][0]["expression"].get("text"))
                 if col and col.casefold() in targets:
                     t = targets[col.casefold()][1]
-                    if f.get("dataType") != COLUMN_TYPES[t] or f.get("displayFormat") != _FORM_DISPLAY[t]:
+                    role = "date" if t in ("date", "timestamp") else f.get("semanticRole")
+                    if f.get("dataType") != COLUMN_TYPES[t] or f.get("displayFormat") != _FORM_DISPLAY[t] \
+                            or f.get("semanticRole") != role:
                         need = True
                     f["dataType"], f["displayFormat"] = dict(COLUMN_TYPES[t]), _FORM_DISPLAY[t]
+                    if role:   # Studio gives a date form the "date" role (an integer yyyyMM had "month")
+                        f["semanticRole"] = role
                 f["expressions"] = ex
             forms.append(f)
         if forms is not None and need:
@@ -6385,6 +6390,106 @@ def cmd_rename_describe(m: MSTR, args):
         _patch_in_changeset(m, writes, "rename-describe")
     print(json.dumps({"ok": True, "dry_run": bool(args.dry_run), "changed": [w[0] for w in writes],
                       "skipped": notes}, indent=2))
+
+
+TIME_INTERVALS = ("year", "quarter", "month", "week", "day")   # seen live on a date attribute (smartAttributeType "<x>_interval")
+
+
+def time_attribute_items(args) -> list[dict]:
+    """--attribute A --intervals year,quarter,month and/or --spec {items: [{attribute, intervals}]}."""
+    items = []
+    if getattr(args, "spec", None):
+        items += list((_load_json_arg(None, args.spec) or {}).get("items") or [])
+    if getattr(args, "attribute", None):
+        items.append({"attribute": args.attribute, "intervals": [x.strip() for x in (args.intervals or "").split(",")
+                                                                   if x.strip()]})
+    if not items:
+        die("add-time-attributes: give --attribute and --intervals, or --spec")
+    for it in items:
+        bad = [x for x in it.get("intervals") or [] if str(x).lower() not in TIME_INTERVALS]
+        if not it.get("attribute") or not it.get("intervals") or bad:
+            die(f"add-time-attributes: each item needs an attribute and intervals from {', '.join(TIME_INTERVALS)}"
+                + (f" (unknown: {bad})" if bad else ""))
+    return items
+
+
+def _smart_type(entry: dict) -> str:
+    return str(entry.get("smartAttributeType") or (entry.get("definition") or {}).get("smartAttributeType") or "")
+
+
+def time_attribute_body(attr: dict, intervals: list[str]) -> tuple[dict | None, list[str], list[str]]:
+    """-> (PUT body or None when nothing to add, added types, problems). The PUT replaces the whole set, so the
+    existing smart attributes go in again with their objectId."""
+    name = (attr.get("information") or {}).get("name") or "?"
+    key_id = (attr.get("keyForm") or {}).get("id")
+    key = next((f for f in attr.get("forms") or [] if f.get("id") == key_id), (attr.get("forms") or [{}])[0])
+    typ = ((key.get("dataType") or {}).get("type") or "").lower()
+    if typ not in ("date", "time_stamp"):
+        return None, [], [f"'{name}' is {typ or 'not typed'}: time attributes need a date or timestamp; convert it "
+                          f"first (set-column-types ... date <pattern>, e.g. yyyyMM)"]
+    existing = [e for e in attr.get("smartAttributes") or [] if _smart_type(e)]
+    have = {_smart_type(e) for e in existing}
+    wanted = [f"{str(x).lower()}_interval" for x in intervals]
+    added = [w for w in wanted if w not in have]
+    if not added:
+        return None, [], []
+    def entry(t, e=None):
+        out = {"subType": "attribute_smart", "definition": {"smartAttributeType": t, "parameters": [],
+                                                            "ascending": (e or {}).get("ascending", True)}}
+        if e and ((e.get("information") or {}).get("objectId") or e.get("objectId")):
+            out["objectId"] = (e.get("information") or {}).get("objectId") or e.get("objectId")
+        return out
+    return {"smartAttributes": [entry(_smart_type(e), e) for e in existing] + [entry(t) for t in added]}, added, []
+
+
+def cmd_add_time_attributes(m: MSTR, args):
+    """Time attributes (year, quarter, month, week, day intervals) on date attributes, as Studio adds them: each
+    shows on the connector as '<attribute> (<interval>)__id / __start / __desc'. One changeset; republish after."""
+    items = time_attribute_items(args)
+    m.login(identity=True)
+    r = m.post(f"/api/model/dataModels/{args.model_id}/export")
+    if not r.ok:
+        die(f"export model: {format_mstr_error(r)}")
+    model = (r.json().get("model") or [{}])[0]
+    by_name = {}
+    for a in model.get("attributes") or []:
+        by_name[(a.get("information") or {}).get("name", "").casefold()] = a
+    writes, notes, problems = [], [], []
+    for it in items:
+        a = next((by_name[c] for c in attribute_name_candidates(it["attribute"]) if c in by_name), None)
+        if a is None:
+            problems.append(f"attribute '{it['attribute']}' not found")
+            continue
+        body, added, probs = time_attribute_body(a, it["intervals"])
+        problems += probs
+        aname, aid = a["information"]["name"], a["information"]["objectId"]
+        if body is None and not probs:
+            notes.append(f"'{aname}' already has {', '.join(it['intervals'])}")
+        if body is not None:
+            writes.append((f"attribute '{aname}': + {', '.join(added)}",
+                           f"/api/model/dataModels/{args.model_id}/attributes/{aid}/smartAttributes", body))
+    if problems:
+        die("add-time-attributes: nothing was written:\n  - " + "\n  - ".join(problems))
+    for n in notes:
+        print(f"  = {n}", file=sys.stderr)
+    for w in writes:
+        print(f"  ~ {w[0]}", file=sys.stderr)
+        if args.dry_run:
+            print(json.dumps(w[2], indent=2), file=sys.stderr)
+    if writes and not args.dry_run:
+        cs = open_cs(m)
+        try:
+            for what, path, body in writes:
+                resp = m.put(path, json=body)
+                if not resp.ok:
+                    die(f"add-time-attributes: PUT {what}: {format_mstr_error(resp)}")
+            commit_cs(m, cs)
+        except BaseException:   # die() raises SystemExit; discard on every failure path
+            discard_cs(m, cs)
+            raise
+    print(json.dumps({"ok": True, "dry_run": bool(args.dry_run), "changed": [w[0] for w in writes],
+                      "skipped": notes, "next": "republish, then the intervals show on the connector as "
+                                                "'<attribute> (<interval>)__id / __start / __desc'"}, indent=2))
 
 
 def cmd_patch_fact_metrics(m: MSTR, args):
@@ -7341,6 +7446,15 @@ def build_parser():
     sp.add_argument("--spec", required=True, help="JSON file with the items")
     sp.add_argument("--dry-run", action="store_true", help="print the changes; open no changeset")
 
+    sp = sub.add_parser("add-time-attributes",
+        help="Time attributes (year, quarter, month, week, day intervals) on date or timestamp attributes, in one "
+             "changeset. Convert a yyyyMM number first with set-column-types. Republish afterwards.")
+    sp.add_argument("--model-id", required=True)
+    sp.add_argument("--attribute", help="date attribute (name as the connector shows it, or the model's)")
+    sp.add_argument("--intervals", default="year,quarter,month", help="comma-separated: " + ", ".join(TIME_INTERVALS))
+    sp.add_argument("--spec", help="JSON {items: [{attribute, intervals: [...]}]} instead of --attribute")
+    sp.add_argument("--dry-run", action="store_true", help="print the request bodies; open no changeset")
+
     sp = sub.add_parser("add-column-attribute",
         help="Attribute that reads one existing column as-is, so a numeric column read as a fact metric can also be "
              "grouped and filtered on (number of units, a score band, a code stored as a number). Not a formula: "
@@ -7464,6 +7578,7 @@ def main():
             "rename-describe": cmd_rename_describe,
             "create-formula-attribute": cmd_create_formula_attribute,
             "add-column-attribute": cmd_create_formula_attribute,
+            "add-time-attributes": cmd_add_time_attributes,
             "set-column-types": cmd_set_column_types,
             "patch-fact-metrics": cmd_patch_fact_metrics,
             "attach-transformation": cmd_attach_transformation,

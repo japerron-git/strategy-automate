@@ -611,16 +611,24 @@ class MaturityTests(unittest.TestCase):
         self.assertEqual(am.maturity_signals({"attributes": attrs, "metrics": metrics[:2] + helpers})["derived_metrics"],
                          am.maturity_signals({"attributes": attrs, "metrics": metrics[:2]})["derived_metrics"])
 
-    def test_numeric_dates_with_calendar_parents_are_not_a_defect(self):
+    def test_numeric_dates_are_reported_even_with_calendar_parents(self):
         date = lambda n: {"name": n, "type": "bigint", "profile": {"distinct_values": 30, "min": "201901",  # noqa: E731
                                                                     "max": "202201"}}
-        bare = am.maturity_signals({"attributes": [date("reporting period"), date("close date")], "metrics": []})
-        self.assertEqual(bare["dates_stored_as_numbers"], ["reporting period", "close date"])
         calendar = am.maturity_signals({"attributes": [date("reporting period"), date("close date"),
                                                        {"name": "year", "type": "bigint"},
                                                        {"name": "latest period flag", "type": "varchar"},
                                                        {"name": "close date year", "type": "bigint"}], "metrics": []})
-        self.assertEqual(calendar["dates_stored_as_numbers"], [])
+        self.assertEqual(calendar["dates_stored_as_numbers"], ["reporting period", "close date"])
+        self.assertEqual(calendar["dates_without_time_attributes"], ["reporting period", "close date"])
+        converted = am.maturity_signals({"attributes": [
+            {"name": "month date", "type": "date"}, {"name": "month date (year)__id", "type": "bigint"},
+            {"name": "month date (month)__id", "type": "bigint"}], "metrics": []})
+        self.assertEqual((converted["dates_stored_as_numbers"], converted["dates_without_time_attributes"]), ([], []))
+
+    def test_date_pattern(self):
+        self.assertEqual(am.date_pattern({"profile": {"min": "201,901", "max": "202,201"}}), "yyyyMM")
+        self.assertEqual(am.date_pattern({"profile": {"max": "20220131"}}), "yyyyMMdd")
+        self.assertEqual(am.date_pattern({"description": "stored as YYYYMM integer"}), "yyyyMM")
 
 
 def _snapshot_rows():
@@ -781,15 +789,23 @@ class EarlyStageSignalTests(unittest.TestCase):
         self.assertEqual(m["metrics_stored_as_text"], ["cumulative costs"])
 
     def test_numeric_codes_and_integer_periods_get_lookups(self):
-        sugg = {s["attribute"]: s["kind"] for s in am.lookup_suggestions(self.SCOPE)}
-        self.assertEqual(sugg, {"status code": "code_lookup", "reporting period": "period_lookup",
-                                "close date": "date_lookup"})
+        sugg = {}
+        for x in am.lookup_suggestions(self.SCOPE):
+            sugg.setdefault(x["attribute"], []).append(x["kind"])
+        self.assertEqual(sugg, {"status code": ["code_lookup"], "reporting period": ["time_attributes", "period_lookup"],
+                                "close date": ["time_attributes"]})
+        period = next(x for x in am.lookup_suggestions(self.SCOPE)
+                      if x["kind"] == "time_attributes" and x["attribute"] == "reporting period")
+        self.assertEqual((period["convert"], period["intervals"]),
+                         ({"type": "date", "date_format": "yyyyMM"}, ["year", "quarter", "month"]))
+        fallback = {x["attribute"]: x["kind"] for x in am.lookup_suggestions(self.SCOPE, time_attributes=False)}
+        self.assertEqual(fallback["close date"], "date_lookup")
         self.assertEqual(am._period_parts("201,912"), ("2019", "2019-Q4", "12"))
         self.assertEqual(am._period_parts("20200301"), ("2020", "2020-Q1", "03"))
 
 
     def test_date_lookup_gives_calendar_parents_as_attributes(self):
-        (sug,) = [x for x in am.lookup_suggestions(self.SCOPE) if x["kind"] == "date_lookup"]
+        (sug,) = [x for x in am.lookup_suggestions(self.SCOPE, time_attributes=False) if x["kind"] == "date_lookup"]
         self.assertEqual(sug["columns"], ["close date", "close date year", "close date quarter"])
         self.assertEqual((sug["new_attributes"], sug["new_forms"]), (["close date year", "close date quarter"], []))
         self.assertIn("preferred to a derived attribute", sug["reason"])
@@ -803,7 +819,7 @@ class EarlyStageSignalTests(unittest.TestCase):
         self.assertEqual(rows, [["close date", "close date year", "close date quarter"],
                                 ["20200301", "2020", "2020-Q1"], ["20211201", "2021", "2021-Q4"]])
         named = {**self.SCOPE, "attributes": self.SCOPE["attributes"] + [{"name": "close date year", "type": "bigint"}]}
-        self.assertNotIn("date_lookup", [x["kind"] for x in am.lookup_suggestions(named)])
+        self.assertNotIn("date_lookup", [x["kind"] for x in am.lookup_suggestions(named, time_attributes=False)])
 
 
 def _table_reply(rows):
@@ -1264,7 +1280,7 @@ class LookupTests(unittest.TestCase):
             "metrics": []}
 
     def test_suggestions(self):
-        sugg = {s["attribute"]: s for s in am.lookup_suggestions(self.scope)}
+        sugg = {s["attribute"]: s for s in am.lookup_suggestions(self.scope) if s["kind"] != "time_attributes"}
         self.assertEqual(set(sugg), {"status code", "snapshot month"})
         self.assertIn("explained only in the description", sugg["status code"]["reason"])
         self.assertEqual(sugg["snapshot month"]["kind"], "period_lookup")
@@ -1274,7 +1290,10 @@ class LookupTests(unittest.TestCase):
 
         self.scope["attributes"].append({"name": "latest period flag", "type": "varchar", "description": "",
                                          "profile": {"distinct_values": 2, "values": ["N", "Y"]}})
-        self.assertNotIn("snapshot month", {s["attribute"] for s in am.lookup_suggestions(self.scope)})
+        self.assertNotIn("snapshot month", {s["attribute"] for s in am.lookup_suggestions(self.scope)
+                                            if s["kind"] != "time_attributes"})
+        self.scope["attributes"].append({"name": "snapshot month (year)__id", "type": "bigint"})
+        self.assertNotIn("time_attributes", [s["kind"] for s in am.lookup_suggestions(self.scope)])
         rel = {"entity": "customer", "suggestions": {"entity_level_attributes": list("abcdef")}}
         kinds = [s["kind"] for s in am.lookup_suggestions(self.scope, relationships=rel)]
         self.assertIn("entity_table", kinds)
@@ -1294,10 +1313,16 @@ class LookupTests(unittest.TestCase):
                                                    ["01", "", ""], ["02", "", ""], ["03", "", ""], ["09", "", ""]])
         with open(built["snapshot month"]["csv"], encoding="utf-8", newline="") as f:
             period = list(csv.reader(f))
-        self.assertEqual(period[0], ["snapshot month", "year", "quarter", "month", "latest period flag"])
-        self.assertEqual(period[1], ["2025-12-01", "2025", "2025-Q4", "12", "N"])
-        self.assertEqual(period[-1], ["2026-02-01", "2026", "2026-Q1", "02", "Y"])
+        self.assertEqual(period, [["snapshot month", "latest period flag"], ["2025-12-01", "N"], ["2026-01-01", "N"],
+                                  ["2026-02-01", "Y"]])          # the calendar comes from time attributes
         self.assertIsNone(built["customer"]["csv"])
+        # fallback: the calendar from the lookup CSV
+        sugg = am.lookup_suggestions(self.scope, time_attributes=False)
+        built = {b["attribute"]: b for b in am.build_lookups(TableRunner(rows), "retail", self.scope, sugg, self.dir)}
+        with open(built["snapshot month"]["csv"], encoding="utf-8", newline="") as f:
+            period = list(csv.reader(f))
+        self.assertEqual(period[0], ["snapshot month", "year", "quarter", "month", "latest period flag"])
+        self.assertEqual(period[-1], ["2026-02-01", "2026", "2026-Q1", "02", "Y"])
 
     def test_null_rendered_as_zero_is_dropped_from_numeric_code_lookups(self):
         scope = {"model": "Store Sales", "attributes": [
@@ -1691,3 +1716,22 @@ class QuestionSqlTests(unittest.TestCase):
         bank = {"questions": [{"id": "Q1", "sql": "SELECT 1", "best_answer": {"sql": "SELECT 3"}}]}
         out = am.set_best_answer(bank, "Q1", sql="SELECT 4", reason_kind="definition", reason="balance-weighted")
         self.assertTrue(out["ok"])
+
+
+class TimeAttributePlanTests(unittest.TestCase):
+    def test_type_change_then_time_attributes_in_phase_3(self):
+        f = _finding("F1", "data_type", actions=[
+            {"kind": "change_column_type", "args": {"column": "reporting period", "type": "date",
+                                                    "date_format": "yyyyMM"}},
+            {"kind": "add_time_attributes", "args": {"attribute": "reporting period",
+                                                     "intervals": ["year", "quarter", "month"]}}])
+        plan = am.build_plan({"findings": [f]}, model_id="MID")
+        self.assertEqual(plan["problems"], [])
+        steps = {p["phase"]: [s["kind"] for s in p["steps"] if s["kind"] != "note"] for p in plan["phases"]}
+        self.assertEqual(steps[2], ["change_column_type"])
+        self.assertIn("add_time_attributes", steps[3])
+        self.assertEqual(plan["files"]["specs/time_attributes.json"],
+                         {"items": [{"attribute": "reporting period", "intervals": ["year", "quarter", "month"]}]})
+        bad = am.build_plan({"findings": [_finding("F1", "data_type", actions=[
+            {"kind": "add_time_attributes", "args": {"attribute": "x", "intervals": ["fortnight"]}}])]}, model_id="MID")
+        self.assertTrue(any("unknown" in p for p in bad["problems"]))

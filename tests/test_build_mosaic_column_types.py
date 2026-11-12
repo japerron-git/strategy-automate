@@ -247,6 +247,17 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(out["aligned"], ["attribute 'Status'"])
         self.assertIn("republish", out["next"])
 
+    def test_a_date_form_gets_the_date_role(self):
+        routes = _routes()
+        routes[("GET", f"{MP}/attributes/A1")]._body["forms"][0]["semanticRole"] = "month"   # an integer yyyyMM
+        fake = _Fake(routes)
+        _run(fake, _args(set=[["STATUS CODE", "date", "yyyyMM"]]))
+        form = next(kw["json"] for m, p, kw, _ in fake.calls if (m, p) == ("PATCH", f"{MP}/attributes/A1"))["forms"][0]
+        self.assertEqual((form["dataType"]["type"], form["displayFormat"], form["semanticRole"]), ("date", "date", "date"))
+        table = next(kw["json"] for m, p, kw, _ in fake.calls if (m, p) == ("PATCH", f"{MP}/tables/T1"))
+        col = next(c for c in table["physicalTable"]["columns"] if c["columnName"] == "STATUS CODE")
+        self.assertEqual((col["dataType"]["type"], col["format"]), ("date", "yyyyMM"))   # as Studio stores it
+
     def test_forms_already_aligned_by_the_service(self):
         routes = _routes(attr_type=TXT)
         attr = routes[("GET", f"{MP}/attributes/A1")]._body

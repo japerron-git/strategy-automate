@@ -167,3 +167,23 @@ Always tell the helper how to sign in per tenant: `MSTR_AUTH_METHOD` (`sso` for 
 
 ## Session cap
 - Canonical coverage: `feedback_build_mosaic_session_leak.md` — symptom (`500 Maximum number of interactive session per user for project exceeded …`, `8004cb0a` / iServerCode `-2147072486`), the one-session-per-pipeline rule (one process or `MSTR_REUSE_SESSION=1`), try/finally `m.logout()`, and recovery. (Earlier guidance here to wait 5–10 min after capping is superseded: iServer reaps project-interactive sessions on a ~30-min idle timer — budget the full 30 minutes and do not paper over with retries.)
+
+## Dates stored as numbers, and time attributes (from a Studio-built model export, 2026-11-12)
+- A yyyyMM integer column typed as a date in Studio is stored as `dataType: {type: date, precision: 0,
+  scale: 0}` plus `format: "yyyyMM"` on the physical column AND on the pipeline column; `sourceDataType`
+  stays integer. The attribute form gets `dataType: date`, `displayFormat: "date"`, `semanticRole: "date"`
+  (an integer yyyyMM form had `"month"`), and the attribute a display format (`format.values`:
+  `number_category` "7", `number_format` "yyyyMM"). `set-column-types ... date yyyyMM` writes the column and
+  form shape; the attribute display format is not written (not needed for the connector).
+- A **date** base takes time attributes (timestamp is not required): `smartAttributes` on the attribute,
+  `smartAttributeType` `day_interval`, `week_interval`, `month_interval`, `quarter_interval`,
+  `year_interval`, each with forms ID (integer), Start (timestamp) and DESC (text). On the connector:
+  `<date> (month)__id` = 202201 (the yyyyMM value), `__start`, `__desc` = "2022-01"; quarter id 202201 for
+  2022-Q1, desc "2022-Q1"; year id 2022. Grouping by them aggregates correctly (unlike GROUP BY an
+  expression of the number). No 15-minute interval appears for a date base.
+- Write: `PUT /api/model/dataModels/{id}/attributes/{attributeId}/smartAttributes` in a changeset, body
+  `{"smartAttributes": [{"subType": "attribute_smart", "objectId"?: <existing>, "definition":
+  {"smartAttributeType": "month_interval", "parameters": [], "ascending": true}}]}`. It replaces the whole
+  set: send existing ones with their objectId. `build_mosaic.py add-time-attributes` does this. Not yet run
+  live (documented REST shape + export shape); republish afterwards.
+

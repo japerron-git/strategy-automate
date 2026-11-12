@@ -157,8 +157,9 @@ python3 assess_model.py lookups --project "<project>" --scope scope.json \
 ```
 
 Recommends lookup tables where the model needs them: coded attributes with no description form
-(codes explained only in a description, or not at all), a period table with calendar parents and a
-latest-period flag when there is none (point-in-time metrics otherwise resolve "latest" per group),
+(codes explained only in a description, or not at all), time attributes for every date (converting a
+number stored as a date first — it is always a finding, whatever parents it has), a period table with
+just a latest-period flag when there is none (point-in-time metrics otherwise resolve "latest" per group),
 and an optional entity table. **Offer the user the CSVs**: the script writes a template per lookup
 with the key values taken from the data; fill the description columns only from cited sources (the
 user's documents or the provider's dictionary, step 2) and name the source in the `source` column —

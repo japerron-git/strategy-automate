@@ -69,15 +69,18 @@ REPUBLISH_PHASES = (1, 2, 3)
 ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_derived_metric",
                 "create_level_metric", "create_weighted_average", "patch_model_object", "patch_fact_metrics",
                 "add_lookup_table", "change_column_type", "source_change", "wire_relationships",
-                "create_formula_attribute", "add_column_attribute", "rename_describe", "publish", "certify",
-                "manual")
+                "create_formula_attribute", "add_column_attribute", "add_time_attributes", "rename_describe",
+                "publish", "certify", "manual")
 COLUMN_TYPES = ("text", "integer", "bigint", "double", "date", "timestamp")   # build_mosaic.py set-column-types
 # Changes made once for the whole plan, at the start of one phase; other phases get a note.
-MERGED_KINDS = {"source_change": 1, "change_column_type": 2, "wire_relationships": 3, "rename_describe": 6}
+MERGED_KINDS = {"source_change": 1, "change_column_type": 2, "wire_relationships": 3, "add_time_attributes": 3,
+                "rename_describe": 6}
 MERGED_NOTES = {"source_change": "Source change done in the phase {phase} rebuild",
                 "change_column_type": "Column type change done in phase {phase} (set-column-types)",
                 "wire_relationships": "Relationships declared in phase {phase} (wire-relationships)",
+                "add_time_attributes": "Time attributes added in phase {phase} (add-time-attributes)",
                 "rename_describe": "Names and descriptions set in phase {phase} (rename-describe)"}
+TIME_ATTRIBUTES_SPEC = "specs/time_attributes.json"
 RENAME_DESCRIBE_SPEC = "specs/rename_describe.json"
 # A republish of a large model runs well past publish's 180 s default; the wait ends as soon as every table is done.
 PUBLISH_WAIT = ["--poll-seconds", "1800"]
@@ -549,6 +552,24 @@ def looks_like_integer_date(attr: dict) -> bool:
 
 
 _HELPER_METRIC = re.compile(r"\b(numerator|denominator|helper)\s*$", re.I)
+TIME_INTERVALS = ("year", "quarter", "month", "week", "day")
+
+
+def has_time_attributes(name: str, all_names: list[str]) -> bool:
+    """Studio's time attributes show on the connector as '<date> (<interval>)__id / __start / __desc'."""
+    pre = name.lower() + " ("
+    return any(n.lower().startswith(pre) and n.lower().endswith(")__id")
+               and n.lower()[len(pre):-len(")__id")] in TIME_INTERVALS for n in all_names)
+
+
+def date_pattern(attr: dict) -> str:
+    """The pattern a number stored as a date follows (for set-column-types), from its profile or description."""
+    prof = attr.get("profile") or {}
+    v = _plain_number(prof.get("max")) or _plain_number(prof.get("min"))
+    if v and v.isdigit():
+        return "yyyyMM" if len(v) == 6 else "yyyyMMdd" if len(v) == 8 else ""
+    hit = re.search(r"\bYYYY-?MM(-?DD)?\b", attr.get("description") or "", re.I)
+    return ("yyyyMMdd" if hit.group(1) else "yyyyMM") if hit else ""
 
 
 def maturity_signals(scope: dict) -> dict[str, Any]:
@@ -569,11 +590,10 @@ def maturity_signals(scope: dict) -> dict[str, Any]:
     latest_flag = any(("latest" in n or "current period" in n or "is current" in n) for n in names)
     names = names + [n.split("__", 1)[0] for n in names if "__" in n]
     constants = [a["name"] for a in attrs if (a.get("profile") or {}).get("distinct_values") == 1]
-    # A date stored as a number is a defect only without calendar parents (its own "<date> year", or for the
-    # reporting period a period lookup with a year and a latest flag).
-    integer_dates = [a["name"] for a in attrs if looks_like_integer_date(a)
-                     and not (f"{a['name'].lower()} year" in names
-                              or (re.search(r"period|month", a["name"], re.I) and "year" in names and latest_flag))]
+    # A date stored as a number (yyyyMM, yyyyMMdd) is a defect whatever parents it has: converted to a date it
+    # takes time attributes (year, quarter, month intervals) that group correctly and enable time-intelligence
+    # metrics; lookups for its parents are the fallback when it can't be converted.
+    integer_dates = [a["name"] for a in attrs if looks_like_integer_date(a)]
     summed_nonadditive = [m["name"] for m in metrics if m.get("formula") and
                           re.match(r"^sum\(", m["formula"].strip(), re.I) and _SUMMED_NONADDITIVE.search(_words(m["name"]))]
     text_metrics = [m["name"] for m in metrics if m.get("type", "").lower() in ("varchar", "char", "string", "text")]
@@ -592,7 +612,12 @@ def maturity_signals(scope: dict) -> dict[str, Any]:
             "metrics_that_look_like_attributes": attribute_like_metrics,
             "numeric_attributes": numeric_attributes, "decoded_codes": decoded,
             "latest_period_flag": latest_flag, "single_value_attributes": constants,
-            "dates_stored_as_numbers": integer_dates, "summed_rates_scores_or_ages": summed_nonadditive,
+            "dates_stored_as_numbers": integer_dates,
+            "dates_without_time_attributes": [a["name"] for a in attrs if "__" not in a["name"]
+                                              and (a.get("type", "").lower() in ("date", "timestamp")
+                                                   or looks_like_integer_date(a))
+                                              and not has_time_attributes(a["name"], [x["name"] for x in attrs])],
+            "summed_rates_scores_or_ages": summed_nonadditive,
             "metrics_stored_as_text": text_metrics,
             "note": "estimate from names, descriptions and formulas; confirm during the assessment"}
 
@@ -1449,8 +1474,23 @@ def _has_description_sibling(name: str, names: list[str]) -> bool:
     return False
 
 
+def _entity_table_suggestion(relationships: dict) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    static = (relationships.get("suggestions") or {}).get("entity_level_attributes") or []
+    if len(static) >= 5:
+        out.append({"id": "L-entity", "kind": "entity_table", "attribute": relationships.get("entity"),
+                    "reason": f"{len(static)} attributes are fixed per entity but repeat on every fact row; "
+                              "an entity table is optional — recommend it only if it fixes a question "
+                              "(counts, once-per-entity amounts) or the fact is large",
+                    "columns": [relationships.get("entity")] + static[:50]})
+    return out
+
+
 def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 200,
-                       relationships: dict | None = None) -> list[dict[str, Any]]:
+                       relationships: dict | None = None, time_attributes: bool = True) -> list[dict[str, Any]]:
+    """Lookups and calendar parents. Calendar parents (year, quarter, month) come from time attributes on a date
+    (converting a number stored as a date first); with time_attributes=False they come from lookup CSVs instead,
+    the fallback when a column can't be converted."""
     attrs = scope.get("attributes") or []
     names = [a["name"] for a in attrs]
     out: list[dict[str, Any]] = []
@@ -1489,6 +1529,34 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
             period_attr = max(dated, key=lambda a: (bool(preferred.search(_words(a["name"]))),
                                                     _distinct(a) or 0))["name"]
     latest = any("latest" in n.lower() or "current period" in n.lower() for n in names)
+    if time_attributes:
+        for a in attrs:
+            if "__" in a["name"] or (_distinct(a) or 0) < 2:
+                continue
+            is_date = a.get("type", "").lower() in ("date", "timestamp")
+            if not (is_date or looks_like_integer_date(a)) or has_time_attributes(a["name"], names):
+                continue
+            pattern = "" if is_date else date_pattern(a)
+            month_grain = pattern == "yyyyMM"
+            out.append({"id": f"T-{_slug(a['name'])}", "kind": "time_attributes", "attribute": a["name"],
+                        "convert": {"type": "date", "date_format": pattern} if pattern else None,
+                        "intervals": ["year", "quarter", "month"] if month_grain or is_date
+                        else ["year", "quarter", "month", "day"],
+                        "reason": ("a date stored as a number: convert it to a date (change_column_type, "
+                                   f"date_format {pattern}), then add time attributes" if pattern else
+                                   "a date without time attributes") +
+                                  " (add_time_attributes): year, quarter and month intervals that group correctly, "
+                                  "enable time-intelligence metrics, and need no lookup table",
+                        "columns": [], "new_forms": [], "new_attributes": []})
+        if period_attr and not latest:   # time attributes give the calendar, not "latest": a small lookup does
+            out.append({"id": f"L-{_slug(period_attr)}", "kind": "period_lookup", "attribute": period_attr,
+                        "reason": "no latest-period flag: point-in-time metrics resolve 'latest' per group without "
+                                  "one (calendar parents come from the period's time attributes)",
+                        "columns": [period_attr, "latest period flag"],
+                        "new_forms": [], "new_attributes": ["latest period flag"]})
+        if relationships:
+            out += _entity_table_suggestion(relationships)
+        return out
     if period_attr and not latest:
         out.append({"id": f"L-{_slug(period_attr)}", "kind": "period_lookup", "attribute": period_attr,
                     "reason": "no latest-period flag: point-in-time metrics resolve 'latest' per group without one, "
@@ -1512,13 +1580,7 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                     "columns": [a["name"], year, f"{a['name']} quarter"],
                     "new_forms": [], "new_attributes": [year, f"{a['name']} quarter"]})
     if relationships:
-        static = (relationships.get("suggestions") or {}).get("entity_level_attributes") or []
-        if len(static) >= 5:
-            out.append({"id": "L-entity", "kind": "entity_table", "attribute": relationships.get("entity"),
-                        "reason": f"{len(static)} attributes are fixed per entity but repeat on every fact row; "
-                                  "an entity table is optional — recommend it only if it fixes a question "
-                                  "(counts, once-per-entity amounts) or the fact is large",
-                        "columns": [relationships.get("entity")] + static[:50]})
+        out += _entity_table_suggestion(relationships)
     return out
 
 
@@ -1549,7 +1611,7 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
     known: dict[str, Any] = {}
     wanted: dict[str, float] = {}
     for sug in suggestions:
-        if sug["kind"] == "entity_table":
+        if sug["kind"] in ("entity_table", "time_attributes"):
             continue
         prof = profiles.get(sug["attribute"], {})
         if prof.get("values") is not None and prof.get("distinct_values") is not None \
@@ -1562,6 +1624,9 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
     for sug in suggestions:
         if sug["kind"] == "entity_table":
             done.append({**sug, "csv": None, "note": "not generated: build it from the source extract if approved"})
+            continue
+        if sug["kind"] == "time_attributes":
+            done.append({**sug, "csv": None, "note": "no CSV: a type change (if needed) and add_time_attributes"})
             continue
         got = known.get(sug["attribute"])
         if got == "pending":
@@ -1581,7 +1646,8 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
             _write_csv(path, sug["columns"], [[v, *_period_parts(v)[:2]] for v in values])
         else:
             latest = max(values) if values else None
-            _write_csv(path, sug["columns"], [[v, *_period_parts(v), "Y" if v == latest else "N"] for v in values])
+            parts = (lambda v: _period_parts(v)) if len(sug["columns"]) > 2 else (lambda v: ())
+            _write_csv(path, sug["columns"], [[v, *parts(v), "Y" if v == latest else "N"] for v in values])
         entry = {**sug, "csv": path, "rows": len(values)}
         if dropped:
             entry["note"] = (f"dropped {sorted(dropped)}: outside the attribute's min/max, so a NULL rendered as a "
@@ -2126,6 +2192,12 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         argv = base + ["set-column-types", "--model-id", model_id] + column_type_set_args([a])
         opt(argv, "--table", "table")
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
+    if kind == "add_time_attributes":
+        bad = [x for x in a.get("intervals") or [] if str(x).lower() not in TIME_INTERVALS]
+        if not a.get("attribute") or not a.get("intervals") or bad:
+            problems.append(f"{kind}: args need attribute and intervals from {', '.join(TIME_INTERVALS)}"
+                            + (f" (unknown: {bad})" if bad else ""))
+        return {"dry_run": [], "apply": [], "manual": None, "problems": problems}
     if kind == "rename_describe":
         items = a.get("items")
         if not isinstance(items, list) or not items:
@@ -2359,6 +2431,18 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
              "dry_run": cmd(argv + ["--dry-run"]), "apply": cmd(argv), "manual": None,
              "risks": ["Takes effect at once (no republish). Derived metrics keep working after a rename: "
                        "they refer to objects by id."]})
+    if merged["add_time_attributes"]:
+        tas = merged["add_time_attributes"]
+        files[TIME_ATTRIBUTES_SPEC] = {"items": [{"attribute": c.get("attribute"), "intervals": c.get("intervals")}
+                                                 for c in tas]}
+        argv = [python, BUILD_SCRIPT, "add-time-attributes", "--model-id", mid, "--spec", TIME_ATTRIBUTES_SPEC]
+        merged_steps.setdefault(MERGED_KINDS["add_time_attributes"], []).append(
+            {"finding": ", ".join(dict.fromkeys(c["finding"] for c in tas)),
+             "title": "Add time attributes", "kind": "add_time_attributes",
+             "dry_run": cmd(argv + ["--dry-run"]), "apply": cmd(argv), "manual": None,
+             "risks": ["Runs after the phase 2 type change and republish: a number stored as a date takes time "
+                       "attributes only once it is a date. Analysts' filters on the number become filters on "
+                       "'<date> (month)__id' (same yyyyMM values)."]})
     merged_findings = {k: {c["finding"] for c in v} for k, v in merged.items()}
     retyped_to = {str(c.get("column") or "").casefold(): (str(c.get("type") or "").lower(), c.get("date_format") or "")
                   for c in merged["change_column_type"]}
@@ -2856,6 +2940,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--round", type=int, default=None)
 
     sp = sub.add_parser("lookups", help="recommend lookup tables and write CSV templates for them")
+    sp.add_argument("--calendar-lookups", action="store_true",
+                    help="calendar parents from lookup CSVs instead of time attributes (when a date column can't be "
+                         "converted)")
     sp.add_argument("--project", required=True)
     sp.add_argument("--scope", required=True)
     sp.add_argument("--out", required=True)
@@ -3015,7 +3102,8 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
     if args.cmd == "lookups":
         scope = _load_json(args.scope)
         rel = _load_json(args.relationships) if args.relationships else None
-        sugg = lookup_suggestions(scope, period=args.period, max_code_values=args.max_code_values, relationships=rel)
+        sugg = lookup_suggestions(scope, period=args.period, max_code_values=args.max_code_values, relationships=rel,
+                                  time_attributes=not args.calendar_lookups)
         built = build_lookups(runner(), args.project, scope, sugg, args.csv_dir, where=args.where)
         _write_json(args.out, {"version": 1, "model": scope.get("model"), "lookups": built})
         if _pending(runner):

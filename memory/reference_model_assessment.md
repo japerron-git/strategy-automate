@@ -43,7 +43,9 @@ must be an ancestor of the report rows, `reference_mosaic_derived_metrics.md` §
 ## Lookup tables
 
 `assess_model.py lookups` recommends: **code lookups** (coded text attributes with no description
-form or attribute), a **period lookup** (calendar parents + latest-period flag, when no flag exists)
+form or attribute), **time attributes** for every date (a number stored as a date — yyyyMM, yyyyMMdd —
+is converted first; calendar parents then come from year/quarter/month intervals, no CSV), a **period
+lookup** for the latest-period flag only (when no flag exists; time attributes give no "latest"),
 and, optionally, an **entity table** (many attributes fixed per entity). It writes CSV templates with
 the key values from the data; description columns are filled only from cited sources (user documents,
 provider dictionary), with the source named per row, or left for the user. Add a lookup by mapping its
@@ -351,9 +353,10 @@ label column is listed as an attribute that no metric filters on.
   changed and reloaded.
 - **Where a new column comes from, in order of preference:**
   1. **A lookup table** for anything that depends on one attribute's value: descriptions, groups and
-     flags of a code (`code_lookup`), calendar parents of a date (`date_lookup`: year and quarter; the
-     reporting period's `period_lookup` adds the latest-period flag). A lookup is fast at run time, and it
-     can be replaced later without deleting the metrics built on it.
+     flags of a code (`code_lookup`), the latest-period flag (`period_lookup`). A lookup is fast at run
+     time, and it can be replaced later without deleting the metrics built on it. Calendar parents of a
+     date are **time attributes** (`add_time_attributes`, after `change_column_type` for a number stored
+     as a date); lookups for them (`lookups --calendar-lookups`) only when the column can't be converted.
   2. **A derived metric** for any calculation over measures. Create these freely.
   3. **A derived (formula) attribute** (`create_formula_attribute`) only when the user asks for one:
      it costs at run time, and a derived metric that filters on it or counts it is deleted if the
