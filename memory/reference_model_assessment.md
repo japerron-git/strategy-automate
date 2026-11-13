@@ -330,7 +330,10 @@ each round (assessment and every verification) tests two outcomes:
   nothing. Grouping alone misses a filter that is ignored when the attribute isn't selected (seen live:
   a flag filter returning a count unrelated to its group), so each attribute is also filtered on its
   smallest value and the count compared with that value's group. Every attribute is tested, by its key
-  form when it has several forms, except against a fact table it is mapped to directly. A raw fact
+  form when it has several forms; one mapped directly to a fact table can't cross-join it, but its filter
+  is still tested. Verified live: a filter is dropped when the attribute has no parent-child
+  relationship to the attribute its table joins the fact through (grouping still works through the
+  shared column). Numbers come back with thousands separators ("201,812"), so filter values lose them. A raw fact
   metric names a table before its column; `Sum({Other Metric})` is derived and never an anchor. Exports
   keep fact-metric expressions under `fact` and relationships under `hierarchy.relationships`. With the export it also checks which tables each attribute reaches and compares the declared
   relationships with the last round (lost ones are findings). In a model with several fact tables an

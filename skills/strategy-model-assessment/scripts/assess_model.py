@@ -935,8 +935,8 @@ def _sql_literal(value: Any, typ: str = "") -> str:
     """A literal for a value read back as text: unquoted only for a numeric column (a varchar holding digits
     compared with a number is a type error)."""
     text = str(value)
-    if (typ or "").lower() in _NUMERIC and re.fullmatch(r"-?\d+(\.\d+)?", text):
-        return text
+    if (typ or "").lower() in _NUMERIC and re.fullmatch(r"-?\d{1,3}(,\d{3})+(\.\d+)?|-?\d+(\.\d+)?", text.strip()):
+        return text.strip().replace(",", "")   # the connector shows thousands separators ("201,812")
     return "'" + text.replace("'", "''") + "'"
 
 
@@ -1789,7 +1789,13 @@ def join_path_sql(model: str, attribute: str, anchor: str, where: str = "") -> s
 
 
 def _typed_literal(value: Any, typ: str) -> str:
+    """A literal of the attribute's type. The connector shows numbers with thousands separators
+    ("201,812"), so a numeric value loses them and is written unquoted."""
     t = (typ or "").lower()
+    if t in _NUMERIC or t.startswith(("decimal", "numeric")):
+        raw = str(value).strip()
+        if re.fullmatch(r"-?\d{1,3}(,\d{3})+(\.\d+)?|-?\d+(\.\d+)?", raw):
+            return raw.replace(",", "")
     text = str(value).replace("'", "''")
     if t.startswith("date"):
         return f"DATE '{text[:10]}'"
@@ -1872,9 +1878,9 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
         log(f"join paths against {anchor}: {len(todo)} attributes")
         for att in todo:
             n = att["name"]
+            # mapped to this fact table directly: it can't cross-join it, but its filter still needs testing
             if att["tables"] is not None and ftable and ftable.casefold() in {t.casefold() for t in att["tables"]}:
-                skipped.setdefault(anchor, []).append(n)   # mapped to this fact table directly
-                continue
+                skipped.setdefault(anchor, []).append(n)
             try:
                 parsed = parse_query_result(runner.call("query", {"project": project,
                                                                   "query": join_path_sql(model, n, anchor, where)}))
@@ -1964,19 +1970,26 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
             "fact's column (or the lookup table's key to an attribute the fact has), or remove the attribute. Say "
             "which, or decline if it is meant to stand alone.", round_no=round_no,
             impact="high" if none else "medium", source="join-paths"))
+    rels = graph.get("relationships") or []
     for n, probs in sorted(filter_problems.items()):
         if n in unjoined:
             continue
         mets = [x["metric"] for x in filtering if x["attribute"] == n]
+        base = (_FORM_NAME.match(n).group("base") if _FORM_NAME.match(n) else n).lower()
+        mine = [f"{r['parent']} -> {r['child']}" for r in rels if base in (r["parent"], r["child"])]
+        rel_note = ("" if not graph else f". Declared relationships: {mine}" if mine else
+                    ". The export declares no relationship for it: a filter on an attribute that isn't selected "
+                    "needs one to the attribute its table joins the fact through")
         detail = "; ".join(f"with {p['anchor']}: {n} = {p['value']!r} counts {p['filtered']} rows filtered, "
                            f"{p['grouped']} grouped" + (" (the full total: the filter is ignored)"
                                                         if p["verdict"] == "ignored" else "") for p in probs)
         findings.append(integrity_finding(
             f"J-filter-{_slug(n)}", f"Filtering on '{n}' doesn't filter the fact", "relationship",
-            detail + (f". Metrics that filter on it: {mets}" if mets else ""),
-            "Grouped by the attribute the counts are right, but a filter on it alone isn't applied to the fact "
-            "(its table's join to the fact is missing or goes another way). Fix the join or relationship; say "
-            "which, or decline.", round_no=round_no, source="join-paths"))
+            detail + rel_note + (f". Metrics that filter on it: {mets}" if mets else ""),
+            "Grouped by the attribute the counts are right, but a filter on it alone isn't applied to the fact: "
+            "usually a missing parent-child relationship to the attribute its table joins the fact through. "
+            "Create the relationship (wire_relationships); say which, or decline.", round_no=round_no,
+            source="join-paths"))
     for r in changes.get("lost") or []:
         findings.append(integrity_finding(
             f"L-{_slug(r['parent'])}-{_slug(r['child'])}", f"Relationship {r['parent']} -> {r['child']} was lost",
@@ -1984,9 +1997,8 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
             "Restore it (wire_relationships), or decline if the change was intended. Metrics and SQL that filter "
             "on the parent may now repeat totals or ignore the filter.", round_no=round_no, source="join-paths"))
     return {"version": 2, "model": model, "facts": facts, "attributes": results,
-            "skipped_mapped_to_fact": skipped,
-            "not_tested": [t["name"] for t in todo if t["name"] not in results and
-                           not any(t["name"] in v for v in skipped.values())] if runner is not None
+            "mapped_to_fact": skipped,
+            "not_tested": [t["name"] for t in todo if t["name"] not in results] if runner is not None
             else [t["name"] for t in todo],
             "unjoined": unjoined, "filter_problems": filter_problems, "metrics_filtering_flagged": filtering,
             "export": {k: v for k, v in graph.items() if k != "relationships"} if graph else None,

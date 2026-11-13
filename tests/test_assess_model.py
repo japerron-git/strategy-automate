@@ -2398,9 +2398,31 @@ class JoinPathTests(unittest.TestCase):
         runner = _ErrRunner(lambda sql: [["n"], ["100"]] if "GROUP BY" not in sql and "WHERE" not in sql else
                             [["n"], ["30"]] if "WHERE" in sql else [["v", "n"], ["r1", "30"], ["r2", "70"]])
         out = am.check_join_paths(runner, "P", scope, export=self.EXPORT)
-        self.assertEqual(out["skipped_mapped_to_fact"], {"net sales": ["store"]})
+        self.assertEqual(out["mapped_to_fact"], {"net sales": ["store"]})
+        self.assertEqual(out["attributes"]["store"]["net sales"]["filter"]["verdict"], "ok")   # still tested
         self.assertEqual(out["attributes"]["region"]["net sales"]["verdict"], "joined")
         self.assertEqual(out["attributes"]["region"]["net sales"]["filter"]["verdict"], "ok")
+
+    def test_ignored_filter_names_the_missing_relationship(self):
+        scope = {"model": "Store Sales", "anchor": {"metric": "net sales"},
+                 "metrics": [{"name": "net sales", "type": "double", "formula": "sum(facts.csv.{NET SALES})"}],
+                 "attributes": [{"name": "promo", "type": "varchar"}, {"name": "region", "type": "varchar"}]}
+
+        def answer(sql):
+            if "GROUP BY" in sql:
+                return [["v", "n"], ["x", "30"], ["y", "70"]]
+            return [["n"], ["100"]]          # the total, and every filter: ignored
+        out = am.check_join_paths(_ErrRunner(answer), "P", scope, export=self.EXPORT)
+        f = {x["id"]: x for x in out["findings"]}
+        self.assertIn("declares no relationship", f["J-filter-promo"]["evidence"]["observed"])
+        self.assertIn("region -> store", f["J-filter-region"]["evidence"]["observed"])
+
+    def test_numeric_filter_values_lose_thousands_separators(self):
+        self.assertEqual(am._typed_literal("201,812", "bigint"), "201812")
+        self.assertEqual(am._typed_literal("5", "integer"), "5")
+        self.assertEqual(am._typed_literal("1,234.5", "double"), "1234.5")
+        self.assertEqual(am._typed_literal("201,812", "varchar"), "'201,812'")
+        self.assertEqual(am._sql_literal("201,812", "bigint"), "201812")      # the probe's filters too
 
     def test_merge_findings_keeps_answers(self):
         doc = {"findings": [{"id": "J-region", "status": "declined", "evidence": {"observed": "old"}}]}

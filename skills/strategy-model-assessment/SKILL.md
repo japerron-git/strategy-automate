@@ -163,7 +163,8 @@ total is a cross join; an error naming a join is the same verdict. It then filte
 non-blank value alone (`WHERE attr = v`): the count must equal that value's group; the full total means
 the filter is ignored when the attribute isn't selected, any other count is a mismatch. Every attribute
 is tested by its own connector name (a multi-form attribute by its key form; time intervals left out;
-one value plus blanks is two groups), except against a fact table it is mapped to directly (export).
+one value plus blanks is two groups); one mapped directly to a fact table can't cross-join it, but its
+filter is still tested. An ignored filter usually means a missing parent-child relationship.
 Only metrics that read a table's column count as facts (`Sum({Other Metric})` is derived). With the
 export it also says which tables each attribute reaches and records the declared relationships
 (`hierarchy.relationships`), so the next round reports those lost; no comparison when either round has
