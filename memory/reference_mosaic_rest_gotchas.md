@@ -193,3 +193,13 @@ Always tell the helper how to sign in per tenant: `MSTR_AUTH_METHOD` (`sso` for 
 - After a conversion, a description that says how the value was stored ("stored as YYYYMM integer") is
   wrong: change it in the same finding (`rename_describe`).
 
+
+## File tables: the import settings decide how a reload splits (verified live, 2026-11-13)
+
+- A file table's import settings are in the model export under the pipeline's `importSource.dataOptions`:
+  separator, quote character, header row, encoding.
+- With no quote character (`quote = ""`), the loader splits on **every** separator, quotes included:
+  a reloaded file whose value was quoted to hide a comma loaded with its columns shifted. Verified by
+  loading such a file by hand. Write a reload file in the table's own format, keep the separator,
+  quotes and line breaks out of values, and give it exactly the table's columns (an extra column such as
+  `source` breaks a straight reload). `assess_model.py check-lookup` checks a file against these rules.

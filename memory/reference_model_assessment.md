@@ -83,7 +83,8 @@ Templates are written in the table's own load format (the export's import settin
 quote character, header row, encoding; a new table uses the format most of the model's tables use),
 with no `source` column: a column the table lacks breaks a reload. Sources go in the
 `<file>_sources.csv` beside it, which is not loaded. With no quote character a value can't hold the
-separator, a double quote or a line break (rephrase it; never switch separators on your own).
+separator, a double quote or a line break (rephrase it; never switch separators on your own): verified
+live, the loader splits on every separator when the table has no quote character.
 `check-lookup --lookups lookups.json --id <id> --csv <file> --record` confirms a filled file is
 load-ready (every line splits into the table's columns, the header matches exactly, the existing
 columns are unchanged from the template row for row, blanks still blank); with `--project` after a
