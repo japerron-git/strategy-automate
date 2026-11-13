@@ -62,7 +62,11 @@ answer as `"<attribute> (<form>)"`; make them visible instead of duplicating the
 form is reported too, and is the worse case: nobody can filter or group on the codes. The connector may
 list an attribute only through a form (`"<attribute>__code"`, `"<attribute> (id)"`); the export still
 attaches it to its table, and a table's key is the attribute whose form reads the fact as well (the
-join), queried by its connector name, so blank keys are counted on that join column. Without the export
+join), queried by its connector name, so blank keys are counted on that join column. An attribute
+belongs to every table its forms read, not only its lookup-table setting: the join attribute often has
+the fact as its lookup table, and a description table may be set on no attribute. Each table's columns
+are read through the form expression on that table (a period reads one column in the fact and
+another in a calendar map). Hidden-form entries carry `key_form`. Without the export
 the headers are connector names: don't replace a table from such a CSV. Time-attribute suggestions name
 the table the column lives in (converting it changes the table for every model reading that file).
 Then it recommends:

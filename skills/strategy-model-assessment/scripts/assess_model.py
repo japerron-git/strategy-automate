@@ -1579,8 +1579,15 @@ def export_forms(scope: dict, export: dict | None) -> dict[str, dict[str, Any]]:
         key_id = (a.get("keyForm") or {}).get("id")
         forms, tables = [], []
         for f in a.get("forms") or []:
+            by_table: dict[str, str] = {}   # a form can read a column in several tables (the fact and a lookup)
             for e in f.get("expressions") or []:
-                tables += [str(t.get("name")) for t in e.get("tables") or [] if t.get("name")]
+                et = (e.get("expression") or {}).get("text") or ""
+                ecol = et[1:-1] if re.fullmatch(r"\[[^\[\]]+\]", et.strip()) else ""
+                for t in e.get("tables") or []:
+                    if t.get("name"):
+                        tables.append(str(t["name"]))
+                        if ecol:
+                            by_table.setdefault(str(t["name"]), ecol)
             text = ((f.get("expressions") or [{}])[0].get("expression") or {}).get("text") or ""
             col = text[1:-1] if re.fullmatch(r"\[[^\[\]]+\]", text.strip()) else ""
             fname = str(f.get("name") or "").lower()
@@ -1589,6 +1596,7 @@ def export_forms(scope: dict, export: dict | None) -> dict[str, dict[str, Any]]:
                      else [f"{cname}__{fname}", f"{cname} ({fname})"])
             visible = next((c for c in cands if c.casefold() in listed), None)
             forms.append({"form": f.get("name"), "category": f.get("category"), "column": col, "key": is_key,
+                          "columns_by_table": by_table,
                           "visible": bool(visible), "query_as": visible or f"{cname} ({fname})",
                           "describes": not is_key and bool(_DESC_FORM.search(f"{f.get('name')} {f.get('category')}"))})
         out[cname] = {"table": (a.get("attributeLookupTable") or {}).get("name"), "forms": forms,
@@ -1623,18 +1631,28 @@ def existing_lookup_tables(scope: dict, *, relationships: dict | None = None, pr
         fact_tables = {str(tb.get("name")) for fm in model.get("factMetrics") or []
                        for e in (fm.get("fact") or fm).get("expressions") or [] for tb in e.get("tables") or []}
         by_table: dict[str, list[str]] = {}
+        declared: dict[str, str] = {}
         for a in model.get("attributes") or []:
             t = (a.get("attributeLookupTable") or {}).get("name")
             raw = str((a.get("information") or {}).get("name") or "").casefold()
             n = names.get(raw) or (raw if raw in forms else None)
-            if t and n:
+            if not n:
+                continue
+            # the connector may list it only through a form ("zero balance__code"): profiles, relationships and
+            # queries use that name
+            key_form = next((f for f in (forms.get(n.lower()) or {}).get("forms", []) if f["key"]), None)
+            conn[n] = n if n.casefold() in names else (key_form["query_as"] if key_form else n)
+            if t:
+                declared[n] = t
                 by_table.setdefault(t, []).append(n)
-                # the connector may list it only through a form ("zero balance__code"): profiles, relationships and
-                # queries use that name
-                key_form = next((f for f in (forms.get(n.lower()) or {}).get("forms", []) if f["key"]), None)
-                conn[n] = n if n.casefold() in names else (key_form["query_as"] if key_form else n)
         if not fact_tables and by_table:   # no metrics read in the export: the table most attributes use is the fact
             fact_tables = {max(by_table, key=lambda t: len(by_table[t]))}
+        # an attribute also belongs to every other table its forms read: the attribute that joins a mapping table
+        # to the fact often has the fact as its lookup table, and a description table may be set on no attribute
+        for n in list(conn):
+            for t in (forms.get(n.lower()) or {}).get("tables", []):
+                if t not in fact_tables and n not in by_table.setdefault(t, []):
+                    by_table[t].append(n)
         for t, attrs in by_table.items():
             if t in fact_tables:
                 continue
@@ -1643,13 +1661,15 @@ def existing_lookup_tables(scope: dict, *, relationships: dict | None = None, pr
             read_as: dict[str, str] = {}
             for n in attrs:   # a column read by several forms: prefer one the connector lists, else the first
                 for f in (forms.get(n.lower()) or {}).get("forms", []):
-                    if f["column"] and (f["column"] not in read_as or f["visible"] and not read_as.get("_v_" + f["column"])):
-                        read_as[f["column"]] = f["query_as"]
+                    col = (f.get("columns_by_table") or {}).get(t) or ("" if f.get("columns_by_table") else f["column"])
+                    if col and (col not in read_as or f["visible"] and not read_as.get("_v_" + col)):
+                        read_as[col] = f["query_as"]
                         if f["visible"]:
-                            read_as["_v_" + f["column"]] = "1"
+                            read_as["_v_" + col] = "1"
             read_as = {k: v for k, v in read_as.items() if not k.startswith("_v_")}
             groups[t] = {"attributes": attrs, "columns": [c for c in cols if c], "source": "model export",
                          "read_as": read_as, "connector_names": {n: conn.get(n, n) for n in attrs},
+                         "declared": [n for n in attrs if declared.get(n) == t],
                          # attributes whose forms read the fact too: the columns that join the table to the fact
                          "joins_fact": [n for n in attrs if set((forms.get(n.lower()) or {}).get("tables", []))
                                         & fact_tables],
@@ -1707,8 +1727,12 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
     names = [a["name"] for a in attrs]
     out: list[dict[str, Any]] = []
     existing = existing_lookup_tables(scope, relationships=relationships, probes=probes, export=export)
-    in_table = {n: t for t, g in existing.items() for n in g["attributes"]}
-    in_table.update({c: t for t, g in existing.items() for c in (g.get("connector_names") or {}).values()})
+    in_table: dict[str, str] = {}
+    for t, g in existing.items():   # an attribute in several tables: its own lookup first
+        for n in g["attributes"]:
+            for name in {n, (g.get("connector_names") or {}).get(n, n)}:
+                if name not in in_table or n in (g.get("declared") or []):
+                    in_table[name] = t
     extend: dict[str, list[str]] = {}
     for a in attrs:
         prof = a.get("profile") or {}
@@ -1777,7 +1801,7 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
     for h in hidden_forms(scope, export):
         out.append({"id": f"H-{_slug(h['attribute'])}-{_slug(str(h['form']))}", "kind": "hidden_form",
                     "attribute": h["attribute"], "form": h["form"], "category": h["category"],
-                    "query_as": h["query_as"],
+                    "query_as": h["query_as"], "key_form": bool(h.get("key")),
                     "reason": f"the model has the {'key ' if h.get('key') else ''}form '{h['form']}' (category "
                               f"{h['category']}) but the connector doesn't list it, so analysts and agents never see it"
                               + ("; it holds the codes, so nobody can filter or group on the codes the glossary and "

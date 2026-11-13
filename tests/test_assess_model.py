@@ -2012,6 +2012,54 @@ class FormListingTests(unittest.TestCase):
         self.assertIn("key form", h["reason"])
         self.assertIn("filter or group on the codes", h["reason"])
 
+    def test_tables_found_through_the_tables_forms_read(self):
+        def attr(name, lookup, forms):
+            out = {"information": {"name": name}, "keyForm": {"id": forms[0][0]},
+                   "forms": [{"id": i, "name": fn, "category": cat,
+                              "expressions": [{"expression": {"text": f"[{c}]"}, "tables": [{"name": t}]} for c, t in ex]}
+                             for i, fn, cat, ex in forms]}
+            if lookup:
+                out["attributeLookupTable"] = {"name": lookup}
+            return out
+        export = {"model": [{"tables": [
+            {"information": {"name": "facts.csv"}},
+            {"information": {"name": "seller_lookup.csv"}, "physicalTable": {"columns": [
+                {"columnName": "SELLER"}, {"columnName": "SELLER GROUP"}]}},
+            {"information": {"name": "Month_Map.csv"}, "physicalTable": {"columns": [
+                {"columnName": "Freddie Month"}, {"columnName": "Activity Month"}]}},
+            {"information": {"name": "ptype_lookup.csv"}, "physicalTable": {"columns": [
+                {"columnName": "PT"}, {"columnName": "PT DESC"}]}}],
+            "factMetrics": [{"expressions": [{"tables": [{"name": "facts.csv"}]}]}],
+            "attributes": [
+                attr("Seller Name", "facts.csv", [("K", "ID", "ID", [("SELLER", "seller_lookup.csv"),
+                                                                     ("SELLER", "facts.csv")])]),
+                attr("Seller Group", "seller_lookup.csv", [("K", "ID", "ID", [("SELLER GROUP", "seller_lookup.csv")])]),
+                attr("Reporting Period", "facts.csv", [("K", "ID", "ID", [("PERIOD", "facts.csv"),
+                                                                          ("Freddie Month", "Month_Map.csv")])]),
+                attr("Activity Month", "Month_Map.csv", [("K", "ID", "ID", [("Activity Month", "Month_Map.csv")])]),
+                attr("Property Type", None, [("K", "ID", "ID", [("PT", "ptype_lookup.csv"), ("PT", "facts.csv")]),
+                                             ("D", "DESC", "DESC", [("PT DESC", "ptype_lookup.csv")])])]}]}
+        scope = {"model": "M", "attributes": [
+            {"name": "seller name", "type": "varchar", "profile": {"distinct_values": 40}},
+            {"name": "seller group", "type": "varchar", "profile": {"distinct_values": 300}},
+            {"name": "reporting period", "type": "bigint", "profile": {"distinct_values": 30}},
+            {"name": "activity month", "type": "varchar", "profile": {"distinct_values": 400}},
+            {"name": "property type", "type": "varchar", "profile": {"distinct_values": 5}},
+            {"name": "property type__desc", "type": "varchar", "profile": {"distinct_values": 5}}]}
+        tables = am.existing_lookup_tables(scope, export=export)
+        self.assertEqual({t: g["key"] for t, g in tables.items()},
+                         {"seller_lookup.csv": "seller name", "Month_Map.csv": "reporting period",
+                          "ptype_lookup.csv": "property type"})   # the join, though the other attribute has more values
+        self.assertEqual(tables["Month_Map.csv"]["read_as"]["Freddie Month"], "reporting period")
+        self.assertNotIn("PERIOD", tables["Month_Map.csv"]["read_as"])      # that column is the fact's
+        self.assertEqual(tables["ptype_lookup.csv"]["read_as"]["PT DESC"], "property type__desc")
+        self.assertEqual(tables["seller_lookup.csv"]["declared"], ["seller group"])
+
+    def test_hidden_form_suggestion_flags_a_key_form(self):
+        sugg = am.lookup_suggestions(self.MAP_SCOPE, export=self.MAP_EXPORT, time_attributes=False)
+        self.assertEqual({(s["attribute"], s["form"]): s["key_form"] for s in sugg if s["kind"] == "hidden_form"}
+                         [("channel", "ID")], True)
+
     def test_no_blank_rows_on_an_exported_key_points_elsewhere(self):
         sug = {"kind": "blank_key", "attribute": "exit type", "count_on": "exit code__code",
                "count_on_source": "model export", "rows_lost": ["keeps 10 of 20"]}
