@@ -1962,3 +1962,65 @@ class FormListingTests(unittest.TestCase):
         (t,) = [x for x in am.lookup_suggestions(scope, export=export) if x["kind"] == "time_attributes"]
         self.assertEqual(t["tables"], ["facts.csv", "Month_Map.csv"])
         self.assertIn("each of these tables", t["shared_table_note"])
+
+    # an attribute the connector lists only as "<attribute>__code" still keys its table, and a hidden key form
+    # is reported
+    MAP_EXPORT = {"model": [{"tables": [
+        {"information": {"name": "facts.csv"}},
+        {"information": {"name": "exit_map.csv"}, "physicalTable": {"columns": [
+            {"columnName": "ZB CODE"}, {"columnName": "EXIT"}, {"columnName": "CREDIT EVENT"}]}}],
+        "factMetrics": [{"expressions": [{"tables": [{"name": "facts.csv"}]}]}],
+        "attributes": [
+            {"information": {"name": "Exit Code"}, "attributeLookupTable": {"name": "exit_map.csv"},
+             "keyForm": {"id": "K"}, "forms": [{"id": "K", "name": "code", "category": "ID", "expressions": [
+                 {"expression": {"text": "[ZB CODE]"}, "tables": [{"name": "exit_map.csv"}, {"name": "facts.csv"}]}]}]},
+            {"information": {"name": "Exit Type"}, "attributeLookupTable": {"name": "exit_map.csv"},
+             "keyForm": {"id": "K"}, "forms": [{"id": "K", "name": "ID", "category": "ID", "expressions": [
+                 {"expression": {"text": "[EXIT]"}, "tables": [{"name": "exit_map.csv"}]}]}]},
+            {"information": {"name": "Credit Event"}, "attributeLookupTable": {"name": "exit_map.csv"},
+             "keyForm": {"id": "K"}, "forms": [{"id": "K", "name": "ID", "category": "ID", "expressions": [
+                 {"expression": {"text": "[CREDIT EVENT]"}, "tables": [{"name": "exit_map.csv"}]}]}]},
+            {"information": {"name": "Channel"}, "attributeLookupTable": {"name": "facts.csv"},
+             "keyForm": {"id": "K"}, "forms": [
+                 {"id": "K", "name": "ID", "category": "ID", "expressions": [{"expression": {"text": "[CH]"}}]},
+                 {"id": "D", "name": "description", "category": "DESC",
+                  "expressions": [{"expression": {"text": "[CH DESC]"}}]}]}]}]}
+    MAP_SCOPE = {"model": "M", "anchor": {"metric": "balance"}, "attributes": [
+        {"name": "exit code__code", "type": "varchar", "profile": {"distinct_values": 9}},
+        {"name": "exit type", "type": "varchar", "profile": {"distinct_values": 12}},
+        {"name": "credit event", "type": "varchar", "profile": {"distinct_values": 2}},
+        {"name": "channel__description", "type": "varchar", "profile": {"distinct_values": 3}}]}
+
+    def test_table_keyed_on_an_attribute_listed_only_through_a_form(self):
+        tables = am.existing_lookup_tables(self.MAP_SCOPE, export=self.MAP_EXPORT)
+        g = tables["exit_map.csv"]
+        self.assertEqual(sorted(g["attributes"]), ["credit event", "exit code", "exit type"])
+        self.assertEqual(g["key"], "exit code")          # it joins the fact, though exit type has more values
+        self.assertEqual(g["connector_names"]["exit code"], "exit code__code")
+        probes = {"attributes": [{"name": n, "issues": ["filtered to x = Y: keeps 10 of 20 fact rows (10 lost)"]}
+                                 for n in ("exit type", "credit event")]}
+        sugg = am.lookup_suggestions(self.MAP_SCOPE, probes=probes, export=self.MAP_EXPORT, time_attributes=False)
+        self.assertEqual({b["attribute"]: b["count_on"] for b in sugg if b["kind"] == "blank_key"},
+                         {"exit type": "exit code__code", "credit event": "exit code__code"})
+
+    def test_hidden_key_form_is_reported(self):
+        hidden = am.hidden_forms(self.MAP_SCOPE, self.MAP_EXPORT)
+        self.assertIn(("channel", "ID", True, "channel (id)"),
+                      [(h["attribute"], h["form"], h["key"], h["query_as"]) for h in hidden])
+        sugg = am.lookup_suggestions(self.MAP_SCOPE, export=self.MAP_EXPORT, time_attributes=False)
+        (h,) = [s for s in sugg if s["kind"] == "hidden_form" and s["attribute"] == "channel"]
+        self.assertIn("key form", h["reason"])
+        self.assertIn("filter or group on the codes", h["reason"])
+
+    def test_no_blank_rows_on_an_exported_key_points_elsewhere(self):
+        sug = {"kind": "blank_key", "attribute": "exit type", "count_on": "exit code__code",
+               "count_on_source": "model export", "rows_lost": ["keeps 10 of 20"]}
+        d = tempfile.mkdtemp(prefix="blank-")
+        self.addCleanup(shutil.rmtree, d, True)
+
+        def answer(sql):
+            self.assertIn('"exit code__code" IS NULL', sql)
+            return [["n"], ["0"]]
+        (out,) = am.build_lookups(_SqlRunner(answer), "P", self.MAP_SCOPE, [sug], d)
+        self.assertIn("a key value with no row in the table", out["blank_key_note"])
+        self.assertNotIn("with a model export", out["blank_key_note"])

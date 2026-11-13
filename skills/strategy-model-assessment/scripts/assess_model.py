@@ -1589,7 +1589,7 @@ def export_forms(scope: dict, export: dict | None) -> dict[str, dict[str, Any]]:
                      else [f"{cname}__{fname}", f"{cname} ({fname})"])
             visible = next((c for c in cands if c.casefold() in listed), None)
             forms.append({"form": f.get("name"), "category": f.get("category"), "column": col, "key": is_key,
-                          "visible": bool(visible), "query_as": visible or (cname if is_key else f"{cname} ({fname})"),
+                          "visible": bool(visible), "query_as": visible or f"{cname} ({fname})",
                           "describes": not is_key and bool(_DESC_FORM.search(f"{f.get('name')} {f.get('category')}"))})
         out[cname] = {"table": (a.get("attributeLookupTable") or {}).get("name"), "forms": forms,
                       "tables": list(dict.fromkeys(tables))}
@@ -1598,9 +1598,10 @@ def export_forms(scope: dict, export: dict | None) -> dict[str, dict[str, Any]]:
 
 def hidden_forms(scope: dict, export: dict | None) -> list[dict[str, Any]]:
     """Forms the model has but the connector doesn't list (get_semantics omits them, so analysts and agents never
-    see them). A label hidden this way looks like a missing description."""
-    return [{"attribute": n, "form": f["form"], "category": f["category"], "query_as": f["query_as"]}
-            for n, a in export_forms(scope, export).items() for f in a["forms"] if not f["visible"] and not f["key"]]
+    see them). A label hidden this way looks like a missing description. A hidden key form is the worse case:
+    analysts can't filter or group on the codes the glossary uses."""
+    return [{"attribute": n, "form": f["form"], "category": f["category"], "query_as": f["query_as"], "key": f["key"]}
+            for n, a in export_forms(scope, export).items() for f in a["forms"] if not f["visible"]]
 
 
 def existing_lookup_tables(scope: dict, *, relationships: dict | None = None, probes: dict | None = None,
@@ -1616,6 +1617,7 @@ def existing_lookup_tables(scope: dict, *, relationships: dict | None = None, pr
     groups: dict[str, dict[str, Any]] = {}
     model = _export_model(export)
     forms = export_forms(scope, export)
+    conn: dict[str, str] = {}   # attribute -> the name the connector answers it by
     if model:
         tables = {(t.get("information") or {}).get("name"): t for t in model.get("tables") or []}
         fact_tables = {str(tb.get("name")) for fm in model.get("factMetrics") or []
@@ -1627,6 +1629,10 @@ def existing_lookup_tables(scope: dict, *, relationships: dict | None = None, pr
             n = names.get(raw) or (raw if raw in forms else None)
             if t and n:
                 by_table.setdefault(t, []).append(n)
+                # the connector may list it only through a form ("zero balance__code"): profiles, relationships and
+                # queries use that name
+                key_form = next((f for f in (forms.get(n.lower()) or {}).get("forms", []) if f["key"]), None)
+                conn[n] = n if n.casefold() in names else (key_form["query_as"] if key_form else n)
         if not fact_tables and by_table:   # no metrics read in the export: the table most attributes use is the fact
             fact_tables = {max(by_table, key=lambda t: len(by_table[t]))}
         for t, attrs in by_table.items():
@@ -1643,7 +1649,10 @@ def existing_lookup_tables(scope: dict, *, relationships: dict | None = None, pr
                             read_as["_v_" + f["column"]] = "1"
             read_as = {k: v for k, v in read_as.items() if not k.startswith("_v_")}
             groups[t] = {"attributes": attrs, "columns": [c for c in cols if c], "source": "model export",
-                         "read_as": read_as,
+                         "read_as": read_as, "connector_names": {n: conn.get(n, n) for n in attrs},
+                         # attributes whose forms read the fact too: the columns that join the table to the fact
+                         "joins_fact": [n for n in attrs if set((forms.get(n.lower()) or {}).get("tables", []))
+                                        & fact_tables],
                          "described": [n for n in attrs if any(f["describes"] for f in (forms.get(n.lower()) or {})
                                                                .get("forms", []))],
                          "evidence": ["each attribute's lookup table in the model export"]}
@@ -1670,12 +1679,18 @@ def existing_lookup_tables(scope: dict, *, relationships: dict | None = None, pr
             ev += [f"'{c}' determines '{p}'" for c, p in edges if c in comp and p in comp]
             groups[f"<inferred: {start}>"] = {"attributes": sorted(comp), "columns": [], "source": "inferred",
                                               "evidence": ev}
+    prof = {a["name"]: _distinct(a) or 0 for a in scope.get("attributes") or []}
     for g in groups.values():
         attrs = g["attributes"]
-        parents = {p for c, p in edges if c in attrs and p in attrs}
+        cn = g.get("connector_names") or {}
+        back = {cn.get(n, n): n for n in attrs}
+        pairs = [(back.get(c, c), back.get(p, p)) for c, p in edges]
+        parents = {p for c, p in pairs if c in attrs and p in attrs}
         children = [a for a in attrs if a not in parents]
-        prof = {a["name"]: _distinct(a) or 0 for a in scope.get("attributes") or []}
-        g["key"] = max(children or attrs, key=lambda n: prof.get(n, 0))
+        # the key is the column that joins the fact (export), else the most detailed attribute
+        pool = [a for a in (children or attrs) if a in (g.get("joins_fact") or [])] or g.get("joins_fact") \
+            or children or attrs
+        g["key"] = max(pool, key=lambda n: prof.get(cn.get(n, n), 0))
         g["determined"] = [a for a in attrs if a != g["key"]]
     return groups
 
@@ -1693,6 +1708,7 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
     out: list[dict[str, Any]] = []
     existing = existing_lookup_tables(scope, relationships=relationships, probes=probes, export=export)
     in_table = {n: t for t, g in existing.items() for n in g["attributes"]}
+    in_table.update({c: t for t, g in existing.items() for c in (g.get("connector_names") or {}).values()})
     extend: dict[str, list[str]] = {}
     for a in attrs:
         prof = a.get("profile") or {}
@@ -1749,9 +1765,11 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
     for n, lost in lost_by.items():
         if lost and n in names:   # rows lost through an attribute's lookup, whether or not it gets a CSV
             g = existing.get(in_table.get(n, ""), {})
-            key = g.get("key") if g and g.get("key") != n else None   # the column that joins the fact
+            key = g.get("key") if g else None   # the column that joins the fact
+            key = (g.get("connector_names") or {}).get(key, key) if key else None
             out.append({"id": f"B-{_slug(n)}", "kind": "blank_key", "attribute": n, "rows_lost": lost,
-                        "count_on": key or n,
+                        "count_on": key if key and key != n else n,
+                        "count_on_source": g.get("source") if key and key != n else None,
                         "reason": "the probe saw fact rows lost through this attribute's lookup (often a blank key "
                                   "that no lookup row matches): give blank a code in the source, then a lookup row "
                                   "for it",
@@ -1760,9 +1778,12 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
         out.append({"id": f"H-{_slug(h['attribute'])}-{_slug(str(h['form']))}", "kind": "hidden_form",
                     "attribute": h["attribute"], "form": h["form"], "category": h["category"],
                     "query_as": h["query_as"],
-                    "reason": f"the model has the form '{h['form']}' (category {h['category']}) but the connector doesn't "
-                              f"list it, so analysts and agents never see it; it answers as \"{h['query_as']}\". Make it "
-                              f"visible instead of adding a column that duplicates it",
+                    "reason": f"the model has the {'key ' if h.get('key') else ''}form '{h['form']}' (category "
+                              f"{h['category']}) but the connector doesn't list it, so analysts and agents never see it"
+                              + ("; it holds the codes, so nobody can filter or group on the codes the glossary and "
+                                 "source use" if h.get("key") else "")
+                              + f". It should answer as \"{h['query_as']}\" (check with a query). Make it visible "
+                                f"instead of adding a column that duplicates it",
                     "columns": [], "new_forms": [], "new_attributes": []})
     period_attr = period
     if not period_attr:
@@ -1885,8 +1906,11 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
                 on = sug.get("count_on") or sug["attribute"]
                 b = _blank_key_rows(runner, project, scope, on, where)
                 extra = _blank_note(b, on, sug.get("rows_lost")) if b else {
-                    "blank_key_note": f"no blank '{on}' rows: '{sug['attribute']}' has no column in the fact, so the rows "
-                                      f"are lost through its table's key; name that key with a model export"}
+                    "blank_key_note": f"no blank '{on}' rows" + (
+                        f": the rows are lost some other way (a key value with no row in the table, not a blank); "
+                        f"compare the fact's '{on}' values with the table's" if sug.get("count_on_source") == "model export"
+                        else f": '{sug['attribute']}' has no column in the fact, so the rows are lost through its "
+                             f"table's key; name that key with a model export (export-model, --model-export)")}
             done.append({**sug, **extra, "csv": None})
             continue
         blank = _blank_key_rows(runner, project, scope, sug["attribute"], where)

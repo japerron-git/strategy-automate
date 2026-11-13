@@ -58,7 +58,11 @@ id reads a column the connector names differently), reads blanks as blanks (`CAS
 into 0, which a reload would write into the table), lists columns no attribute reads (copy them from
 the source file), adds no description column for an attribute that already has a description or label
 form, and reports **hidden forms** (`hidden_form`: forms the export has but get_semantics omits; they
-answer as `"<attribute> (<form>)"`; make them visible instead of duplicating them). Without the export
+answer as `"<attribute> (<form>)"`; make them visible instead of duplicating them). A hidden **key**
+form is reported too, and is the worse case: nobody can filter or group on the codes. The connector may
+list an attribute only through a form (`"<attribute>__code"`, `"<attribute> (id)"`); the export still
+attaches it to its table, and a table's key is the attribute whose form reads the fact as well (the
+join), queried by its connector name, so blank keys are counted on that join column. Without the export
 the headers are connector names: don't replace a table from such a CSV. Time-attribute suggestions name
 the table the column lives in (converting it changes the table for every model reading that file).
 Then it recommends:
