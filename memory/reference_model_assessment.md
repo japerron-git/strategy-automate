@@ -78,7 +78,16 @@ so, an identifier-like name needing the description; calendar parents then come 
 lookup** for the latest-period flag only (when no flag exists; time attributes give no "latest"),
 and, optionally, an **entity table** (many attributes fixed per entity). It writes CSV templates with
 the key values from the data; description columns are filled only from cited sources (user documents,
-provider dictionary), with the source named per row, or left for the user. Add a lookup by mapping its
+provider dictionary), with the source named per row in the sources file, or left for the user.
+Templates are written in the table's own load format (the export's import settings: separator,
+quote character, header row, encoding; a new table uses the format most of the model's tables use),
+with no `source` column: a column the table lacks breaks a reload. Sources go in the
+`<file>_sources.csv` beside it, which is not loaded. With no quote character a value can't hold the
+separator, a double quote or a line break (rephrase it; never switch separators on your own).
+`check-lookup --lookups lookups.json --id <id> --csv <file> --record` confirms a filled file is
+load-ready (every line splits into the table's columns, the header matches exactly, the existing
+columns are unchanged from the template row for row, blanks still blank); with `--project` after a
+reload it also compares the reloaded table with the file. Add a lookup by mapping its
 key column to the **existing** attribute — replacing the attribute deletes the derived metrics that
 filter on it (`feedback_mosaic_gotchas.md`). Then check the attribute's lookup table, republish and
 re-certify.
@@ -372,8 +381,8 @@ warns when an applied or verified finding spans phases.
 `create_weighted_average`, `delete_derived_metric`, `patch_model_object`, `patch_fact_metrics`, `publish`,
 `certify`, `change_column_type`, `source_change` and `wire_relationships` (below), `add_lookup_table` (manual
 steps: add the CSV, map it to the existing attribute, give its key column the attribute's type, create
-`new_attributes` as attributes of their own and `new_forms` as forms, leave out the CSV's `source` column,
-check the lookup); anything else is `manual` with `steps`. Lookup suggestions say which columns are forms
+`new_attributes` as attributes of their own and `new_forms` as forms, load the file with the table's
+import settings, check the lookup; `plan` refuses a `source` column and a failed `check-lookup`); anything else is `manual` with `steps`. Lookup suggestions say which columns are forms
 (descriptions) and which are attributes (flags, calendar parents); `plan` warns when a description, name or
 label column is listed as an attribute that no metric filters on.
 

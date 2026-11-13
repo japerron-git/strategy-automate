@@ -24,10 +24,12 @@ repo. Nothing here writes to the model: plan only prints build_mosaic.py command
 from __future__ import annotations
 
 import argparse
+import codecs
 import copy
 import csv
 import hashlib
 import datetime
+import io
 import json
 import os
 import re
@@ -1763,7 +1765,7 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                     "reason": "coded values with no description form or attribute"
                               + ("; the codes are explained only in the description text" if "=" in desc or ":" in desc
                                  else ""),
-                    "columns": [a["name"], f"{a['name']} description", "source"],
+                    "columns": [a["name"], f"{a['name']} description"],
                     "new_forms": [f"{a['name']} description"], "new_attributes": []})
     for table, coded in extend.items():
         g = existing[table]
@@ -1783,7 +1785,10 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                               + ("" if from_export else
                                  "; the table and its columns are inferred, and the headers are connector names: "
                                  "export the model (export-model, --model-export) before replacing the table"),
-                    "columns": keep + descs + ["source"], "new_forms": descs, "new_attributes": []})
+                    "columns": keep + descs, "new_forms": descs, "new_attributes": [],
+                    "key_column": next((c for c, v in (g.get("read_as") or {}).items()
+                                        if v == (g.get("connector_names") or {}).get(g["key"], g["key"])), keep[0] if keep else g["key"]),
+                    "load_format": (load_formats(export).get(_table_key(table)) if from_export else None)})
     lost_by = {a["name"]: [x for x in a.get("issues") or [] if "keeps" in x and "fact rows" in x]
                for a in (probes or {}).get("attributes") or []}
     for n, lost in lost_by.items():
@@ -1888,21 +1893,155 @@ def _period_parts(value: str) -> tuple[str, str, str]:
     return year, f"{year}-Q{(month - 1) // 3 + 1}", f"{month:02d}"
 
 
-def _write_csv(path: str, header: list[str], rows: list[list[Any]]) -> None:
+# A table's load format, from the export's import settings. Without one, a template is written the safe way: no
+# quote character, so a value holding the separator is a problem to fix (rephrase), never quoted.
+ASSUMED_LOAD_FORMAT = {"separator": ",", "quote": "", "header": True, "encoding": "utf-8", "assumed": True}
+
+
+def _table_key(name: Any) -> str:
+    n = str(name or "").strip().casefold()
+    return re.sub(r"\.(csv|txt|tsv)$", "", n)
+
+
+def _load_format(opts: dict) -> dict[str, Any]:
+    def pick(*keys: str) -> Any:
+        for k in keys:
+            for kk, v in opts.items():
+                if str(kk).casefold() == k.casefold():
+                    return v
+        return None
+    sep = pick("separator", "delimiter", "columnSeparator", "fieldSeparator")
+    sep = {"\\t": "\t", "tab": "\t", "comma": ",", "pipe": "|", "semicolon": ";"}.get(str(sep).lower(), sep) \
+        if sep is not None else ","
+    quote = pick("quote", "quoteChar", "quoteCharacter", "textQualifier")
+    header = pick("header", "hasHeader", "firstRowHeader", "firstRowAsHeader")
+    if isinstance(header, str):
+        header = header.strip().lower() in ("true", "1", "yes")
+    enc = pick("encoding", "charset", "fileEncoding")
+    return {"separator": str(sep), "quote": "" if quote is None else str(quote),
+            "header": True if header is None else bool(header), "encoding": str(enc or "utf-8"),
+            "assumed": False, **({"quote_unset": True} if quote is None else {})}
+
+
+def load_formats(export: dict | None) -> dict[str, dict[str, Any]]:
+    """Each table's import settings (separator, quote character, header row, encoding) from the export's pipeline
+    (importSource.dataOptions), keyed by table name without its extension. A reload is read with these settings,
+    so a template must be written with them."""
+    out: dict[str, dict[str, Any]] = {}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            src = node.get("importSource")
+            if isinstance(src, dict) and isinstance(src.get("dataOptions"), dict):
+                for name in (node.get("name"), (node.get("information") or {}).get("name"), src.get("name"),
+                             src.get("fileName"), src.get("file")):
+                    if isinstance(name, str) and name:
+                        out.setdefault(_table_key(name), _load_format(src["dataOptions"]))
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+    walk(export)
+    return out
+
+
+def _model_load_format(export: dict | None) -> dict[str, Any]:
+    """The format most of the model's tables load with: the one a new table should use too."""
+    fmts = list(load_formats(export).values())
+    if not fmts:
+        return dict(ASSUMED_LOAD_FORMAT)
+    keyed = [(f["separator"], f["quote"], f["header"], f["encoding"]) for f in fmts]
+    best = max(dict.fromkeys(keyed), key=keyed.count)
+    return {"separator": best[0], "quote": best[1], "header": best[2], "encoding": best[3], "assumed": False,
+            "from": "the format most of the model's tables use"}
+
+
+def _codec(name: str) -> str:
+    try:
+        return codecs.lookup(name).name
+    except LookupError:
+        return "utf-8"
+
+
+def _value_problems(value: str, fmt: dict) -> list[str]:
+    sep, q = fmt["separator"], fmt.get("quote") or ""
+    bad = []
+    if "\n" in value or "\r" in value:
+        bad.append("a line break")
+    if not q:
+        if sep in value:
+            bad.append(f"the separator {sep!r}")
+        if '"' in value:
+            bad.append("a double quote (the table has no quote character)")
+    return bad
+
+
+def _write_csv(path: str, header: list[str], rows: list[list[Any]], fmt: dict | None = None) -> list[str]:
+    """Write a file in the table's load format. With no quote character nothing is quoted: a value holding the
+    separator, a quote or a line break would shift columns on reload, so it is reported, not quoted."""
+    fmt = fmt or ASSUMED_LOAD_FORMAT
+    sep, q = fmt["separator"], fmt.get("quote") or ""
+    problems: list[str] = []
+    lines = []
+    body = ([header] if fmt.get("header", True) else []) + rows
+    for i, r in enumerate(body, 1):
+        cells = ["" if v is None else str(v) for v in r]
+        for j, c in enumerate(cells):
+            bad = _value_problems(c, fmt)
+            if bad:
+                problems.append(f"line {i}, column '{header[j] if j < len(header) else j}': {c[:40]!r} holds "
+                                + " and ".join(bad))
+        if q:
+            buf = io.StringIO()
+            csv.writer(buf, delimiter=sep, quotechar=q, lineterminator="").writerow(cells)
+            lines.append(buf.getvalue())
+        else:
+            lines.append(sep.join(cells))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding=_codec(fmt.get("encoding") or "utf-8"), newline="") as f:
+        f.write("\n".join(lines) + "\n")
+    return problems
+
+
+def _write_sources(path: str, key_header: str, keys: list[Any], desc_cols: list[str]) -> None:
+    """Sources for the description columns, one row per key: kept out of the load file (the table has no such
+    column), read by the check and by reviewers. Not loaded, so ordinary CSV quoting is fine here."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(header)
-        w.writerows(rows)
+        w.writerow([key_header] + [f"{d} source" for d in desc_cols])
+        w.writerows([[k] + [""] * len(desc_cols) for k in keys])
+
+
+def _finish_template(entry: dict, path: str, header: list[str], rows: list[list[Any]], fmt: dict) -> dict:
+    """Write the load file and its sources file; record the format and the fixed columns' rows (those the filler
+    must not change) so check-lookup can compare a filled file with them."""
+    problems = _write_csv(path, header, rows, fmt)
+    descs = [c for c in entry.get("new_forms") or [] if c in header]
+    fixed = [c for c in header if c not in descs]
+    out = {**entry, "csv": path, "load_format": fmt,
+           "template": {"columns": header, "fixed_columns": fixed,
+                        "rows": [[r[header.index(c)] for c in fixed] for r in rows]}}
+    if descs:
+        key_col = entry.get("key_column") or header[0]
+        src = re.sub(r"\.csv$", "", path) + "_sources.csv"
+        _write_sources(src, key_col, [r[header.index(key_col)] if key_col in header else r[0] for r in rows], descs)
+        out["sources_csv"] = src
+    if problems:
+        out["format_problems"] = problems
+    return out
 
 
 def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[dict], csv_dir: str, *,
-                  where: str = "", max_values: int = 1000, batch: int = 8) -> list[dict[str, Any]]:
+                  where: str = "", max_values: int = 1000, batch: int = 8,
+                  export: dict | None = None) -> list[dict[str, Any]]:
     """Write a CSV template per suggestion: key values from the data (reusing the scope's samples,
     querying the rest in batches); description columns left blank for the agent to fill from cited
     sources (or the user to fill)."""
     os.makedirs(csv_dir, exist_ok=True)
     model = scope["model"]
+    new_fmt = _model_load_format(export)   # a new table loads like the model's other tables
     profiles = {a["name"]: a.get("profile") or {} for a in scope.get("attributes") or []}
     known: dict[str, Any] = {}
     wanted: dict[str, float] = {}
@@ -1939,7 +2078,8 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
             continue
         blank = _blank_key_rows(runner, project, scope, sug["attribute"], where)
         if sug["kind"] == "extend_lookup":
-            done.append(_extend_template(runner, project, model, sug, csv_dir, where, blank))
+            done.append(_extend_template(runner, project, model, sug, csv_dir, where, blank,
+                                         sug.get("load_format") or new_fmt))
             continue
         got = known.get(sug["attribute"])
         if got == "pending":
@@ -1954,14 +2094,15 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
         values = [v for v in values if v not in dropped]
         path = os.path.join(csv_dir, f"{_slug(sug['attribute'])}_lookup.csv")
         if sug["kind"] == "code_lookup":
-            _write_csv(path, sug["columns"], [[v, "", ""] for v in values])
+            rows = [[v, ""] for v in values]
         elif sug["kind"] == "date_lookup":
-            _write_csv(path, sug["columns"], [[v, *_period_parts(v)[:2]] for v in values])
+            rows = [[v, *_period_parts(v)[:2]] for v in values]
         else:
             latest = max(values) if values else None
             parts = (lambda v: _period_parts(v)) if len(sug["columns"]) > 2 else (lambda v: ())
-            _write_csv(path, sug["columns"], [[v, *parts(v), "Y" if v == latest else "N"] for v in values])
-        entry = {**sug, "csv": path, "rows": len(values), **_blank_note(blank, sug["attribute"])}
+            rows = [[v, *parts(v), "Y" if v == latest else "N"] for v in values]
+        entry = {**_finish_template(sug, path, sug["columns"], [[str(x) for x in r] for r in rows], new_fmt),
+                 "rows": len(values), **_blank_note(blank, sug["attribute"])}
         if dropped:
             entry["note"] = (f"dropped {sorted(dropped)}: outside the attribute's min/max, so a NULL rendered as a "
                              f"number by CAST — represent 'no value' explicitly if users need it")
@@ -1999,36 +2140,157 @@ def _blank_note(blank: float | None, attribute: str, lost: list[str] | None = No
                               f"change."}
 
 
-def _extend_template(runner: Runner, project: str, model: str, sug: dict, csv_dir: str, where: str,
-                     blank: float | None) -> dict[str, Any]:
-    """The existing table's rows (an attribute-only query reads the lookup itself), every column kept under the
-    table's own names, description columns blank to fill from cited sources. Blanks stay blank: CAST alone
-    turns a NULL into 0, which a reload would write into the table."""
-    keep, read_as = sug["keep_columns"], sug.get("read_as") or {}
-    readable = [c for c in keep if read_as.get(c)]
+def _read_table_rows(runner: Runner, project: str, model: str, read_as: dict[str, str], columns: list[str],
+                     where: str = "") -> tuple[list[list[str]] | None, str | None]:
+    """A table's rows through the connector: an attribute-only query reads the lookup itself. Blanks stay blank
+    (CAST alone turns a NULL into 0). Columns with no connector name come back blank."""
+    readable = [c for c in columns if read_as.get(c)]
+    if not readable:
+        return [], None
     cols = ", ".join(f"CASE WHEN {quote_ident(read_as[c])} IS NULL THEN '' ELSE CAST({quote_ident(read_as[c])} AS VARCHAR) "
                      f"END AS c{i}" for i, c in enumerate(readable))
     clause = f" WHERE {where}" if where else ""
     sql = f"SELECT {cols} FROM {quote_model(model)}{clause} GROUP BY {', '.join(str(i + 1) for i in range(len(readable)))}"  # nosec B608  # identifiers are quoted; the connector is read-only
+    parsed = parse_query_result(runner.call("query", {"project": project, "query": sql}))
+    if not parsed["ok"]:
+        return None, parsed["error"] or "the table's rows could not be read"
+    pos = {c: i for i, c in enumerate(readable)}
+    return sorted([[(r.get(f"c{pos[c]}") or "") if c in pos else "" for c in columns] for r in parsed["rows"]]), None
+
+
+def _extend_template(runner: Runner, project: str, model: str, sug: dict, csv_dir: str, where: str,
+                     blank: float | None, fmt: dict | None = None) -> dict[str, Any]:
+    """The existing table's rows (an attribute-only query reads the lookup itself), every column kept under the
+    table's own names, description columns blank to fill from cited sources. Blanks stay blank: CAST alone
+    turns a NULL into 0, which a reload would write into the table."""
+    keep, read_as = sug["keep_columns"], sug.get("read_as") or {}
     try:
-        parsed = parse_query_result(runner.call("query", {"project": project, "query": sql}))
+        rows, err = _read_table_rows(runner, project, model, read_as, keep, where)
     except PendingReply:
         return {**sug, "csv": None, "pending": True}
-    if not parsed["ok"]:
-        return {**sug, "csv": None, "error": parsed["error"] or "the table's rows could not be read"}
-    pos = {c: i for i, c in enumerate(readable)}
-    rows = sorted([[(r.get(f"c{pos[c]}") or "") if c in pos else "" for c in keep] for r in parsed["rows"]])
+    if rows is None:
+        return {**sug, "csv": None, "error": err}
     extra = len(sug["columns"]) - len(keep)
     path = os.path.join(csv_dir, f"{_slug(sug['attribute'])}_lookup.csv")
-    _write_csv(path, sug["columns"], [r + [""] * extra for r in rows])
-    unread = [c for c in keep if c not in pos]
-    note = ("starts from the existing table's rows, every column kept under the table's own names; descriptions to "
-            "fill from cited sources (or 'model data' when derived from the table itself)")
+    fmt = fmt or sug.get("load_format") or ASSUMED_LOAD_FORMAT
+    built = _finish_template(sug, path, sug["columns"], [r + [""] * extra for r in rows], fmt)
+    unread = [c for c in keep if not read_as.get(c)]
+    note = ("starts from the existing table's rows, every column kept under the table's own names, written in the "
+            "table's load format; descriptions to fill from cited sources, named in the sources file (or 'model data' "
+            "when derived from the table itself)")
+    if not sug.get("load_format"):
+        note += "; the table's load format isn't in the export, so the file uses the model's usual format: confirm it"
     if unread:
         note += (f". Columns no attribute reads through the connector are left blank: {unread} — copy them from the "
                  f"source file before reloading")
-    return {**sug, "csv": path, "rows": len(rows), "unreadable_columns": unread, **_blank_note(blank, sug["attribute"]),
+    return {**built, "rows": len(rows), "unreadable_columns": unread, **_blank_note(blank, sug["attribute"]),
             "note": note}
+
+
+def _split_lines(text: str, fmt: dict) -> list[list[str]]:
+    sep, q = fmt["separator"], fmt.get("quote") or ""
+    if q:
+        return [r for r in csv.reader(io.StringIO(text, newline=""), delimiter=sep, quotechar=q) if r != []]
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return [ln[:-1].split(sep) if ln.endswith("\r") else ln.split(sep) for ln in lines]
+
+
+def check_lookup_csv(entry: dict, csv_path: str, *, live_rows: list[list[str]] | None = None) -> dict[str, Any]:
+    """Is a filled lookup file load-ready? Read with the table's own load format: every line splits into the
+    expected fields; no value holds the separator, a quote or a line break when the table has no quote
+    character; the header is the table's columns plus the added description columns, exactly; the fixed
+    columns (the existing table's, and the keys) are unchanged from the template, row for row, blanks still
+    blank. With live_rows (the reloaded table read through the connector), the file's readable columns must
+    match the model's rows."""
+    fmt = entry.get("load_format") or ASSUMED_LOAD_FORMAT
+    tmpl = entry.get("template") or {}
+    expected = list(tmpl.get("columns") or entry.get("columns") or [])
+    fixed = list(tmpl.get("fixed_columns") or [])
+    problems: list[str] = []
+    warnings: list[str] = []
+    try:
+        with open(csv_path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        return {"ok": False, "csv": csv_path, "problems": [f"can't read the file: {e}"], "warnings": []}
+    enc = _codec(fmt.get("encoding") or "utf-8")
+    try:
+        text = raw.decode(enc)
+    except UnicodeDecodeError as e:
+        return {"ok": False, "csv": csv_path, "problems": [f"not valid {fmt.get('encoding')}: {e}"], "warnings": []}
+    if text.startswith("\ufeff"):
+        problems.append("the file starts with a byte-order mark, which the loader reads into the first header")
+        text = text[1:]
+    if "\r\n" in text and not fmt.get("quote"):
+        warnings.append("Windows line endings: the loader may keep a carriage return in the last column")
+    rows = _split_lines(text, fmt)
+    if fmt.get("header", True):
+        header = rows[0] if rows else []
+        rows = rows[1:]
+        if header != expected:
+            missing = [c for c in expected if c not in header]
+            extra = [c for c in header if c not in expected]
+            problems.append("the header doesn't match the table's columns"
+                            + (f"; missing {missing}" if missing else "") + (f"; not in the table {extra}" if extra else "")
+                            + ("; same columns in another order" if not missing and not extra else "")
+                            + (" (sources go in the sources file, not the load file)" if any(
+                                c.strip().lower() == "source" for c in extra) else ""))
+    else:
+        header = expected
+    bad_len = [(i, len(r)) for i, r in enumerate(rows, 2 if fmt.get("header", True) else 1) if len(r) != len(expected)]
+    if bad_len:
+        problems.append(f"{len(bad_len)} line(s) don't split into {len(expected)} fields with separator "
+                        f"{fmt['separator']!r}" + ("" if fmt.get("quote") else " and no quote character")
+                        + ": " + ", ".join(f"line {i} has {n}" for i, n in bad_len[:10])
+                        + (" — a value holds the separator: rephrase it" if any(n > len(expected) for _, n in bad_len)
+                           else ""))
+    for i, r in enumerate(rows, 2 if fmt.get("header", True) else 1):
+        for j, v in enumerate(r):
+            bad = [b for b in _value_problems(v, fmt) if not b.startswith("the separator")]
+            if bad:
+                problems.append(f"line {i}, column '{header[j] if j < len(header) else j}': holds " + " and ".join(bad))
+    idx = {c: header.index(c) for c in fixed if c in header}
+    if tmpl.get("rows") is not None and len(idx) == len(fixed):
+        got = [[r[idx[c]] if idx[c] < len(r) else "" for c in fixed] for r in rows]
+        want = [[str(x) for x in r] for r in tmpl["rows"]]
+        if len(got) != len(want):
+            problems.append(f"{len(got)} rows, the template has {len(want)}: rows were added or removed")
+        changed = [(i, w, g) for i, (w, g) in enumerate(zip(want, got), 1) if w != g]
+        filled = [(i, c) for i, w, g in changed for c, a, b in zip(fixed, w, g) if a == "" and b != ""]
+        if changed:
+            problems.append(f"{len(changed)} row(s) change the table's existing columns {fixed}, which must stay as "
+                            f"the template has them: " + "; ".join(f"row {i}: {w} -> {g}" for i, w, g in changed[:5]))
+        if filled:
+            problems.append(f"{len(filled)} blank value(s) filled in existing columns (a blank must stay blank): "
+                            + ", ".join(f"row {i} '{c}'" for i, c in filled[:10]))
+    elif fixed and len(idx) != len(fixed):
+        warnings.append("the existing columns couldn't all be found, so rows weren't compared with the template")
+    descs = [c for c in expected if c not in fixed and c in header]
+    filled_desc = sum(1 for r in rows for c in descs if header.index(c) < len(r) and r[header.index(c)].strip())
+    src = entry.get("sources_csv")
+    if descs and src and os.path.exists(src):
+        with open(src, encoding="utf-8", newline="") as f:
+            srows = list(csv.reader(f))[1:]
+        cited = sum(1 for r in srows for v in r[1:] if v.strip())
+        if filled_desc and not cited:
+            warnings.append("descriptions are filled but the sources file names no source")
+    live: dict[str, Any] = {}
+    if live_rows is not None:
+        read_as = entry.get("read_as") or {}
+        cols = [c for c in expected if read_as.get(c) and c in header]
+        file_set = {tuple(r[header.index(c)] if header.index(c) < len(r) else "" for c in cols) for r in rows}
+        model_set = {tuple(r) for r in live_rows}
+        only_file, only_model = sorted(file_set - model_set), sorted(model_set - file_set)
+        live = {"columns": cols, "rows_in_model": len(model_set), "rows_in_file": len(file_set),
+                "only_in_file": [list(x) for x in only_file[:20]], "only_in_model": [list(x) for x in only_model[:20]]}
+        if only_file or only_model:
+            problems.append(f"the reloaded table doesn't match the file on {cols}: {len(only_file)} row(s) only in the "
+                            f"file, {len(only_model)} only in the model (a shifted column or a cut value)")
+    return {"ok": not problems, "csv": csv_path, "load_format": fmt, "rows": len(rows),
+            "descriptions_filled": filled_desc, "problems": problems, "warnings": warnings,
+            **({"live": live} if live else {})}
 
 
 def _null_artifacts(values: list, prof: dict, scope: dict, attribute: str) -> set:
@@ -2046,12 +2308,15 @@ def _null_artifacts(values: list, prof: dict, scope: dict, attribute: str) -> se
     return out
 
 
-def _csv_header(path: str) -> list[str]:
+def _csv_header(path: str, fmt: dict | None = None) -> list[str]:
+    fmt = fmt or {"separator": ",", "quote": '"'}
     try:
-        with open(path, encoding="utf-8", newline="") as f:
-            return next(csv.reader(f), [])
-    except OSError:
+        with open(path, encoding=_codec(fmt.get("encoding") or "utf-8"), newline="") as f:
+            first = f.readline().rstrip("\r\n").lstrip("\ufeff")
+    except (OSError, UnicodeDecodeError):
         return []
+    rows = _split_lines(first + "\n", {"separator": fmt.get("separator") or ",", "quote": fmt.get("quote") or ""})
+    return rows[0] if rows else []
 
 
 def lookup_steps(args: dict) -> str:
@@ -2083,9 +2348,18 @@ def lookup_steps(args: dict) -> str:
     steps += [f"Give the CSV's key column the same type as '{key}' (codes such as 01 stay text; set-column-types "
               f"can change it after the table is added).",
               f"Check that '{key}' uses the new table as its lookup (auto-detection may keep the fact table).",
-              "Leave out the CSV's source column, if it has one: it records where each value came from.",
+              "Load the file as it is, with the table's own import settings (separator, quote character, header, "
+              "encoding)" + (f": {_format_text(args['load_format'])}" if args.get("load_format") else "") +
+              ". check-lookup has confirmed it splits into the table's columns; its sources are in a separate file "
+              "that is not loaded.",
               "The phase republishes once at the end; then re-run the questions that depend on this lookup."]
     return " ".join(f"{i}. {t}" for i, t in enumerate(steps, 1))
+
+
+def _format_text(fmt: dict) -> str:
+    sep = {"\t": "tab"}.get(fmt.get("separator"), repr(fmt.get("separator")))
+    q = repr(fmt["quote"]) if fmt.get("quote") else "no quote character"
+    return f"separator {sep}, {q}, {'a' if fmt.get('header', True) else 'no'} header row, {fmt.get('encoding')}"
 
 
 def lookups_checklist(items: list[tuple[dict, bool]]) -> str:
@@ -2105,13 +2379,16 @@ def lookups_checklist(items: list[tuple[dict, bool]]) -> str:
             bits.append("new columns: attributes if a metric filters on them, otherwise forms")
         if not retyped:
             bits.append(f"key column typed like '{key}'")
+        if a.get("load_format"):
+            bits.append(f"load with {_format_text(a['load_format'])}")
         lines.append(f"({i}) " + "; ".join(bits) + ".")
     head = (f"{'Add these ' + str(len(items)) + ' lookup tables, each the same way' if len(items) > 1 else 'Add this lookup table'}"
             f": add the CSV as a new table; map its key column to the EXISTING attribute named (keep it: "
             f"deleting or replacing it deletes the derived metrics that filter on it); create the listed attributes "
             f"as attributes of their own, related to the key, since metrics filter on them; add the listed forms as "
             f"forms of the key (display only); check the key attribute uses the new table as its lookup "
-            f"(auto-detection may keep the fact table); leave out the CSV's source column if it has one."
+            f"(auto-detection may keep the fact table); load each file with its table's import settings (shown per "
+            f"table); sources are in separate files that are not loaded."
             + (" Key types that must change are set by the commands right after this step." if any(r for _, r in items)
                else "") + " The phase republishes once at the end.")
     return head + " Tables: " + " ".join(lines)
@@ -2645,7 +2922,7 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         need("csv", "key_attribute")
         if a.get("extends_table"):   # replacing an existing table's data: it must keep every column read from it
             keep = [str(c) for c in a.get("keep_columns") or []]
-            cols = [str(c) for c in a.get("columns") or []] or _csv_header(str(a.get("csv") or ""))
+            cols = [str(c) for c in a.get("columns") or []] or _csv_header(str(a.get("csv") or ""), a.get("load_format"))
             if not keep:
                 problems.append(f"{kind}: extends_table needs keep_columns (the columns its attributes read)")
             elif cols:
@@ -2653,6 +2930,13 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
                 if lost:
                     problems.append(f"{kind}: the CSV for '{a['extends_table']}' drops {lost}, which attributes still "
                                     f"read; add them back or the attributes lose their source")
+        cols = [str(c) for c in a.get("columns") or []] or _csv_header(str(a.get("csv") or ""), a.get("load_format"))
+        if any(c.strip().lower() == "source" for c in cols):
+            problems.append(f"{kind}: {a.get('csv')} has a source column the table doesn't have; move sources to the "
+                            f"sources file, then run check-lookup")
+        chk = a.get("check") or {}
+        if chk and not chk.get("ok"):
+            problems.append(f"{kind}: check-lookup failed for {a.get('csv')}: " + "; ".join(chk.get("problems") or []))
         return {"dry_run": None, "apply": None, "manual": lookup_steps(a), "problems": problems}
     if kind == "publish":
         return {"dry_run": None, "apply": base + ["publish", "--model-id", model_id] + PUBLISH_WAIT, "manual": None,
@@ -3357,6 +3641,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-code-values", type=int, default=200,
                     help="treat text attributes with at most this many values as codes (default 200)")
 
+    sp = sub.add_parser("check-lookup", help="check a filled lookup file is load-ready: the table's load format, its "
+                        "header, the existing columns unchanged from the template; with --project, also against the "
+                        "reloaded table")
+    sp.add_argument("--lookups", required=True, help="lookups.json from the lookups command")
+    sp.add_argument("--id", required=True, help="the suggestion's id (X-..., L-...)")
+    sp.add_argument("--csv", help="the filled file (default: the template path in lookups.json)")
+    sp.add_argument("--project", help="query the model: compare the reloaded table with the file (after a reload)")
+    sp.add_argument("--model", help="model name (default: lookups.json)")
+    sp.add_argument("--read-as", action="append", default=[], metavar="COLUMN=NAME",
+                    help="how the connector answers a column the suggestion doesn't map (a new description form)")
+    sp.add_argument("--record", action="store_true", help="save the result in lookups.json (the workbook shows it)")
+
     sp = sub.add_parser("grade", help="compare results with expected values; summarize by level and path")
     sp.add_argument("--bank", required=True)
     sp.add_argument("--results", required=True)
@@ -3424,7 +3720,7 @@ def main(argv: list[str] | None = None, runner_factory: Callable[[argparse.Names
         return r
     runner.made = made  # type: ignore[attr-defined]
 
-    if args.cmd in LIVE_COMMANDS:
+    if args.cmd in LIVE_COMMANDS or (args.cmd == "check-lookup" and args.project):
         try:
             code = _live(args, runner, log)
             pending = [r for r in made if getattr(r, "pending", None)]
@@ -3503,6 +3799,8 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
         print(json.dumps({"ok": True, "out": args.out, "attributes": len(out["attributes"]),
                           "metrics": len(out["metrics"]), "warnings": len(out["warnings"])}, indent=2))
         return 0
+    if args.cmd == "check-lookup":
+        return _check_lookup_cmd(args, runner)
     if args.cmd == "lookups":
         scope = _load_json(args.scope)
         rel = _load_json(args.relationships) if args.relationships else None
@@ -3510,7 +3808,8 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
                                   time_attributes=not args.calendar_lookups,
                                   probes=_load_json(args.probes) if args.probes else None,
                                   export=_load_json(args.model_export) if args.model_export else None)
-        built = build_lookups(runner(), args.project, scope, sugg, args.csv_dir, where=args.where)
+        export = _load_json(args.model_export) if args.model_export else None
+        built = build_lookups(runner(), args.project, scope, sugg, args.csv_dir, where=args.where, export=export)
         _write_json(args.out, {"version": 1, "model": scope.get("model"), "lookups": built})
         if _pending(runner):
             return 3
@@ -3542,7 +3841,44 @@ def _pending(runner: Callable[[], Runner]) -> bool:
     return any(getattr(r, "pending", None) for r in made)
 
 
+def _check_lookup_cmd(args: argparse.Namespace, runner: Callable[[], Runner] | None = None) -> int:
+    data = _load_json(args.lookups)
+    entry = next((x for x in data.get("lookups") or [] if x.get("id") == args.id), None)
+    if not entry:
+        print(json.dumps({"ok": False, "error": f"no suggestion '{args.id}' in {args.lookups}"}, indent=2))
+        return 2
+    path = args.csv or entry.get("csv")
+    if not path:
+        print(json.dumps({"ok": False, "error": f"'{args.id}' has no CSV file; pass --csv"}, indent=2))
+        return 2
+    extra = dict(x.split("=", 1) for x in args.read_as if "=" in x)
+    if extra or entry.get("kind") == "code_lookup":
+        entry = {**entry, "read_as": {**({entry["columns"][0]: entry["attribute"]} if entry.get("kind") == "code_lookup"
+                                        else {}), **(entry.get("read_as") or {}), **extra}}
+    live = None
+    if runner is not None:
+        cols = [c for c in (entry.get("template") or {}).get("columns") or entry.get("columns") or []
+                if (entry.get("read_as") or {}).get(c)]
+        live, err = _read_table_rows(runner(), args.project, args.model or data.get("model") or "",
+                                     entry.get("read_as") or {}, cols)
+        if live is None:
+            print(json.dumps({"ok": False, "error": err}, indent=2))
+            return 2
+    res = check_lookup_csv(entry, path, live_rows=live)
+    if args.record:
+        for x in data.get("lookups") or []:
+            if x.get("id") == args.id:
+                x["check"] = {k: res[k] for k in ("ok", "csv", "problems", "warnings") if k in res}
+                if live is not None:
+                    x["check"]["against_model"] = True
+        _write_json(args.lookups, data)
+    print(json.dumps(res, indent=2))
+    return 0 if res["ok"] else 1
+
+
 def _offline(args: argparse.Namespace) -> int:
+    if args.cmd == "check-lookup":
+        return _check_lookup_cmd(args)
     if args.cmd == "grade":
         bank = _load_json(args.bank)
         out = grade_bank(bank, _load_json(args.results), bank_dir=os.path.dirname(os.path.abspath(args.bank)),

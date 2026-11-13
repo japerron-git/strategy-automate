@@ -166,8 +166,9 @@ number stored as a date first — it is always a finding, whatever parents it ha
 just a latest-period flag when there is none (point-in-time metrics otherwise resolve "latest" per group),
 and an optional entity table. **Offer the user the CSVs**: the script writes a template per lookup
 with the key values taken from the data; fill the description columns only from cited sources (the
-user's documents or the provider's dictionary, step 2) and name the source in the `source` column —
-or leave them blank for the user. A lookup becomes a finding with an `add_lookup_table` action; the
+user's documents or the provider's dictionary, step 2) and name the source in the template's
+`_sources.csv` file — or leave them blank for the user. Use no separator, quote or line break in a
+value (rephrase instead), and run `check-lookup ... --record` on each filled file before offering it. A lookup becomes a finding with an `add_lookup_table` action; the
 change plan turns it into the steps to add and map the table (map it to the **existing** attribute:
 replacing an attribute deletes the derived metrics that filter on it). List lookup columns that metrics
 will filter on (flags) under `new_attributes`: a filter can target an attribute but not a form.

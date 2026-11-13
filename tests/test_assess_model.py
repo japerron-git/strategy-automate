@@ -1127,7 +1127,7 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         self.assertEqual([w for w in plan["warnings"] if "display column" in w],
                          ["F1: 'status description' looks like a display column; list it under new_forms unless a "
                           "metric will filter on it"])
-        self.assertIn("leave out the CSV's source column", plan["phases"][0]["steps"][0]["manual"])
+        self.assertIn("sources are in separate files that are not loaded", plan["phases"][0]["steps"][0]["manual"])
 
     def test_plan_cli_writes_spec_files(self):
         d = tempfile.mkdtemp(prefix="assess-plan-")
@@ -1332,8 +1332,8 @@ class LookupTests(unittest.TestCase):
         # status code reuses the scope's complete sample (4 values); only the period is queried
         self.assertEqual(runner.calls, 1)
         with open(built["status code"]["csv"], encoding="utf-8", newline="") as f:
-            self.assertEqual(list(csv.reader(f)), [["status code", "status code description", "source"],
-                                                   ["01", "", ""], ["02", "", ""], ["03", "", ""], ["09", "", ""]])
+            self.assertEqual(list(csv.reader(f)), [["status code", "status code description"],
+                                                   ["01", ""], ["02", ""], ["03", ""], ["09", ""]])
         with open(built["snapshot month"]["csv"], encoding="utf-8", newline="") as f:
             period = list(csv.reader(f))
         self.assertEqual(period, [["snapshot month", "latest period flag"], ["2025-12-01", "N"], ["2026-01-01", "N"],
@@ -1508,7 +1508,8 @@ class CommandRoutingTests(unittest.TestCase):
         subs = next(a for a in ap._actions if isinstance(a, argparse._SubParsersAction))
         needs_model = {name for name, sp in subs.choices.items()
                        if any("--project" in a.option_strings for a in sp._actions)}
-        self.assertEqual(needs_model - {"plan"}, set(am.LIVE_COMMANDS))   # plan only names the project
+        # plan only names the project; check-lookup queries the model only when given one
+        self.assertEqual(needs_model - {"plan", "check-lookup"}, set(am.LIVE_COMMANDS))
 
     def test_roles_runs_from_the_command_line_in_replay_mode(self):
         d = tempfile.mkdtemp(prefix="roles-cli-")
@@ -1835,9 +1836,9 @@ class ExistingTableTests(unittest.TestCase):
         with open(built["csv"], encoding="utf-8", newline="") as f:
             rows = list(csv.reader(f))
         self.assertEqual(rows[0], ["status code", "late flag", "status bucket", "status code description",
-                                   "status bucket description", "source"])
-        self.assertEqual(rows[1], ["00", "N", "0", "", "", ""])
-        self.assertEqual(rows[3], ["XX", "", "9", "", "", ""])
+                                   "status bucket description"])
+        self.assertEqual(rows[1], ["00", "N", "0", "", ""])
+        self.assertEqual(rows[3], ["XX", "", "9", "", ""])
         self.assertEqual(built["blank_key_fact_rows"], 136699.0)
         self.assertIn("kept them", built["blank_key_note"])                  # no probe evidence of loss: a note
 
@@ -1884,8 +1885,8 @@ class ExistingTableTests(unittest.TestCase):
         with open(built["csv"], encoding="utf-8", newline="") as f:
             rows = list(csv.reader(f))
         self.assertEqual(rows[0], ["STATUS", "BUCKET SORT", "BUCKET", "MONTHS LATE", "UNUSED",
-                                   "status code description", "source"])
-        self.assertEqual(rows[2], ["RA", "5", "180+ days", "", "", "", ""])   # a blank stays blank, not 0
+                                   "status code description"])
+        self.assertEqual(rows[2], ["RA", "5", "180+ days", "", "", ""])   # a blank stays blank, not 0
         self.assertEqual(built["unreadable_columns"], ["UNUSED"])
 
     def test_rows_lost_through_a_described_attribute_still_reported(self):
@@ -2072,3 +2073,141 @@ class FormListingTests(unittest.TestCase):
         (out,) = am.build_lookups(_SqlRunner(answer), "P", self.MAP_SCOPE, [sug], d)
         self.assertIn("a key value with no row in the table", out["blank_key_note"])
         self.assertNotIn("with a model export", out["blank_key_note"])
+
+
+class LookupFormatTests(unittest.TestCase):
+    """Templates are written in the table's own load format (the export's import settings), sources stay out of
+    the load file, and check-lookup confirms a filled file is load-ready."""
+
+    EXPORT = {"model": [{
+        "tables": [{"information": {"name": "facts.csv"}},
+                   {"information": {"name": "status_map.csv"}, "physicalTable": {"columns": [
+                       {"columnName": "STATUS"}, {"columnName": "BUCKET"}]}}],
+        "factMetrics": [{"expressions": [{"tables": [{"name": "facts.csv"}]}]}],
+        "attributes": [
+            {"information": {"name": "Status Code"}, "attributeLookupTable": {"name": "status_map.csv"},
+             "keyForm": {"id": "K"}, "forms": [{"id": "K", "name": "ID", "category": "ID", "expressions": [
+                 {"expression": {"text": "[STATUS]"}, "tables": [{"name": "status_map.csv"}, {"name": "facts.csv"}]}]}]},
+            {"information": {"name": "Status Bucket"}, "attributeLookupTable": {"name": "status_map.csv"},
+             "keyForm": {"id": "K"}, "forms": [{"id": "K", "name": "ID", "category": "ID", "expressions": [
+                 {"expression": {"text": "[BUCKET]"}, "tables": [{"name": "status_map.csv"}]}]}]}],
+        "pipeline": {"rootTable": {"children": [
+            {"name": "status_map", "importSource": {"dataOptions": {"separator": ";", "quote": "", "header": True,
+                                                                     "encoding": "UTF-8"}}},
+            {"name": "facts", "importSource": {"dataOptions": {"separator": ",", "quote": "", "header": "true",
+                                                                "encoding": "UTF-8"}}}]}}}]}
+    SCOPE = {"model": "Store Sales", "anchor": {"metric": "net sales"}, "attributes": [
+        {"name": "status code", "type": "varchar", "profile": {"distinct_values": 3, "values": ["00", "01", "XX"]}},
+        {"name": "status bucket", "type": "varchar", "profile": {"distinct_values": 2, "values": ["0", "1"]}}],
+        "metrics": []}
+
+    def _build(self, rows):
+        d = tempfile.mkdtemp(prefix="fmt-")
+        self.addCleanup(shutil.rmtree, d, True)
+        sugg = [s for s in am.lookup_suggestions(self.SCOPE, export=self.EXPORT, time_attributes=False)
+                if s["kind"] == "extend_lookup"]
+
+        def answer(sql):
+            if "IS NULL OR CAST" in sql:
+                return [["n"], ["0"]]
+            return [["c0", "c1"]] + rows
+        (built,) = am.build_lookups(_SqlRunner(answer), "P", self.SCOPE, sugg, d, export=self.EXPORT)
+        return built, d
+
+    def test_load_formats_from_the_export(self):
+        f = am.load_formats(self.EXPORT)
+        self.assertEqual((f["status_map"]["separator"], f["status_map"]["quote"], f["status_map"]["header"]),
+                         (";", "", True))
+        self.assertTrue(f["facts"]["header"])                                  # "true" read as true
+        (x,) = [s for s in am.lookup_suggestions(self.SCOPE, export=self.EXPORT, time_attributes=False)
+                if s["kind"] == "extend_lookup"]
+        self.assertEqual(x["load_format"]["separator"], ";")
+        self.assertNotIn("source", x["columns"])
+        self.assertEqual(x["key_column"], "STATUS")
+
+    def test_template_in_the_tables_format_with_a_sources_file(self):
+        built, _ = self._build([["00", "0"], ["01", "1"], ["XX", ""]])
+        with open(built["csv"], encoding="utf-8", newline="") as f:
+            text = f.read()
+        self.assertEqual(text.splitlines()[0], "STATUS;BUCKET;status code description")
+        self.assertIn("XX;;", text)                                         # a blank stays blank
+        self.assertNotIn('"', text)                                          # nothing quoted
+        with open(built["sources_csv"], encoding="utf-8", newline="") as f:
+            self.assertEqual(next(csv.reader(f)), ["STATUS", "status code description source"])
+        self.assertEqual(built["template"]["fixed_columns"], ["STATUS", "BUCKET"])
+        self.assertNotIn("format_problems", built)
+
+    def test_a_value_holding_the_separator_is_reported_not_quoted(self):
+        built, _ = self._build([["00", "0;1"], ["01", "1"]])
+        self.assertTrue(any("separator" in p for p in built["format_problems"]))
+
+    def _filled(self, built, d, lines):
+        path = os.path.join(d, "filled.csv")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("\n".join(lines) + "\n")
+        return path
+
+    def test_check_passes_a_load_ready_file(self):
+        built, d = self._build([["00", "0"], ["01", "1"], ["XX", ""]])
+        path = self._filled(built, d, ["STATUS;BUCKET;status code description",
+                                       "00;0;Current", "01;1;30 to 59 days late", "XX;;Unknown"])
+        res = am.check_lookup_csv(built, path)
+        self.assertTrue(res["ok"], res["problems"])
+        self.assertEqual(res["descriptions_filled"], 3)
+        self.assertIn("sources file names no source", " ".join(res["warnings"]))
+
+    def test_check_catches_shifted_columns_sources_and_changed_rows(self):
+        built, d = self._build([["00", "0"], ["01", "1"], ["XX", ""]])
+        path = self._filled(built, d, ["STATUS;BUCKET;status code description;source",
+                                       "00;0;Current; per glossary;glossary", "01;2;Late \"30\";glossary",
+                                       "XX;0;Unknown;glossary"])
+        res = am.check_lookup_csv(built, path)
+        text = " | ".join(res["problems"])
+        self.assertFalse(res["ok"])
+        self.assertIn("sources go in the sources file", text)
+        self.assertIn("don't split into 3 fields", text)
+        self.assertIn("double quote", text)
+        self.assertIn("change the table's existing columns", text)
+        self.assertIn("blank value(s) filled", text)
+
+    def test_check_against_the_reloaded_table(self):
+        built, d = self._build([["00", "0"], ["01", "1"]])
+        path = self._filled(built, d, ["STATUS;BUCKET;status code description", "00;0;Current", "01;1;Late"])
+        ok = am.check_lookup_csv(built, path, live_rows=[["00", "0"], ["01", "1"]])
+        self.assertTrue(ok["ok"], ok["problems"])
+        bad = am.check_lookup_csv(built, path, live_rows=[["00", "0"], ["01", ""]])
+        self.assertIn("doesn't match the file", " ".join(bad["problems"]))
+
+    def test_check_lookup_command_records_the_result(self):
+        built, d = self._build([["00", "0"]])
+        lk = os.path.join(d, "lookups.json")
+        with open(lk, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "model": "Store Sales", "lookups": [built]}, f)
+        path = self._filled(built, d, ["STATUS;BUCKET;status code description", "00;0;Current, on time"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = am.main(["check-lookup", "--lookups", lk, "--id", built["id"], "--csv", path, "--record"])
+        self.assertEqual(code, 0)            # a comma is fine in a table that splits on ';'
+        with open(lk, encoding="utf-8") as f:
+            self.assertTrue(json.load(f)["lookups"][0]["check"]["ok"])
+
+    def test_new_tables_use_the_models_usual_format(self):
+        fmt = am._model_load_format(self.EXPORT)
+        self.assertEqual(fmt["quote"], "")
+        self.assertTrue(am._model_load_format(None)["assumed"])
+
+
+class LookupPlanCheckTests(unittest.TestCase):
+    def test_source_column_and_failed_check_are_plan_problems(self):
+        d = tempfile.mkdtemp(prefix="plan-src-")
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "t.csv")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("CODE;LABEL;source\n01;x;y\n")
+        fmt = {"separator": ";", "quote": "", "header": True, "encoding": "UTF-8"}
+        out = am.action_commands({"kind": "add_lookup_table", "args": {
+            "csv": path, "key_attribute": "code", "load_format": fmt,
+            "check": {"ok": False, "problems": ["line 3 has 4 fields"]}}}, "MID")
+        text = " | ".join(out["problems"])
+        self.assertIn("source column", text)
+        self.assertIn("check-lookup failed", text)
+        self.assertIn("separator ';', no quote character", out["manual"])
