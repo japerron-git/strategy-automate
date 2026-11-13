@@ -2300,16 +2300,20 @@ class _ErrRunner(_SqlRunner):
 
 class JoinPathTests(unittest.TestCase):
     SCOPE = {"model": "Store Sales", "anchor": {"metric": "net sales", "counts": {"net sales": 100}},
-             "attributes": [{"name": "region", "profile": {"distinct_values": 3}},
-                            {"name": "store", "profile": {"distinct_values": 40}},
-                            {"name": "flag", "profile": {"distinct_values": 2}},
-                            {"name": "one", "profile": {"distinct_values": 1}},
-                            {"name": "store__desc", "profile": {"distinct_values": 40}}],
+             "attributes": [{"name": "region", "type": "varchar", "profile": {"distinct_values": 3}},
+                            {"name": "store", "type": "varchar", "profile": {"distinct_values": 40}},
+                            {"name": "flag", "type": "varchar", "profile": {"distinct_values": 2}},
+                            {"name": "one", "type": "varchar", "profile": {"distinct_values": 1}},
+                            {"name": "status__id", "type": "varchar"}, {"name": "status__desc", "type": "varchar"},
+                            {"name": "open date", "type": "date"},
+                            {"name": "open date (month)__id", "type": "bigint"}],
              "metrics": [{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
-                         {"name": "regional sales", "type": "double", "formula": "net sales where region = 'a'"}]}
+                         {"name": "latest sales", "type": "double", "formula": "Sum({Net Sales}) {~+}"},
+                         {"name": "regional sales", "type": "double", "formula": "Sum({net sales}) where ({region} = 'a')"},
+                         {"name": "store age", "type": "double", "formula": "Avg(t.csv.{Store Age})"}]}
 
     def _answer(self, sql):
-        if sql.startswith('SELECT COUNT("net sales") AS n'):
+        if sql.startswith('SELECT COUNT("net sales") AS n FROM "store sales"') and "WHERE" not in sql:
             return [["n"], ["100"]]
         if 'GROUP BY "region"' in sql:
             return [["v", "n"], ["a", "100"], ["b", "100"]]
@@ -2317,56 +2321,86 @@ class JoinPathTests(unittest.TestCase):
             return [["v", "n"], ["s1", "1"], ["s2", "2"]]
         if 'GROUP BY "flag"' in sql:
             return "Query failed: no join path between the tables"
+        if 'GROUP BY "one"' in sql:
+            return [["v", "n"], ["", "97"], ["Y", "3"]]            # a blank and one value: two groups
+        if 'GROUP BY "status__id"' in sql:
+            return [["v", "n"], ["01", "4"], ["02", "96"]]
+        if 'GROUP BY "open date"' in sql:
+            return [["v", "n"], ["2026-01-05", "1"], ["2026-01-08", "1"]]
+        if "WHERE \"store\" = 's1'" in sql:
+            return [["n"], ["1"]]
+        if "WHERE \"one\" = 'Y'" in sql:
+            return [["n"], ["100"]]                                  # the filter is ignored
+        if "WHERE \"status__id\" = '01'" in sql:
+            return [["n"], ["4"]]
+        if "WHERE \"open date\" = DATE '2026-01-05'" in sql:
+            return [["n"], ["1"]]
         raise AssertionError(sql)
 
-    def test_cross_join_join_error_and_filtering_metrics(self):
+    def test_verdicts_filters_and_whole_name_matches(self):
         runner = _ErrRunner(self._answer)
         out = am.check_join_paths(runner, "P", self.SCOPE, round_no=2)
-        self.assertEqual(out["attributes"]["region"]["net sales"]["verdict"], "cross_join")
-        self.assertEqual(out["attributes"]["store"]["net sales"]["verdict"], "joined")
-        self.assertEqual(out["attributes"]["flag"]["net sales"]["verdict"], "join_error")
-        self.assertNotIn("one", out["attributes"])              # one value: can't tell
-        self.assertNotIn("store__desc", out["attributes"])      # forms share the attribute's join
+        # one fact table; "latest sales" is built on a metric, so it is not a fact
+        self.assertEqual([f["anchor"] for f in out["facts"]], ["net sales"])
+        v = {n: r["net sales"]["verdict"] for n, r in out["attributes"].items()}
+        self.assertEqual(v, {"region": "cross_join", "store": "joined", "flag": "join_error", "one": "joined",
+                             "status__id": "joined", "open date": "joined"})        # key form; no intervals
+        self.assertEqual(out["attributes"]["one"]["net sales"]["filter"]["verdict"], "ignored")
+        self.assertEqual(out["attributes"]["store"]["net sales"]["filter"]["verdict"], "ok")
         self.assertEqual(set(out["unjoined"]), {"region", "flag"})
-        self.assertEqual(out["metrics_filtering_unjoined"], [{"metric": "regional sales", "attribute": "region"}])
+        self.assertEqual(set(out["filter_problems"]), {"one"})
+        self.assertEqual(out["metrics_filtering_flagged"], [{"metric": "regional sales", "attribute": "region"}])
         ids = {f["id"]: f for f in out["findings"]}
-        self.assertEqual(set(ids), {"J-region", "J-flag"})
-        self.assertIn("regional sales", ids["J-region"]["evidence"]["observed"])
-        self.assertTrue(ids["J-region"]["needs_answer"])
+        self.assertEqual(set(ids), {"J-region", "J-flag", "J-filter-one"})
+        self.assertIn("filter is ignored", ids["J-filter-one"]["evidence"]["observed"])
+
+    def test_whole_names_only(self):
+        scope = {**self.SCOPE, "metrics": [
+            {"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
+            {"name": "loans", "type": "double", "formula": "Count(Loan)"},
+            {"name": "age", "type": "double", "formula": "Avg({Loan Age})"}],
+            "attributes": [{"name": "loan", "type": "varchar"}]}
+        runner = _ErrRunner(lambda sql: [["n"], ["100"]] if "GROUP BY" not in sql else
+                            [["v", "n"], ["L1", "100"], ["L2", "100"]])
+        out = am.check_join_paths(runner, "P", scope)
+        self.assertEqual(out["metrics_filtering_flagged"], [{"metric": "loans", "attribute": "loan"}])
 
     EXPORT = {"model": [{
         "factMetrics": [{"information": {"objectId": "FM", "name": "Net Sales"},
-                         "expressions": [{"tables": [{"name": "facts.csv"}]}]}],
+                         "fact": {"expressions": [{"tables": [{"name": "facts.csv"}]}]}}],
+        "hierarchy": {"relationships": [{"parent": {"objectId": "A2"}, "child": {"objectId": "A1"},
+                                         "relationshipType": "one_to_many"}]},
         "attributes": [
             {"information": {"objectId": "A1", "name": "Store"}, "attributeLookupTable": {"name": "stores.csv"},
-             "forms": [{"expressions": [{"tables": [{"name": "stores.csv"}, {"name": "facts.csv"}]}]}],
-             "relationships": [{"parent": {"objectId": "A2"}, "child": {"objectId": "A1"},
-                                "relationshipType": "one_to_many"}]},
+             "forms": [{"expressions": [{"tables": [{"name": "stores.csv"}, {"name": "facts.csv"}]}]}]},
             {"information": {"objectId": "A2", "name": "Region"}, "attributeLookupTable": {"name": "stores.csv"},
              "forms": [{"expressions": [{"tables": [{"name": "stores.csv"}]}]}]},
             {"information": {"objectId": "A3", "name": "Promo"}, "attributeLookupTable": {"name": "promos.csv"},
              "forms": [{"expressions": [{"tables": [{"name": "promos.csv"}]}]}]}]}]}
 
-    def test_export_graph_and_lost_relationships(self):
+    def test_export_graph_fact_under_fact_and_hierarchy_relationships(self):
         g = am.export_join_graph(self.EXPORT)
         self.assertEqual(g["fact_tables"], ["facts.csv"])
-        self.assertEqual([u["attribute"] for u in g["unreachable"]], ["promo"])    # region reaches through stores
+        self.assertEqual([u["attribute"] for u in g["unreachable"]], ["promo"])
         self.assertEqual(g["relationships"], [{"parent": "region", "child": "store", "type": "one_to_many"}])
         prev = {"relationships": [{"parent": "region", "child": "store"}, {"parent": "country", "child": "region"}]}
         out = am.check_join_paths(None, "P", self.SCOPE, export=self.EXPORT, previous=prev, round_no=3)
         self.assertEqual(out["relationship_changes"]["lost"], [{"parent": "country", "child": "region"}])
-        ids = {f["id"] for f in out["findings"]}
-        self.assertIn("L-country-region", ids)
-        self.assertIn("J-promo", ids)                 # export alone: no shared column with the fact
+        self.assertIn("L-country-region", {f["id"] for f in out["findings"]})
+        self.assertIn("J-promo", {f["id"] for f in out["findings"]})
+        empty = am.check_join_paths(None, "P", self.SCOPE, export=self.EXPORT, previous={"relationships": []})
+        self.assertIn("not compared", empty["relationship_changes"]["note"])
 
-    def test_one_query_per_lookup_table_with_the_export(self):
-        scope = {**self.SCOPE, "attributes": [{"name": "store", "profile": {"distinct_values": 40}},
-                                               {"name": "region", "profile": {"distinct_values": 3}}]}
-        runner = _ErrRunner(lambda sql: [["n"], ["100"]] if sql.startswith("SELECT COUNT") else
-                            [["v", "n"], ["s1", "1"], ["s2", "2"]])
+    def test_attributes_mapped_to_the_fact_are_skipped_the_rest_each_tested(self):
+        scope = {"model": "Store Sales", "anchor": {"metric": "net sales"},
+                 "metrics": [{"name": "net sales", "type": "double", "formula": "sum(facts.csv.{NET SALES})"}],
+                 "attributes": [{"name": "store", "type": "varchar"}, {"name": "region", "type": "varchar"}]}
+        runner = _ErrRunner(lambda sql: [["n"], ["100"]] if "GROUP BY" not in sql and "WHERE" not in sql else
+                            [["n"], ["30"]] if "WHERE" in sql else [["v", "n"], ["r1", "30"], ["r2", "70"]])
         out = am.check_join_paths(runner, "P", scope, export=self.EXPORT)
-        self.assertEqual(out["attributes"]["region"]["net sales"]["inherited_from"], "store")
-        self.assertEqual(len([c for c in runner.calls if "GROUP BY" in c[1]["query"]]), 1)
+        self.assertEqual(out["skipped_mapped_to_fact"], {"net sales": ["store"]})
+        self.assertEqual(out["attributes"]["region"]["net sales"]["verdict"], "joined")
+        self.assertEqual(out["attributes"]["region"]["net sales"]["filter"]["verdict"], "ok")
 
     def test_merge_findings_keeps_answers(self):
         doc = {"findings": [{"id": "J-region", "status": "declined", "evidence": {"observed": "old"}}]}
@@ -2404,8 +2438,9 @@ class UnbracedFormulaTests(unittest.TestCase):
 
     def test_raw_metric_and_table(self):
         metrics = [{"name": "order quantity", "type": "bigint", "formula": "sum(retail_orders.xlsx.Quantity)"},
+                   {"name": "latest upb", "type": "double", "formula": "Sum({Current Actual UPB Amount})"},
                    {"name": "total", "type": "double", "formula": "sum(retail_orders.xlsx.{Order Total})"},
                    {"name": "ratio", "type": "double", "formula": "total / order quantity"}]
         self.assertEqual(am.raw_fact_metrics(metrics), ["order quantity", "total"])
         self.assertEqual(am._metric_table(metrics[0]), "retail_orders.xlsx")
-        self.assertEqual(am._metric_table(metrics[1]), "retail_orders.xlsx")
+        self.assertEqual(am._metric_table(metrics[2]), "retail_orders.xlsx")

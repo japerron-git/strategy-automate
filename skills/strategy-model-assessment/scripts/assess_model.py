@@ -530,7 +530,8 @@ def choose_anchor(runner: Runner, project: str, model: str, metrics: list[dict],
 
 # one aggregation of one column: "sum(table.csv.{Net Sales})", or with no braces when the column has no space
 # ("sum(retail_orders.xlsx.Quantity)")
-_RAW_METRIC = re.compile(r"^(sum|avg|min|max|count)\(\s*[^(){}]*(\{[^{}]+\}|\.[A-Za-z_][\w]*)\s*\)$", re.I)
+# a table must come before the column: "Sum({Other Metric})" is a metric built on a metric, not a fact
+_RAW_METRIC = re.compile(r"^(sum|avg|min|max|count)\(\s*[^(){}]+\.(\{[^{}]+\}|[A-Za-z_]\w*)\s*\)$", re.I)
 _DEFAULT_NAME = re.compile(r"^(total|sum of|average|avg|count of|count)\b.*\(.*\)$|^[a-z0-9]+(_[a-z0-9]+)+$", re.I)
 _ATTRIBUTE_LIKE = re.compile(r"\b(id|code|key|number|zip|postal|year|month|flag|indicator|status|type)\b", re.I)
 _NUMERIC = ("bigint", "integer", "int", "double", "decimal", "real", "float", "smallint", "tinyint")
@@ -1696,14 +1697,64 @@ def _anchors_by_fact(scope: dict) -> list[dict[str, Any]]:
     return out
 
 
+def _export_fact_tables(model: dict) -> list[str]:
+    """Tables the fact metrics read. Exports keep a fact metric's expressions either on it or under `fact`."""
+    return sorted({str(t.get("name")) for fm in model.get("factMetrics") or []
+                   for e in ((fm.get("fact") or {}).get("expressions") or []) + (fm.get("expressions") or [])
+                   for t in e.get("tables") or [] if t.get("name")})
+
+
+def _ref_name(ref: Any, ids: dict[str, str]) -> str:
+    if isinstance(ref, str):
+        return ids.get(ref) or ref.lower()
+    if not isinstance(ref, dict):
+        return ""
+    info = ref.get("information") or {}
+    oid = str(ref.get("objectId") or ref.get("id") or info.get("objectId") or "")
+    return ids.get(oid) or str(ref.get("name") or info.get("name") or "").lower()
+
+
+def _export_relationships(model: dict, export: dict | None) -> list[dict[str, str]]:
+    """Declared parent-child relationships by attribute name: under `hierarchy.relationships` (as exports
+    keep them) or on each attribute."""
+    ids = _object_ids(export)
+    found: list[Any] = []
+    hier = model.get("hierarchy") or {}
+    found += hier.get("relationships") or [] if isinstance(hier, dict) else []
+    for a in model.get("attributes") or []:
+        rr = a.get("relationships")
+        found += (rr.get("relationships") if isinstance(rr, dict) else rr) or []
+    rels = set()
+    for r in found:
+        if not isinstance(r, dict):
+            continue
+        p, c = _ref_name(r.get("parent"), ids), _ref_name(r.get("child"), ids)
+        if p and c:
+            rels.add((p, c, str(r.get("relationshipType") or r.get("type") or "")))
+    return [{"parent": p, "child": c, "type": t} for p, c, t in sorted(rels)]
+
+
+def _attribute_tables(model: dict) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for a in model.get("attributes") or []:
+        name = str((a.get("information") or {}).get("name") or "").lower()
+        tabs = {str(t.get("name")) for f in a.get("forms") or [] for e in f.get("expressions") or []
+                for t in e.get("tables") or [] if t.get("name")}
+        lt = (a.get("attributeLookupTable") or {}).get("name")
+        if lt:
+            tabs.add(str(lt))
+        if name and tabs:
+            out[name] = tabs
+    return out
+
+
 def export_join_graph(export: dict | None) -> dict[str, Any]:
     """From the export: tables joined through attributes mapped to columns in both, which tables each
     attribute reaches, the fact tables it can't reach, and the declared relationships by name."""
     model = _export_model(export)
     if not model:
         return {}
-    facts = sorted({str(t.get("name")) for fm in model.get("factMetrics") or [] for e in fm.get("expressions") or []
-                    for t in e.get("tables") or [] if t.get("name")})
+    facts = _export_fact_tables(model)
     parent: dict[str, str] = {}
 
     def find(x: str) -> str:
@@ -1712,17 +1763,8 @@ def export_join_graph(export: dict | None) -> dict[str, Any]:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
-    attr_tables: dict[str, set[str]] = {}
-    for a in model.get("attributes") or []:
-        name = str((a.get("information") or {}).get("name") or "").lower()
-        tabs = {str(t.get("name")) for f in a.get("forms") or [] for e in f.get("expressions") or []
-                for t in e.get("tables") or [] if t.get("name")}
-        lt = (a.get("attributeLookupTable") or {}).get("name")
-        if lt:
-            tabs.add(str(lt))
-        if not name or not tabs:
-            continue
-        attr_tables[name] = tabs
+    attr_tables = _attribute_tables(model)
+    for tabs in attr_tables.values():
         first = sorted(tabs)[0]
         for t in tabs:
             parent[find(t)] = find(first)
@@ -1735,22 +1777,8 @@ def export_join_graph(export: dict | None) -> dict[str, Any]:
         if facts and missing:
             unreachable.append({"attribute": name, "tables": sorted(tabs), "facts_not_reached": missing,
                                 "reaches_no_fact": len(missing) == len(facts)})
-    ids = _object_ids(export)
-    rels = set()
-    for a in model.get("attributes") or []:
-        rr = a.get("relationships")
-        rr = rr.get("relationships") if isinstance(rr, dict) else rr
-        for r in rr or []:
-            if not isinstance(r, dict):
-                continue
-            p = (r.get("parent") or {})
-            c = (r.get("child") or {})
-            pn = ids.get(str(p.get("objectId") or p.get("id") or "")) or str(p.get("name") or "").lower()
-            cn = ids.get(str(c.get("objectId") or c.get("id") or "")) or str(c.get("name") or "").lower()
-            if pn and cn:
-                rels.add((pn, cn, str(r.get("relationshipType") or "")))
     return {"fact_tables": facts, "unreachable": unreachable,
-            "relationships": [{"parent": p, "child": c, "type": t} for p, c, t in sorted(rels)]}
+            "relationships": _export_relationships(model, export)}
 
 
 def join_path_sql(model: str, attribute: str, anchor: str, where: str = "") -> str:
@@ -1760,53 +1788,80 @@ def join_path_sql(model: str, attribute: str, anchor: str, where: str = "") -> s
             f"GROUP BY {a} ORDER BY 2 ASC LIMIT 2")
 
 
+def _typed_literal(value: Any, typ: str) -> str:
+    t = (typ or "").lower()
+    text = str(value).replace("'", "''")
+    if t.startswith("date"):
+        return f"DATE '{text[:10]}'"
+    if t.startswith("timestamp"):
+        return f"TIMESTAMP '{text}'"
+    return _sql_literal(value, typ)
+
+
+def filter_test_sql(model: str, attribute: str, anchor: str, value: Any, typ: str, where: str = "") -> str:
+    cond = f"{quote_ident(attribute)} = {_typed_literal(value, typ)}"
+    return (f"SELECT COUNT({quote_ident(anchor)}) AS n FROM {quote_model(model)} "  # nosec B608  # identifiers are quoted; the value is a typed literal; the connector is read-only
+            f"WHERE {cond}" + (f" AND ({where})" if where else ""))
+
+
 _JOIN_ERROR = re.compile(r"\b(join|joins|joined|cross|path|relationship|unrelated|not related|no common)\b", re.I)
 
 
-def _testable_attributes(scope: dict, export: dict | None) -> tuple[list[str], dict[str, str]]:
-    """Base attributes (no form or time-interval names) with more than one value. With the export, one per
-    lookup table (attributes on one table share its join), the rest inheriting its verdict."""
-    names = [a["name"] for a in scope.get("attributes") or []
-             if "__" not in a["name"] and not re.search(r" \((" + "|".join(TIME_INTERVALS) + r")\)", a["name"])
-             and (_num((a.get("profile") or {}).get("distinct_values")) or 2) > 1]
-    inherit: dict[str, str] = {}
-    model = _export_model(export)
-    if not model:
-        return names, inherit
-    table_of = {str((a.get("information") or {}).get("name") or "").lower(): (a.get("attributeLookupTable") or {}).get("name")
-                for a in model.get("attributes") or []}
-    prof = {a["name"]: _num((a.get("profile") or {}).get("distinct_values")) or 0 for a in scope.get("attributes") or []}
-    chosen: dict[str, str] = {}
-    for n in sorted(names, key=lambda x: -prof.get(x, 0)):
-        t = table_of.get(n.lower())
-        if not t:
-            chosen[n] = n
-            continue
-        if t in chosen:
-            inherit[n] = chosen[t]
+def _testable_attributes(scope: dict, export: dict | None) -> list[dict[str, Any]]:
+    """One connector name per attribute (time intervals left out): its plain name, else its key form (the
+    export's, else `__id` / `(id)`, else its first form). Attributes with one value are tested too: a blank
+    is a second group. With the export, each attribute also carries the tables its forms read, so it is
+    skipped only against a fact table it is mapped to directly."""
+    attrs = scope.get("attributes") or []
+    types = {a["name"]: a.get("type") or "" for a in attrs}
+    interval = re.compile(r" \((" + "|".join(TIME_INTERVALS) + r")\)")
+    names = [a["name"] for a in attrs if not interval.search(a["name"])]
+    plain = {n.casefold() for n in names}
+    key_forms: dict[str, str] = {}
+    if export:
+        for base, a in export_forms(scope, export).items():
+            key = next((f for f in a["forms"] if f["key"] and f["visible"]), None)
+            if key:
+                key_forms[base.casefold()] = str(key["query_as"])
+    by_base: dict[str, list[str]] = {}
+    for n in names:
+        m = _FORM_NAME.match(n)
+        by_base.setdefault((m.group("base") if m else n).casefold(), []).append(n)
+    tables = _attribute_tables(_export_model(export)) if export else {}
+    out = []
+    for base, members in by_base.items():
+        if base in plain:
+            pick = next(n for n in members if n.casefold() == base)
+        elif key_forms.get(base, "").casefold() in {x.casefold() for x in members}:
+            pick = next(n for n in members if n.casefold() == key_forms[base].casefold())
         else:
-            chosen[t] = n
-    return [n for n in names if n not in inherit], inherit
+            ids = [n for n in members if re.search(r"(__id| \(id\))$", n.casefold())]
+            pick = ids[0] if ids else sorted(members)[0]
+        out.append({"name": pick, "attribute": base, "type": types.get(pick, ""),
+                    "tables": sorted(tables[base]) if base in tables else None})
+    return out
 
 
 def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export: dict | None = None,
                      previous: dict | None = None, where: str = "", round_no: int | None = None,
                      max_attributes: int = 300, log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
-    """Does every attribute join each fact table? Through the connector: COUNT(<anchor>) grouped by the
-    attribute, two smallest groups; if both equal the anchor's total, every value gets every fact row (a
-    cross join). An error naming a join is the same verdict. From the export: tables each attribute reaches.
-    Metrics whose formulas name an unjoined attribute filter nothing. With the previous round's output, the
-    declared relationships that were lost or added."""
+    """Does every attribute join each fact table, and does filtering on it filter? Through the connector,
+    per fact table's anchor: COUNT(<anchor>) grouped by the attribute, two smallest groups; both equal to
+    the anchor's total is a cross join (no join path), and an error naming a join is the same verdict. Then
+    COUNT(<anchor>) WHERE attribute = its smallest value: it should equal that value's group; equal to the
+    total means the filter is ignored when the attribute isn't selected. Attributes mapped directly to a
+    fact table (export) aren't tested against it. From the export: tables each attribute reaches, and the
+    declared relationships, compared with the previous round's when both have some."""
     model = scope["model"]
     graph = export_join_graph(export) if export else {}
     facts = _anchors_by_fact(scope)
-    todo, inherit = _testable_attributes(scope, export)
-    todo = todo[:max_attributes]
+    todo = _testable_attributes(scope, export)[:max_attributes]
     results: dict[str, dict[str, dict]] = {}
+    skipped: dict[str, list[str]] = {}
     for fact in facts:
         if runner is None:
             break
-        anchor = fact["anchor"]
+        anchor, ftable = fact["anchor"], (fact.get("table") or "")
         clause = f" WHERE {where}" if where else ""
         try:
             tot = parse_query_result(runner.call("query", {"project": project, "query":
@@ -1815,7 +1870,11 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
         except PendingReply:   # ask for the group queries in the same pass: one replay round, not two
             fact["total"] = "pending"
         log(f"join paths against {anchor}: {len(todo)} attributes")
-        for n in todo:
+        for att in todo:
+            n = att["name"]
+            if att["tables"] is not None and ftable and ftable.casefold() in {t.casefold() for t in att["tables"]}:
+                skipped.setdefault(anchor, []).append(n)   # mapped to this fact table directly
+                continue
             try:
                 parsed = parse_query_result(runner.call("query", {"project": project,
                                                                   "query": join_path_sql(model, n, anchor, where)}))
@@ -1827,40 +1886,63 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
                 results.setdefault(n, {})[anchor] = {"verdict": "join_error" if _JOIN_ERROR.search(err) else "error",
                                                      "error": err[:300]}
                 continue
-            counts = [_num(r.get("n")) for r in parsed["rows"]]
+            rows = [(r.get("v"), _num(r.get("n"))) for r in parsed["rows"]]
+            counts = [c for _, c in rows]
             total = fact["total"]
             if total == "pending":
                 verdict = "pending"
-            elif len(counts) < 2:
+            elif len(rows) < 2:
                 verdict = "single_value"
             elif total and all(c is not None and _close(c, total) for c in counts):
                 verdict = "cross_join"
             else:
                 verdict = "joined"
-            results.setdefault(n, {})[anchor] = {"verdict": verdict, "smallest_groups": counts, "total": total}
-    for n, rep in inherit.items():
-        if rep in results:
-            results[n] = {k: {**v, "inherited_from": rep} for k, v in results[rep].items()}
+            res = {"verdict": verdict, "smallest_groups": [[v, c] for v, c in rows], "total": total}
+            pick = next(((v, c) for v, c in rows if not _blank(v)), None)
+            if verdict in ("joined", "single_value") and pick and total not in (None, "pending"):
+                try:
+                    fq = parse_query_result(runner.call("query", {"project": project, "query": filter_test_sql(
+                        model, n, anchor, pick[0], att["type"], where)}))
+                    got = _num(fq["rows"][0].get("n")) if fq["ok"] and fq["rows"] else None
+                    fv = ("error" if got is None else "ok" if pick[1] is not None and _close(got, pick[1]) else
+                          "ignored" if _close(got, total) else "mismatch")
+                    res["filter"] = {"value": pick[0], "grouped": pick[1], "filtered": got, "verdict": fv,
+                                     **({"error": (fq.get("error") or "")[:300]} if not fq["ok"] else {})}
+                except PendingReply:
+                    res["filter"] = {"value": pick[0], "verdict": "pending"}
+            results.setdefault(n, {})[anchor] = res
     unjoined: dict[str, list[str]] = {}
+    filter_problems: dict[str, list[dict]] = {}
     for n, by_anchor in results.items():
         bad = [a for a, r in by_anchor.items() if r["verdict"] in ("cross_join", "join_error")]
         if bad:
             unjoined[n] = bad
+        for a, r in by_anchor.items():
+            if (r.get("filter") or {}).get("verdict") in ("ignored", "mismatch"):
+                filter_problems.setdefault(n, []).append({"anchor": a, **r["filter"]})
     for u in graph.get("unreachable") or []:
-        if u["attribute"] not in unjoined and u["reaches_no_fact"]:
-            unjoined[u["attribute"]] = ["(export: no shared column with any fact table)"]
+        if u["reaches_no_fact"] and not any(t["attribute"] == u["attribute"] and t["name"] in results for t in todo):
+            unjoined.setdefault(u["attribute"], ["(export: no shared column with any fact table)"])
+    flagged = set(unjoined) | set(filter_problems)
     filtering = []
     for m in scope.get("metrics") or []:
-        f = (m.get("formula") or "").lower()
-        for n in unjoined:
-            if n.lower() in f:
+        f = m.get("formula") or ""
+        for n in sorted(flagged):
+            base = (_FORM_NAME.match(n).group("base") if _FORM_NAME.match(n) else n)
+            names = {n, base}
+            # a whole name between delimiters ({x}, "x", [x], (x)), never a word inside another name
+            if any(re.search(r"[{\"\[(]\s*" + re.escape(x) + r"\s*[}\"\])]", f, re.I) for x in names):
                 filtering.append({"metric": m["name"], "attribute": n})
-    changes = {}
-    if previous is not None and graph.get("relationships") is not None and previous.get("relationships") is not None:
-        old = {(r["parent"], r["child"]) for r in previous["relationships"]}
+    changes: dict[str, Any] = {}
+    prev_rels = (previous or {}).get("relationships")
+    if previous is not None and graph.get("relationships") and prev_rels:
+        old = {(r["parent"], r["child"]) for r in prev_rels}
         new = {(r["parent"], r["child"]) for r in graph["relationships"]}
         changes = {"lost": [{"parent": p, "child": c} for p, c in sorted(old - new)],
                    "added": [{"parent": p, "child": c} for p, c in sorted(new - old)]}
+    elif previous is not None and graph:
+        changes = {"note": "not compared: " + ("the previous round recorded no relationships" if not prev_rels
+                                               else "this export has no relationships")}
     findings = []
     all_anchors = [f["anchor"] for f in facts]
     for n, bad in sorted(unjoined.items()):
@@ -1882,19 +1964,35 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
             "fact's column (or the lookup table's key to an attribute the fact has), or remove the attribute. Say "
             "which, or decline if it is meant to stand alone.", round_no=round_no,
             impact="high" if none else "medium", source="join-paths"))
+    for n, probs in sorted(filter_problems.items()):
+        if n in unjoined:
+            continue
+        mets = [x["metric"] for x in filtering if x["attribute"] == n]
+        detail = "; ".join(f"with {p['anchor']}: {n} = {p['value']!r} counts {p['filtered']} rows filtered, "
+                           f"{p['grouped']} grouped" + (" (the full total: the filter is ignored)"
+                                                        if p["verdict"] == "ignored" else "") for p in probs)
+        findings.append(integrity_finding(
+            f"J-filter-{_slug(n)}", f"Filtering on '{n}' doesn't filter the fact", "relationship",
+            detail + (f". Metrics that filter on it: {mets}" if mets else ""),
+            "Grouped by the attribute the counts are right, but a filter on it alone isn't applied to the fact "
+            "(its table's join to the fact is missing or goes another way). Fix the join or relationship; say "
+            "which, or decline.", round_no=round_no, source="join-paths"))
     for r in changes.get("lost") or []:
         findings.append(integrity_finding(
             f"L-{_slug(r['parent'])}-{_slug(r['child'])}", f"Relationship {r['parent']} -> {r['child']} was lost",
             "relationship", "declared in the previous round's export, missing from this one",
             "Restore it (wire_relationships), or decline if the change was intended. Metrics and SQL that filter "
             "on the parent may now repeat totals or ignore the filter.", round_no=round_no, source="join-paths"))
-    return {"version": 1, "model": model, "facts": facts, "attributes": results,
-            "not_tested": [n for n in todo if n not in results] if runner is not None else todo,
-            "unjoined": unjoined, "metrics_filtering_unjoined": filtering,
+    return {"version": 2, "model": model, "facts": facts, "attributes": results,
+            "skipped_mapped_to_fact": skipped,
+            "not_tested": [t["name"] for t in todo if t["name"] not in results and
+                           not any(t["name"] in v for v in skipped.values())] if runner is not None
+            else [t["name"] for t in todo],
+            "unjoined": unjoined, "filter_problems": filter_problems, "metrics_filtering_flagged": filtering,
             "export": {k: v for k, v in graph.items() if k != "relationships"} if graph else None,
             "relationships": graph.get("relationships") if graph else (previous or {}).get("relationships"),
             "relationship_changes": changes, "findings": findings,
-            "note": "single_value attributes can't be tested: one value looks the same joined or cross-joined"}
+            "note": "single_value: only one group, so a cross join can't be told apart (its filter is still tested)"}
 
 
 def merge_findings(doc: dict, new: list[dict]) -> dict[str, Any]:
@@ -4277,7 +4375,8 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
                                round_no=args.round, max_attributes=args.max_attributes, log=log)
         _write_json(args.out, out)
         print(json.dumps({"out": args.out, "facts": out["facts"], "unjoined": out["unjoined"],
-                          "metrics_filtering_unjoined": out["metrics_filtering_unjoined"],
+                          "filter_problems": sorted(out["filter_problems"]),
+                          "metrics_filtering_flagged": out["metrics_filtering_flagged"],
                           "relationship_changes": out["relationship_changes"],
                           "findings": [f["id"] for f in out["findings"]]}, indent=2))
         return _pending(runner)

@@ -159,9 +159,15 @@ python3 assess_model.py join-paths --project "<project>" --scope scope.json [--m
 With no join path between an attribute's table and a fact table, Mosaic cross-joins: every value of the
 attribute gets the fact's full total, and a metric filtering on it filters nothing. For each fact table's
 anchor, the command groups `COUNT(<anchor>)` by each attribute (two smallest groups): both equal to the
-total is a cross join; an error naming a join is the same verdict. With the export it also says which
-tables each attribute reaches and records the declared relationships, so the next round reports those
-lost or added. An attribute with one value can't be tested. Its findings need the user's answer
+total is a cross join; an error naming a join is the same verdict. It then filters on the smallest
+non-blank value alone (`WHERE attr = v`): the count must equal that value's group; the full total means
+the filter is ignored when the attribute isn't selected, any other count is a mismatch. Every attribute
+is tested by its own connector name (a multi-form attribute by its key form; time intervals left out;
+one value plus blanks is two groups), except against a fact table it is mapped to directly (export).
+Only metrics that read a table's column count as facts (`Sum({Other Metric})` is derived). With the
+export it also says which tables each attribute reaches and records the declared relationships
+(`hierarchy.relationships`), so the next round reports those lost; no comparison when either round has
+none. Its findings need the user's answer
 (`needs_answer`); merge them with `add-findings --findings findings.json --from join_paths.json`.
 
 After any change to the model, also run `references --old-scope <previous scope.json> --scope scope.json
