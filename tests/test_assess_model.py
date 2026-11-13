@@ -1956,7 +1956,7 @@ class FormListingTests(unittest.TestCase):
             {"information": {"name": "Reporting Period"}, "attributeLookupTable": {"name": "facts.csv"},
              "keyForm": {"id": "K"}, "forms": [{"id": "K", "name": "ID", "expressions": [
                  {"expression": {"text": "[PERIOD]"}, "tables": [{"name": "facts.csv"}]},
-                 {"expression": {"text": "[Freddie Month]"}, "tables": [{"name": "Month_Map.csv"}]}]}]}]}]}
+                 {"expression": {"text": "[Calendar Month]"}, "tables": [{"name": "Month_Map.csv"}]}]}]}]}]}
         scope = {"model": "M", "attributes": [{"name": "reporting period", "type": "bigint", "description": "YYYYMM",
                                                "profile": {"distinct_values": 30, "values": ["201901", "202201"]}}]}
         (t,) = [x for x in am.lookup_suggestions(scope, export=export) if x["kind"] == "time_attributes"]
@@ -2026,7 +2026,7 @@ class FormListingTests(unittest.TestCase):
             {"information": {"name": "seller_lookup.csv"}, "physicalTable": {"columns": [
                 {"columnName": "SELLER"}, {"columnName": "SELLER GROUP"}]}},
             {"information": {"name": "Month_Map.csv"}, "physicalTable": {"columns": [
-                {"columnName": "Freddie Month"}, {"columnName": "Activity Month"}]}},
+                {"columnName": "Calendar Month"}, {"columnName": "Activity Month"}]}},
             {"information": {"name": "ptype_lookup.csv"}, "physicalTable": {"columns": [
                 {"columnName": "PT"}, {"columnName": "PT DESC"}]}}],
             "factMetrics": [{"expressions": [{"tables": [{"name": "facts.csv"}]}]}],
@@ -2035,7 +2035,7 @@ class FormListingTests(unittest.TestCase):
                                                                      ("SELLER", "facts.csv")])]),
                 attr("Seller Group", "seller_lookup.csv", [("K", "ID", "ID", [("SELLER GROUP", "seller_lookup.csv")])]),
                 attr("Reporting Period", "facts.csv", [("K", "ID", "ID", [("PERIOD", "facts.csv"),
-                                                                          ("Freddie Month", "Month_Map.csv")])]),
+                                                                          ("Calendar Month", "Month_Map.csv")])]),
                 attr("Activity Month", "Month_Map.csv", [("K", "ID", "ID", [("Activity Month", "Month_Map.csv")])]),
                 attr("Property Type", None, [("K", "ID", "ID", [("PT", "ptype_lookup.csv"), ("PT", "facts.csv")]),
                                              ("D", "DESC", "DESC", [("PT DESC", "ptype_lookup.csv")])])]}]}
@@ -2050,7 +2050,7 @@ class FormListingTests(unittest.TestCase):
         self.assertEqual({t: g["key"] for t, g in tables.items()},
                          {"seller_lookup.csv": "seller name", "Month_Map.csv": "reporting period",
                           "ptype_lookup.csv": "property type"})   # the join, though the other attribute has more values
-        self.assertEqual(tables["Month_Map.csv"]["read_as"]["Freddie Month"], "reporting period")
+        self.assertEqual(tables["Month_Map.csv"]["read_as"]["Calendar Month"], "reporting period")
         self.assertNotIn("PERIOD", tables["Month_Map.csv"]["read_as"])      # that column is the fact's
         self.assertEqual(tables["ptype_lookup.csv"]["read_as"]["PT DESC"], "property type__desc")
         self.assertEqual(tables["seller_lookup.csv"]["declared"], ["seller group"])
