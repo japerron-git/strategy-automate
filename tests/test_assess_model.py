@@ -1926,3 +1926,39 @@ class RelationshipErrorTests(unittest.TestCase):
                  "metrics": []}
         out = am.review_relationships(R(), "p", scope, entity="store id")
         self.assertEqual(out["failed_queries"], ["Query failed: per-job memory limit"])
+
+
+class FormListingTests(unittest.TestCase):
+    """The connector can list an attribute only through its forms ('<attribute> (id)'): the export's forms
+    are still matched, so hidden forms and the columns they read are found."""
+
+    def test_attribute_listed_only_as_its_id_form(self):
+        T = ExistingTableTests
+        scope = dict(T.SCOPE, attributes=[a for a in T.SCOPE["attributes"] if a["name"] != "status bucket"]
+                     + [{"name": "status bucket (id)", "type": "varchar"}])
+        forms = am.export_forms(scope, T.EXPORT)
+        self.assertIn("status bucket", forms)
+        key = next(f for f in forms["status bucket"]["forms"] if f["key"])
+        self.assertEqual((key["visible"], key["query_as"]), (True, "status bucket (id)"))
+        hidden = am.hidden_forms(scope, T.EXPORT)
+        self.assertEqual(sorted(h["form"] for h in hidden), ["DESC", "Status Bucket"])
+        tables = am.existing_lookup_tables(scope, relationships=T.REL, export=T.EXPORT)
+        self.assertEqual(tables["status_map.csv"]["read_as"]["BUCKET SORT"], "status bucket (id)")
+        self.assertEqual(tables["status_map.csv"]["read_as"]["BUCKET"], "status bucket (status bucket)")
+
+    def test_blank_keys_counted_on_the_tables_key_and_time_attributes_name_every_table(self):
+        T = ExistingTableTests
+        probes = {"attributes": [{"name": "late flag", "issues": ["filtered to x = Y: keeps 10 of 20 fact rows (10 lost)"]}]}
+        sugg = am.lookup_suggestions(T.SCOPE, relationships=T.REL, probes=probes, export=T.EXPORT, time_attributes=False)
+        (b,) = [x for x in sugg if x["kind"] == "blank_key"]
+        self.assertEqual(b["count_on"], "status code")                        # the column that joins the fact
+        export = {"model": [{"tables": [], "attributes": [
+            {"information": {"name": "Reporting Period"}, "attributeLookupTable": {"name": "facts.csv"},
+             "keyForm": {"id": "K"}, "forms": [{"id": "K", "name": "ID", "expressions": [
+                 {"expression": {"text": "[PERIOD]"}, "tables": [{"name": "facts.csv"}]},
+                 {"expression": {"text": "[Freddie Month]"}, "tables": [{"name": "Month_Map.csv"}]}]}]}]}]}
+        scope = {"model": "M", "attributes": [{"name": "reporting period", "type": "bigint", "description": "YYYYMM",
+                                               "profile": {"distinct_values": 30, "values": ["201901", "202201"]}}]}
+        (t,) = [x for x in am.lookup_suggestions(scope, export=export) if x["kind"] == "time_attributes"]
+        self.assertEqual(t["tables"], ["facts.csv", "Month_Map.csv"])
+        self.assertIn("each of these tables", t["shared_table_note"])

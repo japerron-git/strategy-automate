@@ -1572,21 +1572,27 @@ def export_forms(scope: dict, export: dict | None) -> dict[str, dict[str, Any]]:
     for a in model.get("attributes") or []:
         mname = str((a.get("information") or {}).get("name") or "")
         cname = mname.lower()
-        if cname.casefold() not in listed:
+        # the connector may list an attribute only through its forms ("<attribute> (id)", "<attribute>__<form>")
+        if cname.casefold() not in listed and not any(n.startswith(cname.casefold() + " (") or
+                                                       n.startswith(cname.casefold() + "__") for n in listed):
             continue
         key_id = (a.get("keyForm") or {}).get("id")
-        forms = []
+        forms, tables = [], []
         for f in a.get("forms") or []:
+            for e in f.get("expressions") or []:
+                tables += [str(t.get("name")) for t in e.get("tables") or [] if t.get("name")]
             text = ((f.get("expressions") or [{}])[0].get("expression") or {}).get("text") or ""
             col = text[1:-1] if re.fullmatch(r"\[[^\[\]]+\]", text.strip()) else ""
             fname = str(f.get("name") or "").lower()
             is_key = f.get("id") == key_id
-            cands = [cname] if is_key else [f"{cname}__{fname}", f"{cname} ({fname})"]
+            cands = ([cname, f"{cname} ({fname})", f"{cname}__{fname}", f"{cname} (id)", f"{cname}__id"] if is_key
+                     else [f"{cname}__{fname}", f"{cname} ({fname})"])
             visible = next((c for c in cands if c.casefold() in listed), None)
             forms.append({"form": f.get("name"), "category": f.get("category"), "column": col, "key": is_key,
                           "visible": bool(visible), "query_as": visible or (cname if is_key else f"{cname} ({fname})"),
                           "describes": not is_key and bool(_DESC_FORM.search(f"{f.get('name')} {f.get('category')}"))})
-        out[cname] = {"table": (a.get("attributeLookupTable") or {}).get("name"), "forms": forms}
+        out[cname] = {"table": (a.get("attributeLookupTable") or {}).get("name"), "forms": forms,
+                      "tables": list(dict.fromkeys(tables))}
     return out
 
 
@@ -1617,7 +1623,8 @@ def existing_lookup_tables(scope: dict, *, relationships: dict | None = None, pr
         by_table: dict[str, list[str]] = {}
         for a in model.get("attributes") or []:
             t = (a.get("attributeLookupTable") or {}).get("name")
-            n = names.get(str((a.get("information") or {}).get("name") or "").casefold())
+            raw = str((a.get("information") or {}).get("name") or "").casefold()
+            n = names.get(raw) or (raw if raw in forms else None)
             if t and n:
                 by_table.setdefault(t, []).append(n)
         if not fact_tables and by_table:   # no metrics read in the export: the table most attributes use is the fact
@@ -1627,8 +1634,14 @@ def existing_lookup_tables(scope: dict, *, relationships: dict | None = None, pr
                 continue
             cols = [c.get("columnName") or (c.get("information") or {}).get("name")
                     for c in ((tables.get(t) or {}).get("physicalTable") or {}).get("columns") or []]
-            read_as = {f["column"]: f["query_as"] for n in attrs for f in (forms.get(n.lower()) or {}).get("forms", [])
-                       if f["column"]}
+            read_as: dict[str, str] = {}
+            for n in attrs:   # a column read by several forms: prefer one the connector lists, else the first
+                for f in (forms.get(n.lower()) or {}).get("forms", []):
+                    if f["column"] and (f["column"] not in read_as or f["visible"] and not read_as.get("_v_" + f["column"])):
+                        read_as[f["column"]] = f["query_as"]
+                        if f["visible"]:
+                            read_as["_v_" + f["column"]] = "1"
+            read_as = {k: v for k, v in read_as.items() if not k.startswith("_v_")}
             groups[t] = {"attributes": attrs, "columns": [c for c in cols if c], "source": "model export",
                          "read_as": read_as,
                          "described": [n for n in attrs if any(f["describes"] for f in (forms.get(n.lower()) or {})
@@ -1735,7 +1748,10 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                for a in (probes or {}).get("attributes") or []}
     for n, lost in lost_by.items():
         if lost and n in names:   # rows lost through an attribute's lookup, whether or not it gets a CSV
+            g = existing.get(in_table.get(n, ""), {})
+            key = g.get("key") if g and g.get("key") != n else None   # the column that joins the fact
             out.append({"id": f"B-{_slug(n)}", "kind": "blank_key", "attribute": n, "rows_lost": lost,
+                        "count_on": key or n,
                         "reason": "the probe saw fact rows lost through this attribute's lookup (often a blank key "
                                   "that no lookup row matches): give blank a code in the source, then a lookup row "
                                   "for it",
@@ -1766,11 +1782,13 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                 continue
             pattern = "" if is_date else date_pattern(a)
             month_grain = pattern == "yyyyMM"
-            home = (export_forms(scope, export).get(a["name"].lower()) or {}).get("table")
+            ef = export_forms(scope, export).get(a["name"].lower()) or {}
+            homes = ef.get("tables") or ([ef["table"]] if ef.get("table") else [])
             out.append({"id": f"T-{_slug(a['name'])}", "kind": "time_attributes", "attribute": a["name"],
-                        "table": home,
-                        "shared_table_note": (f"the column lives in '{home}': converting its type changes the table, so "
-                                              f"check whether other models read the same file") if home else None,
+                        "table": homes[0] if homes else None, "tables": homes,
+                        "shared_table_note": (f"the attribute reads {', '.join(repr(h) for h in homes)}: converting its "
+                                              f"type changes {'each of these tables' if len(homes) > 1 else 'that table'}, "
+                                              f"so check whether other models read the same files") if homes else None,
                         "convert": {"type": "date", "date_format": pattern} if pattern else None,
                         "intervals": ["year", "quarter", "month"] if month_grain or is_date
                         else ["year", "quarter", "month", "day"],
@@ -1864,8 +1882,11 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
         if sug["kind"] in ("blank_key", "hidden_form"):
             extra = {}
             if sug["kind"] == "blank_key":
-                b = _blank_key_rows(runner, project, scope, sug["attribute"], where)
-                extra = _blank_note(b, sug["attribute"], sug.get("rows_lost")) if b else {}
+                on = sug.get("count_on") or sug["attribute"]
+                b = _blank_key_rows(runner, project, scope, on, where)
+                extra = _blank_note(b, on, sug.get("rows_lost")) if b else {
+                    "blank_key_note": f"no blank '{on}' rows: '{sug['attribute']}' has no column in the fact, so the rows "
+                                      f"are lost through its table's key; name that key with a model export"}
             done.append({**sug, **extra, "csv": None})
             continue
         blank = _blank_key_rows(runner, project, scope, sug["attribute"], where)
