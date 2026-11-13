@@ -535,6 +535,12 @@ _RAW_METRIC = re.compile(r"^(sum|avg|min|max|count)\(\s*[^(){}]+\.(\{[^{}]+\}|[A
 _DEFAULT_NAME = re.compile(r"^(total|sum of|average|avg|count of|count)\b.*\(.*\)$|^[a-z0-9]+(_[a-z0-9]+)+$", re.I)
 _ATTRIBUTE_LIKE = re.compile(r"\b(id|code|key|number|zip|postal|year|month|flag|indicator|status|type)\b", re.I)
 _NUMERIC = ("bigint", "integer", "int", "double", "decimal", "real", "float", "smallint", "tinyint")
+def _weighted_part(m: dict) -> bool:
+    """A weighted average's numerator (Sum(rate * weight)) or denominator is meant to be summed."""
+    return bool(re.search(r"\b(numerator|denominator|weight|weighted)\b", _words(m.get("name") or ""))
+                or "*" in (m.get("formula") or ""))
+
+
 _SUMMED_NONADDITIVE = re.compile(r"\b(rate|ratio|score|percent|percentage|pct|age|months|term|price|index|"
                                  r"average|avg|mean|latitude|longitude)\b", re.I)
 
@@ -647,7 +653,8 @@ def maturity_signals(scope: dict) -> dict[str, Any]:
     integer_dates = [a["name"] for a in attrs if looks_like_integer_date(a)]
     text_dates = [a["name"] for a in attrs if (a.get("type") or "").lower() in _TEXT_TYPES and looks_like_stored_date(a)]
     summed_nonadditive = [m["name"] for m in metrics if m.get("formula") and
-                          re.match(r"^sum\(", m["formula"].strip(), re.I) and _SUMMED_NONADDITIVE.search(_words(m["name"]))]
+                          re.match(r"^sum\(", m["formula"].strip(), re.I) and _SUMMED_NONADDITIVE.search(_words(m["name"]))
+                          and not _weighted_part(m)]
     text_metrics = [m["name"] for m in metrics if m.get("type", "").lower() in ("varchar", "char", "string", "text")]
     share = round(described / total, 3)
     structural = len(summed_nonadditive) >= 3 or len(integer_dates) + len(text_dates) >= 2 or bool(text_metrics)
@@ -3065,7 +3072,110 @@ def _compare(q: dict, rows: list[dict], ref: list[dict], tol: float) -> tuple[st
                                float(tol), str(q.get("id")))
         return {"ok": "pass", "mismatch": "fail", "empty": "empty"}.get(cmp["status"], "fail"), cmp, None
     except SystemExit as e:
-        return "error", None, f"comparison: {e}"
+        msg = str(e)
+        if "duplicate keys" in msg:
+            msg += (" — the result repeats a group. Grouping by an expression of an attribute doesn't regroup in "
+                    "Mosaic: rewrite the SQL to group by the attribute or its time attribute (reason kind sql_error)")
+        return "error", None, f"comparison: {msg}"
+
+
+_SQL_KW_END = re.compile(r"\b(having|order\s+by|limit|union|except|intersect|window|qualify|offset|fetch)\b", re.I)
+
+
+def _split_top(text: str, sep: str = ",") -> list[str]:
+    out, depth, cur = [], 0, []
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == sep and depth == 0:
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur))
+    return [x.strip() for x in out if x.strip()]
+
+
+def _strip_alias(item: str) -> tuple[str, str]:
+    m = re.match(r"^(.*?)\s+(?:as\s+)?(\"[^\"]+\"|[A-Za-z_]\w*)$", item.strip(), re.I | re.S)
+    if m and not re.fullmatch(r"\"[^\"]+\"|[A-Za-z_]\w*", item.strip()) and not m.group(1).rstrip().endswith(
+            (".", "(")):
+        return m.group(1).strip(), m.group(2).strip('"').lower()
+    return item.strip(), ""
+
+
+def grouped_expressions(sql: str) -> list[str]:
+    """Expressions a query groups by, at any level, instead of a plain column: in Mosaic grouping by an
+    expression computed from an attribute doesn't regroup (each underlying value stays its own row), even in
+    an outer query over a subquery. Group by the attribute itself, or its time attribute."""
+    text = _SQL_LITERAL.sub("''", sql or "")
+    depth, d = [], 0
+    for ch in text:
+        if ch == "(":
+            d += 1
+            depth.append(d)
+        elif ch == ")":
+            depth.append(d)
+            d -= 1
+        else:
+            depth.append(d)
+    low = text.lower()
+
+    def at(i: int) -> int:
+        return depth[i] if i < len(depth) else 0
+
+    def region_end(i: int, dd: int) -> int:
+        j = i
+        while j < len(text) and not (text[j] == ")" and at(j) == dd):
+            j += 1
+        return j
+
+    def find(word: str, start: int, stop: int, dd: int) -> int:
+        for m in re.finditer(word, low[start:stop]):
+            k = start + m.start()
+            if at(k) == dd:
+                return k
+        return -1
+    found: list[str] = []
+    bare = re.compile(r'(?:(?:"[^"]+"|[A-Za-z_]\w*)\.)?(?:"[^"]+"|[A-Za-z_]\w*)')
+    for m in re.finditer(r"\bselect\b", low):
+        i = m.start()
+        dd = at(i)
+        end = region_end(i, dd)
+        f = find(r"\bfrom\b", m.end(), end, dd)
+        g = find(r"\bgroup\s+by\b", m.end(), end, dd)
+        if f < 0 or g < 0 or g < f:
+            continue
+        gstart = g + len(re.match(r"group\s+by", low[g:]).group(0))
+        stop = end
+        for kw in re.finditer(_SQL_KW_END, low[gstart:end]):
+            if at(gstart + kw.start()) == dd:
+                stop = gstart + kw.start()
+                break
+        select_items = _split_top(text[m.end():f])
+        aliases = {}
+        for it in select_items:
+            expr, alias = _strip_alias(it)
+            if alias:
+                aliases[alias] = expr
+        for item in _split_top(text[gstart:stop]):
+            expr = item
+            if re.fullmatch(r"\d+", item) and 0 < int(item) <= len(select_items):
+                expr = _strip_alias(select_items[int(item) - 1])[0]
+            elif item.strip('"').lower() in aliases:
+                expr = aliases[item.strip('"').lower()]
+            e = expr.strip()
+            if not bare.fullmatch(e) and not re.fullmatch(r"-?\d+(\.\d+)?|''", e):
+                found.append(e)
+    return found
+
+
+def _sql_lint(sql: str) -> list[str]:
+    bad = grouped_expressions(sql)
+    return [f"it groups by an expression of an attribute ({', '.join(b[:60] for b in bad)}), which doesn't regroup in "
+            f"Mosaic: group by the attribute itself or its time attribute ((year), (month) forms)"] if bad else []
 
 
 def best_answer_version(q: dict) -> int:
@@ -3118,6 +3228,7 @@ def set_best_answer(bank: dict, qid: str, *, sql: str = "", not_answerable: str 
         problems.append("an override needs --reason: what was decided, what changed in the data, or what was wrong")
     if sql.strip() and _WS.sub(" ", sql.strip()).lower() == _WS.sub(" ", (q.get("sql") or "").strip()).lower():
         problems.append("the best answer must be independent of the question's own SQL, or it proves nothing")
+    problems += [f"the best answer: {p}" for p in _sql_lint(sql)]
     if problems:
         return {"ok": False, "problems": problems}
     history = list((current or {}).get("history") or [])
@@ -3158,6 +3269,7 @@ def set_question_sql(bank: dict, qid: str, *, sql: str = "", not_answerable: boo
         problems.append("the question's SQL can't be its best answer: then the grade proves nothing")
     if path and path not in PATHS:
         problems.append(f"path must be one of {', '.join(PATHS)}")
+    problems += [f"the SQL: {p}" for p in _sql_lint(sql)]
     if problems:
         return {"ok": False, "problems": problems}
     history = list(q.get("sql_history") or [])
@@ -3225,7 +3337,9 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
             item["note"] = res.get("error")
             item["no_sql"] = True
         elif not res.get("ok"):
-            item.update({"verdict": "error", "note": res.get("error")})
+            # a timeout says the query is slow, not that the model answered wrong
+            timed = bool(re.search(r"timed?\s*out|timeout|deadline exceeded", str(res.get("error") or ""), re.I))
+            item.update({"verdict": "timeout" if timed else "error", "note": res.get("error")})
         else:
             ref, why = _reference_rows(q, res, bank_dir)
             tol = exp.get("tolerance", tolerance if tolerance is not None else 1e-6)
@@ -3299,14 +3413,14 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
         # Answerability: questions that could not run before and now do, and paths that got simpler.
         rank = {p: i for i, p in enumerate(PATHS)}
         runnable_before = {g.get("id") for g in previous.get("questions") or []
-                           if g.get("verdict") not in ("error", "not_run") and not g.get("no_sql")
+                           if g.get("verdict") not in ("error", "timeout", "not_run") and not g.get("no_sql")
                            and not str(g.get("note") or "").startswith("no sql")}
         newly, simpler = [], []
         for g in graded:
             p = prev.get(g["id"])
             if not p:
                 continue
-            if g["id"] not in runnable_before and g.get("verdict") not in ("error", "not_run") and not g.get("no_sql"):
+            if g["id"] not in runnable_before and g.get("verdict") not in ("error", "timeout", "not_run") and not g.get("no_sql"):
                 newly.append(g["id"])
             before_path, after_path = p.get("expected_path"), g.get("expected_path")
             if before_path in rank and after_path in rank and rank[after_path] < rank[before_path]:
@@ -3985,6 +4099,9 @@ def check_bank(bank: dict) -> dict[str, Any]:
             problems.append(f"{qid}: missing sql")
         if (q.get("sql") or "").strip() and "{{MODEL}}" not in q["sql"]:
             warnings.append(f"{qid}: sql has no {{{{MODEL}}}} placeholder")
+        for where, text in (("sql", q.get("sql") or ""), ("best answer", (q.get("best_answer") or {}).get("sql") or "")):
+            for lint in _sql_lint(text):
+                warnings.append(f"{qid}: {where}: {lint}; fix with reason kind sql_error")
         for key in ("key", "measures", "metrics", "domain_claims"):
             if key in q and not isinstance(q[key], list):
                 problems.append(f"{qid}: {key} must be a list")

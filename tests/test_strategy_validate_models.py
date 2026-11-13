@@ -105,3 +105,10 @@ class ValidatorSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GroupedNumberKeyTests(unittest.TestCase):
+    def test_thousands_separators_dropped_from_number_keys(self):
+        self.assertEqual(svm.key_for({"y": "2,015"}, ["y"]), ("2015",))
+        self.assertEqual(svm.key_for({"y": "Smith, John"}, ["y"]), ("Smith, John",))
+        self.assertEqual(svm.key_for({"y": "1,234,567.5"}, ["y"]), ("1234567.5",))

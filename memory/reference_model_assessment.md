@@ -160,6 +160,38 @@ Aggregates of fact metrics run on the fact. So:
   facts can be steered to one fact by adding a hint metric from that fact to the query; use one anchor
   per fact table, and say in descriptions which hint metric to add.
 
+**Saved SQL is checked for the no-regroup rule.** `question-sql` and `best-answer` refuse SQL that groups
+by an expression instead of a plain column, at any level (an outer query over a subquery too), and
+`check --bank` warns about any already in the bank. Seen live: a vintage grouped by
+`CAST(date / 100 AS INTEGER)` returned each year several times (the comparison failed on duplicate
+keys), and FICO bands grouped by a `CASE` timed out. Group by the attribute or its time attribute.
+Number keys lose their thousands separators before comparison ("2,015" = "2015"). A query that times
+out is graded `timeout`, not `error`: it says the query is slow (or wrongly shaped), not that the model
+answered wrong. The maturity check for summed rates leaves out weighted-average parts (a numerator
+`Sum(rate * weight)` or its denominator).
+
+## Open items (engine and plugin)
+
+- **Which export and scope each output used.** `lookups.json`, `join_paths.json` and `probes.json` don't
+  record it, so outputs from different exports mix unnoticed (a table replaced since the lookups ran
+  still shows as the one to extend). Record it in each output; the workbook warns when they differ or a
+  table named has been replaced, and marks a lookup check "out of date".
+- **Descriptions for derived metrics and the model.** `rename_describe` covers attributes and fact
+  metrics only, so these fall back to manual steps. To verify live: a full-body PUT of a derived metric
+  changes only its description; a PATCH of the data model sets the model description. Then both join
+  the one phase-6 command.
+- **Showing hidden forms.** No command makes a hidden form visible. To verify live: adding the form to
+  the attribute's report and browse displays makes the connector list it. Then a `show_forms` action,
+  proposed by the hidden-form suggestions and re-checked on a fresh export before planning.
+- **Questions out of approved findings.** A step that is a question for the data owner (a design, a
+  data review) sits inside approved findings as a manual step. It should be its own finding that needs
+  an answer, with no action; `plan` should report the manual steps per phase.
+- **Reloading a table.** No command replaces a file table's data, so lookup extensions are reloaded by
+  hand, which has dropped attribute relationships (seen live: four filters stopped applying). To find:
+  whether the API can replace a table's data (`build_mosaic.py openapi-search`). If it can, the lookup
+  step reloads, re-runs `join-paths` and proposes lost relationships back in the same phase; if not, the
+  script stops after the manual reload until the relationships check passes.
+
 ## Question levels
 
 | Level | What it asks | Typical SQL | Default share |

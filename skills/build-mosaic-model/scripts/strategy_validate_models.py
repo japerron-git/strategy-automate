@@ -201,10 +201,20 @@ def split_cols(value: str) -> list[str]:
     return [part.strip() for part in (value or "").split(",") if part.strip()]
 
 
+_GROUPED_NUMBER = re.compile(r"-?\d{1,3}(,\d{3})+(\.\d+)?")
+
+
+def _key_text(value: Any) -> str:
+    """A key as text. The Mosaic connector shows numbers with thousands separators ("2,015"), a reference
+    file doesn't: a number written that way loses them, so the two match."""
+    text = str(value)
+    return text.replace(",", "") if _GROUPED_NUMBER.fullmatch(text.strip()) else text
+
+
 def key_for(row: dict[str, Any], key_cols: list[str]) -> tuple:
     if not key_cols:
         return ()
-    return tuple(NULL_SENTINEL if row.get(col) in (None, "") else str(row.get(col)) for col in key_cols)
+    return tuple(NULL_SENTINEL if row.get(col) in (None, "") else _key_text(row.get(col)) for col in key_cols)
 
 
 def number(value: Any) -> float | None:

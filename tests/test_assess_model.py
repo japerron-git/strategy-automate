@@ -2505,3 +2505,44 @@ class UnbracedFormulaTests(unittest.TestCase):
         self.assertEqual(am.raw_fact_metrics(metrics), ["order quantity", "total"])
         self.assertEqual(am._metric_table(metrics[0]), "retail_orders.xlsx")
         self.assertEqual(am._metric_table(metrics[2]), "retail_orders.xlsx")
+
+
+class SqlLintTests(unittest.TestCase):
+    CASES = {
+        'SELECT CAST("open date" / 100 AS INTEGER) AS y, SUM("x") FROM t GROUP BY 1 ORDER BY 1': 1,
+        'SELECT "region", SUM("x") AS s FROM t GROUP BY 1 ORDER BY 2': 0,
+        'SELECT "region", SUM("x") FROM t GROUP BY "region" HAVING SUM("x") > 1': 0,
+        'SELECT v, SUM(n) FROM (SELECT "a" AS v, COUNT("m") AS n FROM t GROUP BY "a") GROUP BY v': 0,
+        "SELECT CASE WHEN v > 5 THEN 'hi' ELSE 'lo' END AS b, SUM(n) FROM "
+        '(SELECT "a" AS v, COUNT("m") AS n FROM t GROUP BY "a") GROUP BY 1': 1,          # outer query too
+        'SELECT "a" / 100 AS yr, SUM("x") FROM t GROUP BY yr': 1,
+        'SELECT t."a", "b", SUM("x") FROM t GROUP BY 1, 2': 0,
+        'SELECT SUM("x") FROM t WHERE "a" = \'GROUP BY x\'': 0,
+        'SELECT "open date (year)__id" AS y, SUM("x") FROM t GROUP BY 1': 0,
+    }
+
+    def test_grouped_expressions(self):
+        for sql, n in self.CASES.items():
+            self.assertEqual(len(am.grouped_expressions(sql)), n, sql)
+
+    def test_refused_when_saved_and_warned_in_check(self):
+        bad = 'SELECT CAST("open date" / 100 AS INTEGER) AS y, SUM("x") FROM {{MODEL}} GROUP BY 1'
+        bank = {"model": "M", "questions": [{"id": "Q1", "level": 1, "question": "q", "sql": 'SELECT 1 FROM {{MODEL}}'}]}
+        res = am.set_question_sql(bank, "Q1", sql=bad, reason_kind="sql_error", reason="x")
+        self.assertFalse(res["ok"])
+        self.assertIn("doesn't regroup", " ".join(res["problems"]))
+        bank["questions"][0]["sql"] = bad
+        self.assertTrue(any("doesn't regroup" in w for w in am.check_bank(bank)["warnings"]))
+
+    def test_weighted_average_parts_are_not_summed_rates(self):
+        metrics = [{"name": "wa rate numerator", "formula": "Sum(Max({Rate}) * Max({Balance}))"},
+                   {"name": "wa rate denominator", "formula": "Sum((Max({Balance}) * Max({Rate})) / Max({Rate}))"},
+                   {"name": "interest rate", "formula": "Sum(t.csv.{Rate})"}]
+        self.assertEqual([m["name"] for m in metrics if not am._weighted_part(m)], ["interest rate"])
+
+    def test_timeout_has_its_own_verdict(self):
+        bank = {"model": "M", "questions": [{"id": "Q1", "level": 1, "question": "q", "sql": "SELECT 1",
+                                             "expected": {"source": "none"}}]}
+        results = {"results": [{"id": "Q1", "ok": False, "error": 'tool "query" timed out after 230s'}]}
+        g = am.grade_bank(bank, results)
+        self.assertEqual(g["questions"][0]["verdict"], "timeout")
