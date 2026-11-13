@@ -528,7 +528,9 @@ def choose_anchor(runner: Runner, project: str, model: str, metrics: list[dict],
                     "with several fact tables needs one anchor per fact."}
 
 
-_RAW_METRIC = re.compile(r"^(sum|avg|min|max|count)\(\s*[^(){}]*\{[^{}]+\}\s*\)$", re.I)
+# one aggregation of one column: "sum(table.csv.{Net Sales})", or with no braces when the column has no space
+# ("sum(retail_orders.xlsx.Quantity)")
+_RAW_METRIC = re.compile(r"^(sum|avg|min|max|count)\(\s*[^(){}]*(\{[^{}]+\}|\.[A-Za-z_][\w]*)\s*\)$", re.I)
 _DEFAULT_NAME = re.compile(r"^(total|sum of|average|avg|count of|count)\b.*\(.*\)$|^[a-z0-9]+(_[a-z0-9]+)+$", re.I)
 _ATTRIBUTE_LIKE = re.compile(r"\b(id|code|key|number|zip|postal|year|month|flag|indicator|status|type)\b", re.I)
 _NUMERIC = ("bigint", "integer", "int", "double", "decimal", "real", "float", "smallint", "tinyint")
@@ -941,8 +943,12 @@ def _blank(v: Any) -> bool:
     return v is None or str(v).strip().lower() in ("", "null", "none")
 
 
+_TABLE_OF_BARE = re.compile(r"^\w+\(\s*([^(){}]+)\.[A-Za-z_]\w*\s*\)$")
+
+
 def _metric_table(m: dict) -> str:
-    hit = _TABLE_OF.search(m.get("formula") or "")
+    f = (m.get("formula") or "").strip()
+    hit = _TABLE_OF.search(f) or _TABLE_OF_BARE.match(f)
     return hit.group(1).strip().lower() if hit else ""
 
 
@@ -1805,10 +1811,9 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
         try:
             tot = parse_query_result(runner.call("query", {"project": project, "query":
                                                            f"SELECT COUNT({quote_ident(anchor)}) AS n FROM {quote_model(model)}{clause}"}))  # nosec B608  # identifiers are quoted; the connector is read-only
-        except PendingReply:
+            fact["total"] = _num(tot["rows"][0].get("n")) if tot["ok"] and tot["rows"] else None
+        except PendingReply:   # ask for the group queries in the same pass: one replay round, not two
             fact["total"] = "pending"
-            continue
-        fact["total"] = _num(tot["rows"][0].get("n")) if tot["ok"] and tot["rows"] else None
         log(f"join paths against {anchor}: {len(todo)} attributes")
         for n in todo:
             try:
@@ -1824,7 +1829,9 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
                 continue
             counts = [_num(r.get("n")) for r in parsed["rows"]]
             total = fact["total"]
-            if len(counts) < 2:
+            if total == "pending":
+                verdict = "pending"
+            elif len(counts) < 2:
                 verdict = "single_value"
             elif total and all(c is not None and _close(c, total) for c in counts):
                 verdict = "cross_join"

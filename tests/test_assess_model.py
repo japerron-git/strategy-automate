@@ -2397,3 +2397,15 @@ class PhaseGateTests(unittest.TestCase):
         answered = am.build_plan(self._doc("declined"), model_id="MID")
         self.assertNotIn("blocked_by", next(p for p in answered["phases"] if p["phase"] == 4))
         self.assertNotEqual(plan["plan_id"], answered["plan_id"])     # a newer plan has another id
+
+
+class UnbracedFormulaTests(unittest.TestCase):
+    """A column with no space appears without braces in the formula (seen live)."""
+
+    def test_raw_metric_and_table(self):
+        metrics = [{"name": "order quantity", "type": "bigint", "formula": "sum(retail_orders.xlsx.Quantity)"},
+                   {"name": "total", "type": "double", "formula": "sum(retail_orders.xlsx.{Order Total})"},
+                   {"name": "ratio", "type": "double", "formula": "total / order quantity"}]
+        self.assertEqual(am.raw_fact_metrics(metrics), ["order quantity", "total"])
+        self.assertEqual(am._metric_table(metrics[0]), "retail_orders.xlsx")
+        self.assertEqual(am._metric_table(metrics[1]), "retail_orders.xlsx")
