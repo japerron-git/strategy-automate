@@ -1654,13 +1654,16 @@ def apply_reference_changes(bank: dict, changes: list[dict], *, round_no: int | 
 
 def integrity_finding(fid: str, title: str, category: str, observed: str, recommendation: str, *,
                       round_no: int | None, questions: list[str] | None = None, impact: str = "high",
-                      source: str = "") -> dict[str, Any]:
-    """A finding a person must answer: proposed, flagged needs_answer, no action until they decide one."""
+                      source: str = "", actions: list[dict] | None = None,
+                      checks: list[dict] | None = None) -> dict[str, Any]:
+    """A finding a person must answer: proposed and flagged needs_answer. Its actions, when the engine can
+    work one out, are a proposal: approving the finding plans them, declining drops them. Its checks name
+    the command whose next run shows it fixed (verify-changes marks it verified from that run)."""
     return {"id": fid, "title": title, "category": category, "impact": impact, "effort": "small",
             "evidence": {"questions": list(questions or []), "observed": observed},
-            "recommendation": recommendation, "actions": [], "risks": [], "depends_on": [],
-            "tests": list(questions or []), "status": "proposed", "needs_answer": True,
-            "introduced_in_round": round_no, "source": source}
+            "recommendation": recommendation, "actions": list(actions or []), "risks": [], "depends_on": [],
+            "tests": list(questions or []), "checks": list(checks or []), "status": "proposed",
+            "needs_answer": True, "introduced_in_round": round_no, "source": source}
 
 
 def reference_findings(changes: list[dict], usage: dict, round_no: int | None) -> list[dict[str, Any]]:
@@ -1848,6 +1851,58 @@ def _testable_attributes(scope: dict, export: dict | None) -> list[dict[str, Any
     return out
 
 
+def _join_attributes(export: dict | None) -> dict[str, dict[str, str]]:
+    """For each attribute on a lookup table, the attribute of that table that joins the fact (its forms read
+    both): the child a parent on the table needs a relationship to. Only when exactly one does."""
+    model = _export_model(export)
+    if not model:
+        return {}
+    facts = {f.casefold() for f in _export_fact_tables(model)}
+    tables = _attribute_tables(model)
+    display = {str((a.get("information") or {}).get("name") or "").lower(): str((a.get("information") or {}).get("name"))
+               for a in model.get("attributes") or []}
+    lookup = {str((a.get("information") or {}).get("name") or "").lower(): (a.get("attributeLookupTable") or {}).get("name")
+              for a in model.get("attributes") or []}
+    out: dict[str, dict[str, str]] = {}
+    for n, t in lookup.items():
+        if not t or str(t).casefold() in facts:
+            continue
+        joiners = [c for c, tabs in tables.items() if c != n and t in tabs and {x.casefold() for x in tabs} & facts]
+        if len(joiners) == 1:
+            out[n] = {"parent": display.get(n, n), "child": display.get(joiners[0], joiners[0]), "table": str(t)}
+    return out
+
+
+def _lost_relationship_spec(export: dict | None, r: dict, typ: str | None) -> dict[str, str] | None:
+    model = _export_model(export)
+    if not model:
+        return None
+    attrs = {str((a.get("information") or {}).get("name") or "").lower(): a for a in model.get("attributes") or []}
+    p, c = attrs.get(r["parent"]), attrs.get(r["child"])
+    if not p or not c:
+        return None   # one of them is gone: a person decides
+    shared = sorted(set(_attribute_tables(model).get(r["parent"], set())) & set(_attribute_tables(model).get(r["child"], set())))
+    return {"parent": str(p["information"]["name"]), "child": str(c["information"]["name"]),
+            "table": shared[0] if len(shared) == 1 else "", "type": typ or "one_to_many"}
+
+
+def _relationship_action(spec: dict[str, str]) -> dict[str, Any]:
+    rel = {"parent_attribute": spec["parent"], "child_attribute": spec["child"],
+           "type": spec.get("type") or "one_to_many"}
+    if spec.get("table"):
+        rel["relationship_table"] = spec["table"]
+    return {"kind": "wire_relationships", "args": {"relationships": [rel]}}
+
+
+def resolved_findings(findings_doc: dict, current: list[dict]) -> dict[str, list[str]]:
+    """Findings an earlier join-paths or references run raised: the ones this run no longer raises are
+    resolved (their check passes now), the rest still present."""
+    now = {f["id"] for f in current}
+    mine = [f for f in findings_doc.get("findings") or [] if f.get("source") in ("join-paths", "references")]
+    return {"resolved": [f["id"] for f in mine if f["id"] not in now],
+            "still_present": [f["id"] for f in mine if f["id"] in now]}
+
+
 def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export: dict | None = None,
                      previous: dict | None = None, where: str = "", round_no: int | None = None,
                      max_attributes: int = 300, log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
@@ -1912,7 +1967,8 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
                     got = _num(fq["rows"][0].get("n")) if fq["ok"] and fq["rows"] else None
                     fv = ("error" if got is None else "ok" if pick[1] is not None and _close(got, pick[1]) else
                           "ignored" if _close(got, total) else "mismatch")
-                    res["filter"] = {"value": pick[0], "grouped": pick[1], "filtered": got, "verdict": fv,
+                    res["filter"] = {"value": pick[0], "sent": _typed_literal(pick[0], att["type"]),
+                                     "grouped": pick[1], "filtered": got, "verdict": fv,
                                      **({"error": (fq.get("error") or "")[:300]} if not fq["ok"] else {})}
                 except PendingReply:
                     res["filter"] = {"value": pick[0], "verdict": "pending"}
@@ -1969,8 +2025,10 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
             "Every value of the attribute gets the fact's full total (a cross join). Map the attribute's key to the "
             "fact's column (or the lookup table's key to an attribute the fact has), or remove the attribute. Say "
             "which, or decline if it is meant to stand alone.", round_no=round_no,
-            impact="high" if none else "medium", source="join-paths"))
+            impact="high" if none else "medium", source="join-paths",
+            checks=[{"command": "join-paths", "attribute": n, "expect": "joined"}]))
     rels = graph.get("relationships") or []
+    joins = _join_attributes(export) if export else {}
     for n, probs in sorted(filter_problems.items()):
         if n in unjoined:
             continue
@@ -1980,7 +2038,7 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
         rel_note = ("" if not graph else f". Declared relationships: {mine}" if mine else
                     ". The export declares no relationship for it: a filter on an attribute that isn't selected "
                     "needs one to the attribute its table joins the fact through")
-        detail = "; ".join(f"with {p['anchor']}: {n} = {p['value']!r} counts {p['filtered']} rows filtered, "
+        detail = "; ".join(f"with {p['anchor']}: {n} = {p.get('sent') or repr(p['value'])} counts {p['filtered']} rows filtered, "
                            f"{p['grouped']} grouped" + (" (the full total: the filter is ignored)"
                                                         if p["verdict"] == "ignored" else "") for p in probs)
         findings.append(integrity_finding(
@@ -1988,14 +2046,22 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
             detail + rel_note + (f". Metrics that filter on it: {mets}" if mets else ""),
             "Grouped by the attribute the counts are right, but a filter on it alone isn't applied to the fact: "
             "usually a missing parent-child relationship to the attribute its table joins the fact through. "
-            "Create the relationship (wire_relationships); say which, or decline.", round_no=round_no,
-            source="join-paths"))
+            + (f"Proposed: {joins[base]['parent']} -> {joins[base]['child']} through {joins[base]['table']} "
+               f"(one to many). Approve to create it, Modify to change it, or Decline."
+               if base in joins and not mine else "Create the relationship (wire_relationships); say which, or decline."),
+            round_no=round_no, source="join-paths",
+            actions=[_relationship_action(joins[base])] if base in joins and not mine else None,
+            checks=[{"command": "join-paths", "attribute": n, "expect": "filter ok"}]))
+    prev_types = {(r["parent"], r["child"]): r.get("type") for r in prev_rels or []}
     for r in changes.get("lost") or []:
+        spec = _lost_relationship_spec(export, r, prev_types.get((r["parent"], r["child"])))
         findings.append(integrity_finding(
             f"L-{_slug(r['parent'])}-{_slug(r['child'])}", f"Relationship {r['parent']} -> {r['child']} was lost",
             "relationship", "declared in the previous round's export, missing from this one",
             "Restore it (wire_relationships), or decline if the change was intended. Metrics and SQL that filter "
-            "on the parent may now repeat totals or ignore the filter.", round_no=round_no, source="join-paths"))
+            "on the parent may now repeat totals or ignore the filter.", round_no=round_no, source="join-paths",
+            actions=[_relationship_action(spec)] if spec else None,
+            checks=[{"command": "join-paths", "relationship": [r["parent"], r["child"]], "expect": "present"}]))
     return {"version": 2, "model": model, "facts": facts, "attributes": results,
             "mapped_to_fact": skipped,
             "not_tested": [t["name"] for t in todo if t["name"] not in results] if runner is not None
@@ -2008,8 +2074,9 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
 
 
 def merge_findings(doc: dict, new: list[dict]) -> dict[str, Any]:
-    """Add findings from references / join-paths. A finding already there keeps its status and decision (the
-    user answered it); its evidence is refreshed. Returns what was added and what was already there."""
+    """Add findings from references / join-paths. A finding already there keeps its status and decision once
+    the user answered it (only its evidence is refreshed); one still proposed takes the new evidence,
+    recommendation, proposed actions and checks. Returns what was added and what was already there."""
     have = {f.get("id"): f for f in doc.setdefault("findings", [])}
     added, kept = [], []
     for f in new:
@@ -2019,6 +2086,10 @@ def merge_findings(doc: dict, new: list[dict]) -> dict[str, Any]:
             added.append(f["id"])
         else:
             old["evidence"] = f["evidence"]
+            if (old.get("status") or "proposed") == "proposed":
+                for k in ("recommendation", "actions", "checks", "impact", "title"):
+                    if k in f:
+                        old[k] = f[k]
             kept.append({"id": f["id"], "status": old.get("status")})
     return {"added": added, "already_there": kept}
 
@@ -4004,7 +4075,8 @@ def check_findings(doc: dict) -> dict[str, Any]:
         if f.get("status") in ("modified", "declined") and not (f.get("decision_note") or "").strip():
             warnings.append(f"{fid}: {f.get('status')} without a decision_note")
         if not f.get("tests"):
-            warnings.append(f"{fid}: no tests named")
+            if not f.get("checks"):
+                warnings.append(f"{fid}: no tests named")
     problems += [f"findings: dependency cycle {c}" for c in _cycles(fs)]
     return {"problems": problems, "warnings": warnings}
 
@@ -4240,6 +4312,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--model-export", help="this round's export: the key form a plain name became")
     sp.add_argument("--old-model-export", help="the previous round's export: objects renamed (same id)")
     sp.add_argument("--apply", action="store_true", help="rewrite the SQL (reason kind model_change) in --bank")
+    sp.add_argument("--findings", help="findings.json: report which earlier name findings are resolved")
     sp.add_argument("--round", type=int)
     sp.add_argument("--out", required=True)
 
@@ -4249,6 +4322,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--scope", required=True)
     sp.add_argument("--model-export", help="the export: tables each attribute reaches, declared relationships")
     sp.add_argument("--previous", help="the previous round's join_paths.json, to compare relationships")
+    sp.add_argument("--findings", help="findings.json: report which earlier join-paths findings are resolved")
     sp.add_argument("--where", default="")
     sp.add_argument("--round", type=int)
     sp.add_argument("--max-attributes", type=int, default=300)
@@ -4385,12 +4459,15 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
                                export=_load_json(args.model_export) if args.model_export else None,
                                previous=_load_json(args.previous) if args.previous else None, where=args.where,
                                round_no=args.round, max_attributes=args.max_attributes, log=log)
+        if args.findings:
+            out["earlier_findings"] = resolved_findings(_load_json(args.findings), out["findings"])
         _write_json(args.out, out)
         print(json.dumps({"out": args.out, "facts": out["facts"], "unjoined": out["unjoined"],
                           "filter_problems": sorted(out["filter_problems"]),
                           "metrics_filtering_flagged": out["metrics_filtering_flagged"],
                           "relationship_changes": out["relationship_changes"],
-                          "findings": [f["id"] for f in out["findings"]]}, indent=2))
+                          "findings": [f["id"] for f in out["findings"]],
+                          **({"earlier_findings": out["earlier_findings"]} if args.findings else {})}, indent=2))
         return _pending(runner)
     if args.cmd == "lookups":
         scope = _load_json(args.scope)
@@ -4479,6 +4556,10 @@ def _offline(args: argparse.Namespace) -> int:
             _write_json(args.bank, bank)
         out = {"version": 1, "model": new.get("model"), "removed": changes, "usage": usage,
                "findings": reference_findings(changes, usage, args.round)}
+        if getattr(args, "findings", None):
+            done = resolved_findings(_load_json(args.findings), out["findings"])
+            done = {k: [i for i in v if i.startswith("N-")] for k, v in done.items()}
+            out["earlier_findings"] = done
         _write_json(args.out, out)
         print(json.dumps({"out": args.out, "names_gone": [c["name"] for c in changes],
                           "rewritten": len(usage["rewritten"]), "applied": args.apply,

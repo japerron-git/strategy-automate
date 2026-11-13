@@ -2417,6 +2417,45 @@ class JoinPathTests(unittest.TestCase):
         self.assertIn("declares no relationship", f["J-filter-promo"]["evidence"]["observed"])
         self.assertIn("region -> store", f["J-filter-region"]["evidence"]["observed"])
 
+    REL_EXPORT = {"model": [{
+        "factMetrics": [{"fact": {"expressions": [{"tables": [{"name": "facts.csv"}]}]}}],
+        "hierarchy": {"relationships": []},
+        "attributes": [
+            {"information": {"objectId": "S", "name": "Status Code"}, "attributeLookupTable": {"name": "status_map.csv"},
+             "forms": [{"expressions": [{"tables": [{"name": "status_map.csv"}, {"name": "facts.csv"}]}]}]},
+            {"information": {"objectId": "B", "name": "Status Bucket"}, "attributeLookupTable": {"name": "status_map.csv"},
+             "forms": [{"expressions": [{"tables": [{"name": "status_map.csv"}]}]}]}]}]}
+
+    def test_ignored_filter_proposes_the_relationship_and_a_check(self):
+        scope = {"model": "Store Sales", "anchor": {"metric": "net sales"},
+                 "metrics": [{"name": "net sales", "type": "double", "formula": "sum(facts.csv.{NET SALES})"}],
+                 "attributes": [{"name": "status bucket", "type": "integer"}, {"name": "status code", "type": "varchar"}]}
+
+        def answer(sql):
+            if 'GROUP BY "status bucket"' in sql:
+                return [["v", "n"], ["5", "822"], ["4", "900"]]
+            if 'GROUP BY' in sql:
+                return [["v", "n"], ["01", "3"], ["02", "5"]]
+            if '"status code" =' in sql:
+                return [["n"], ["3"]]
+            return [["n"], ["15,878,654"]]
+        out = am.check_join_paths(_ErrRunner(answer), "P", scope, export=self.REL_EXPORT, round_no=1)
+        (f,) = out["findings"]
+        self.assertEqual(f["id"], "J-filter-status_bucket")
+        self.assertIn("status bucket = 5 counts", f["evidence"]["observed"])          # the literal sent, unquoted
+        self.assertEqual(f["actions"], [{"kind": "wire_relationships", "args": {"relationships": [
+            {"parent_attribute": "Status Bucket", "child_attribute": "Status Code", "type": "one_to_many",
+             "relationship_table": "status_map.csv"}]}}])
+        self.assertEqual(f["checks"], [{"command": "join-paths", "attribute": "status bucket", "expect": "filter ok"}])
+        self.assertEqual(am.check_findings({"findings": [f]})["warnings"], [])        # a check stands in for tests
+        doc = {"findings": [{"id": f["id"], "status": "proposed", "actions": [], "source": "join-paths"}]}
+        am.merge_findings(doc, [f])
+        self.assertEqual(doc["findings"][0]["actions"], f["actions"])               # unanswered: takes the proposal
+        self.assertEqual(am.resolved_findings(doc, []), {"resolved": [f["id"]], "still_present": []})
+        plan = am.build_plan({"findings": [{**f, "status": "approved"}]}, model_id="MID")
+        self.assertEqual(plan["problems"], [])
+        self.assertEqual(plan["phases"][0]["phase"], 3)
+
     def test_numeric_filter_values_lose_thousands_separators(self):
         self.assertEqual(am._typed_literal("201,812", "bigint"), "201812")
         self.assertEqual(am._typed_literal("5", "integer"), "5")

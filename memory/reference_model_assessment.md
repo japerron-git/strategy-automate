@@ -333,7 +333,12 @@ each round (assessment and every verification) tests two outcomes:
   form when it has several forms; one mapped directly to a fact table can't cross-join it, but its filter
   is still tested. Verified live: a filter is dropped when the attribute has no parent-child
   relationship to the attribute its table joins the fact through (grouping still works through the
-  shared column). Numbers come back with thousands separators ("201,812"), so filter values lose them. A raw fact
+  shared column). Numbers come back with thousands separators ("201,812"), so filter values lose them.
+  With the export, an ignored-filter finding proposes the missing relationship (the attribute → the one
+  attribute of its table that joins the fact, through that table); a lost relationship is proposed back
+  with its table. Findings from checks carry `checks` instead of tests: the next run lists them under
+  `earlier_findings.resolved` (verified) or `still_present` (failed), and `add-findings` updates an
+  unanswered one's proposal but never an answered one. A raw fact
   metric names a table before its column; `Sum({Other Metric})` is derived and never an anchor. Exports
   keep fact-metric expressions under `fact` and relationships under `hierarchy.relationships`. With the export it also checks which tables each attribute reaches and compares the declared
   relationships with the last round (lost ones are findings). In a model with several fact tables an
