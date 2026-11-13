@@ -313,6 +313,25 @@ Before every phase: a backup copy of the model; before phase 3, list the derived
 filter on any attribute being removed or replaced. After every phase: the phase's unit tests, then
 the whole bank as regression.
 
+**Answers are enforced per phase.** A finding still `proposed` blocks the phases of its actions, or its
+own phase when it has none, wherever it came from (assessment, verification, a check): `plan` gives the
+phase `blocked_by` and no script is generated for it until the finding is answered. `plan_id` marks a
+plan; scripts made from an older plan refuse to run.
+
+**Test outcomes every round, not edits.** Tables and attributes change in too many ways to predict, so
+each round (assessment and every verification) tests two outcomes:
+- *Names:* `references` compares this round's connector names with the last round's. A form added can
+  rename `attr` to `attr__id`; a renamed object keeps its export id. Saved SQL (question, best answer,
+  expected) is rewritten where exactly one name replaces the old one (reason kind `model_change`);
+  anything else is a finding that needs an answer. A best answer that moves after such a rewrite needs
+  the user's confirmation.
+- *Join paths:* `join-paths` groups `COUNT(<anchor>)` by each attribute, per fact table. With no join
+  path Mosaic cross-joins: every group equals the total, and metrics filtering on the attribute filter
+  nothing. With the export it also checks which tables each attribute reaches and compares the declared
+  relationships with the last round (lost ones are findings). In a model with several fact tables an
+  attribute can join one and not another, so each fact table is tested. Single-value attributes can't
+  be tested.
+
 ## File formats (JSON)
 
 `assess_model.py check` validates all of these.

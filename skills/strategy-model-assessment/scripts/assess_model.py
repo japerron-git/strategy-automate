@@ -1499,6 +1499,413 @@ def review_relationships(runner: Runner, project: str, scope: dict, *, entity: s
     return out
 
 
+# ── references and join paths ────────────────────────────────────────────────────────────────
+# Tables and attributes change in many ways (a form added, a table replaced, an object renamed), so instead of
+# predicting each edit, every round tests the outcome: are the names saved SQL uses still there, and does every
+# attribute still join each fact table? With no join path, Mosaic cross-joins: the attribute's every value
+# gets the fact table's full total, and a metric filtering on it filters nothing.
+
+_FORM_NAME = re.compile(r"^(?P<base>.+?)(?:__(?P<f1>[^_][^()]*)| \((?P<f2>[^()]+)\))$")
+_SQL_LITERAL = re.compile(r"('(?:[^']|'')*')")
+
+
+def _object_ids(export: dict | None) -> dict[str, str]:
+    """Object id -> name (lower case) for the export's attributes and metrics: a rename keeps the id."""
+    model = _export_model(export)
+    out: dict[str, str] = {}
+    for key in ("attributes", "factMetrics", "metrics"):
+        for o in model.get(key) or []:
+            info = o.get("information") or {}
+            oid = info.get("objectId") or o.get("id") or info.get("id")
+            if oid and info.get("name"):
+                out[str(oid)] = str(info["name"]).lower()
+    return out
+
+
+def _is_interval(name: str, base: str) -> bool:
+    rest = name[len(base):]
+    return any(rest.startswith(f" ({i})") for i in TIME_INTERVALS)
+
+
+def reference_changes(old_scope: dict, new_scope: dict, *, export: dict | None = None,
+                      old_export: dict | None = None) -> list[dict[str, Any]]:
+    """Connector names (attributes, metrics) the old round had and this one doesn't, each with the name that
+    replaced it when there is exactly one: the same object id renamed (both exports), the attribute's key
+    form when a form was added (`attr` -> `attr__id`), or the plain name when forms were dropped."""
+    renamed: dict[str, str] = {}
+    if export and old_export:
+        old_ids, new_ids = _object_ids(old_export), _object_ids(export)
+        renamed = {old_ids[i]: new_ids[i] for i in old_ids if i in new_ids and old_ids[i] != new_ids[i]}
+    key_forms: dict[str, str] = {}
+    if export:
+        for base, a in export_forms(new_scope, export).items():
+            key = next((f for f in a["forms"] if f["key"] and f["visible"]), None)
+            if key:
+                key_forms[base.casefold()] = str(key["query_as"])
+    out = []
+    for kind in ("attributes", "metrics"):
+        old = {o["name"].casefold(): o["name"] for o in old_scope.get(kind) or []}
+        new = {o["name"].casefold(): o["name"] for o in new_scope.get(kind) or []}
+        for k, name in old.items():
+            if k in new:
+                continue
+            cands, how = [], ""
+            if renamed.get(k) in new:
+                cands, how = [new[renamed[k]]], "the same object, renamed (export ids)"
+            elif kind == "attributes":
+                if key_forms.get(k, "").casefold() in new:
+                    cands, how = [new[key_forms[k].casefold()]], "the attribute's key form (export)"
+                else:
+                    forms = [n for kk, n in new.items() if (kk.startswith(k + "__") or kk.startswith(k + " ("))
+                             and not _is_interval(kk, k)]
+                    ids = [n for n in forms if re.search(r"(__id| \(id\))$", n.casefold())]
+                    cands, how = (ids, "the attribute's id form") if len(ids) == 1 else (forms, "a form of the attribute")
+                if not cands:
+                    m = _FORM_NAME.match(name)
+                    base = (m.group("base") if m else "").casefold()
+                    if base and base in new and not _is_interval(k, base):
+                        cands, how = [new[base]], "the attribute's plain name (its other forms were dropped)"
+            out.append({"name": name, "kind": kind[:-1], "replacement": cands[0] if len(cands) == 1 else None,
+                        "candidates": cands, "how": how or "no match"})
+    return out
+
+
+def replace_identifier(sql: str, old: str, new: str) -> tuple[str, int, int]:
+    """Rewrite the quoted identifier "old" as "new" outside string literals. Returns (sql, quoted rewrites,
+    unquoted mentions left alone: a bare word may be a keyword or another name, so a person checks it)."""
+    parts = _SQL_LITERAL.split(sql)
+    quoted = re.compile('"' + re.escape(old) + '"', re.I)
+    bare = re.compile(r'(?<![\w".])' + re.escape(old) + r'(?![\w"(])', re.I) \
+        if re.fullmatch(r"[A-Za-z_]\w*", old) else None
+    done = left = 0
+    for i in range(0, len(parts), 2):
+        parts[i], n = quoted.subn(quote_ident(new).replace("\\", "\\\\"), parts[i])
+        done += n
+        if bare:
+            left += len(bare.findall(parts[i]))
+    return "".join(parts), done, left
+
+
+def _saved_sql(q: dict) -> list[tuple[str, str]]:
+    out = [("question", q.get("sql") or "")]
+    out.append(("best_answer", (q.get("best_answer") or {}).get("sql") or ""))
+    exp = q.get("expected") or {}
+    if exp.get("source") == "same_model_sql":
+        out.append(("expected", exp.get("sql") or ""))
+    return [(w, t) for w, t in out if t.strip()]
+
+
+def apply_reference_changes(bank: dict, changes: list[dict], *, round_no: int | None = None,
+                            apply: bool = False) -> dict[str, Any]:
+    """Find saved SQL (question, best answer, expected) naming a name the model no longer has. With apply,
+    rewrite it when the name has exactly one replacement (reason kind model_change, history kept); the rest
+    is unresolved: no replacement, several candidates, or an unquoted mention."""
+    gone = [c for c in changes]
+    rewritten, unresolved = [], []
+    for q in bank.get("questions") or []:
+        texts = dict(_saved_sql(q))
+        new_texts = dict(texts)
+        notes: dict[str, list[str]] = {}
+        for c in gone:
+            for where, text in list(new_texts.items()):
+                probe_sql, n_quoted, n_bare = replace_identifier(text, c["name"], c["replacement"] or c["name"])
+                if not n_quoted and not n_bare:
+                    continue
+                if c["replacement"] and n_quoted:
+                    new_texts[where] = probe_sql
+                    notes.setdefault(where, []).append(f'"{c["name"]}" -> "{c["replacement"]}" ({c["how"]})')
+                if not c["replacement"] or n_bare:
+                    unresolved.append({"question": q.get("id"), "where": where, "name": c["name"],
+                                       "candidates": c["candidates"],
+                                       "why": "unquoted mention: check it by hand" if c["replacement"] and n_bare
+                                       else ("several candidates" if c["candidates"] else "no replacement found")})
+        for where, text in new_texts.items():
+            if text == texts.get(where):
+                continue
+            entry = {"question": q.get("id"), "where": where, "changes": notes.get(where, []), "sql": text}
+            if apply:
+                reason = "the model renamed: " + "; ".join(notes.get(where, []))
+                if where == "question":
+                    res = set_question_sql(bank, q["id"], sql=text, reason_kind="model_change", reason=reason,
+                                           round_no=round_no)
+                elif where == "best_answer":
+                    res = set_best_answer(bank, q["id"], sql=text, reason_kind="model_change", reason=reason,
+                                          round_no=round_no)
+                else:
+                    exp = q["expected"]
+                    exp.setdefault("sql_history", []).append({"sql": exp.get("sql"), "until_round": round_no,
+                                                              "reason_kind": "model_change", "reason": reason})
+                    exp["sql"] = text
+                    res = {"ok": True}
+                if not res.get("ok"):
+                    unresolved.append({"question": q.get("id"), "where": where, "name": ", ".join(notes.get(where, [])),
+                                       "candidates": [], "why": "; ".join(res.get("problems") or [])})
+                    continue
+            rewritten.append(entry)
+    return {"rewritten": rewritten, "unresolved": unresolved, "applied": apply}
+
+
+def integrity_finding(fid: str, title: str, category: str, observed: str, recommendation: str, *,
+                      round_no: int | None, questions: list[str] | None = None, impact: str = "high",
+                      source: str = "") -> dict[str, Any]:
+    """A finding a person must answer: proposed, flagged needs_answer, no action until they decide one."""
+    return {"id": fid, "title": title, "category": category, "impact": impact, "effort": "small",
+            "evidence": {"questions": list(questions or []), "observed": observed},
+            "recommendation": recommendation, "actions": [], "risks": [], "depends_on": [],
+            "tests": list(questions or []), "status": "proposed", "needs_answer": True,
+            "introduced_in_round": round_no, "source": source}
+
+
+def reference_findings(changes: list[dict], usage: dict, round_no: int | None) -> list[dict[str, Any]]:
+    by_name: dict[str, list[dict]] = {}
+    for u in usage["unresolved"]:
+        by_name.setdefault(u["name"], []).append(u)
+    out = []
+    for name, items in by_name.items():
+        qs = sorted({str(u["question"]) for u in items})
+        cands = next((u["candidates"] for u in items if u["candidates"]), [])
+        out.append(integrity_finding(
+            f"N-{_slug(name)}", f"Saved SQL names '{name}', which the model no longer has", "attribute",
+            f"{len(qs)} question(s) ({', '.join(qs[:10])}) name '{name}' in {sorted({u['where'] for u in items})}: "
+            + "; ".join(sorted({u['why'] for u in items})) + (f". Candidates: {cands}" if cands else ""),
+            "Say which name replaces it (the SQL is then rewritten with reason kind model_change), or decline to "
+            "rewrite the questions as not answerable. A best answer whose value moves after a rewrite needs your "
+            "confirmation.", round_no=round_no, questions=qs, source="references"))
+    return out
+
+
+def _anchors_by_fact(scope: dict) -> list[dict[str, Any]]:
+    """One anchor per fact table (the fullest raw fact metric reading it): an attribute can join one fact
+    table and not another, so join paths are tested against each."""
+    metrics = scope.get("metrics") or []
+    raw = set(raw_fact_metrics(metrics))
+    counts = (scope.get("anchor") or {}).get("counts") or {}
+    by: dict[str, list[str]] = {}
+    for m in metrics:
+        if m["name"] in raw:
+            by.setdefault(_metric_table(m), []).append(m["name"])
+    out = [{"table": t or None, "anchor": max(names, key=lambda n: counts.get(n, -1))} for t, names in by.items()]
+    if not out and (scope.get("anchor") or {}).get("metric"):
+        out = [{"table": None, "anchor": scope["anchor"]["metric"]}]
+    return out
+
+
+def export_join_graph(export: dict | None) -> dict[str, Any]:
+    """From the export: tables joined through attributes mapped to columns in both, which tables each
+    attribute reaches, the fact tables it can't reach, and the declared relationships by name."""
+    model = _export_model(export)
+    if not model:
+        return {}
+    facts = sorted({str(t.get("name")) for fm in model.get("factMetrics") or [] for e in fm.get("expressions") or []
+                    for t in e.get("tables") or [] if t.get("name")})
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    attr_tables: dict[str, set[str]] = {}
+    for a in model.get("attributes") or []:
+        name = str((a.get("information") or {}).get("name") or "").lower()
+        tabs = {str(t.get("name")) for f in a.get("forms") or [] for e in f.get("expressions") or []
+                for t in e.get("tables") or [] if t.get("name")}
+        lt = (a.get("attributeLookupTable") or {}).get("name")
+        if lt:
+            tabs.add(str(lt))
+        if not name or not tabs:
+            continue
+        attr_tables[name] = tabs
+        first = sorted(tabs)[0]
+        for t in tabs:
+            parent[find(t)] = find(first)
+    for t in facts:
+        find(t)
+    unreachable = []
+    for name, tabs in sorted(attr_tables.items()):
+        comps = {find(t) for t in tabs}
+        missing = [f for f in facts if find(f) not in comps]
+        if facts and missing:
+            unreachable.append({"attribute": name, "tables": sorted(tabs), "facts_not_reached": missing,
+                                "reaches_no_fact": len(missing) == len(facts)})
+    ids = _object_ids(export)
+    rels = set()
+    for a in model.get("attributes") or []:
+        rr = a.get("relationships")
+        rr = rr.get("relationships") if isinstance(rr, dict) else rr
+        for r in rr or []:
+            if not isinstance(r, dict):
+                continue
+            p = (r.get("parent") or {})
+            c = (r.get("child") or {})
+            pn = ids.get(str(p.get("objectId") or p.get("id") or "")) or str(p.get("name") or "").lower()
+            cn = ids.get(str(c.get("objectId") or c.get("id") or "")) or str(c.get("name") or "").lower()
+            if pn and cn:
+                rels.add((pn, cn, str(r.get("relationshipType") or "")))
+    return {"fact_tables": facts, "unreachable": unreachable,
+            "relationships": [{"parent": p, "child": c, "type": t} for p, c, t in sorted(rels)]}
+
+
+def join_path_sql(model: str, attribute: str, anchor: str, where: str = "") -> str:
+    clause = f" WHERE {where}" if where else ""
+    a = quote_ident(attribute)
+    return (f"SELECT {a} AS v, COUNT({quote_ident(anchor)}) AS n FROM {quote_model(model)}{clause} "  # nosec B608  # identifiers are quoted; the connector is read-only
+            f"GROUP BY {a} ORDER BY 2 ASC LIMIT 2")
+
+
+_JOIN_ERROR = re.compile(r"\b(join|joins|joined|cross|path|relationship|unrelated|not related|no common)\b", re.I)
+
+
+def _testable_attributes(scope: dict, export: dict | None) -> tuple[list[str], dict[str, str]]:
+    """Base attributes (no form or time-interval names) with more than one value. With the export, one per
+    lookup table (attributes on one table share its join), the rest inheriting its verdict."""
+    names = [a["name"] for a in scope.get("attributes") or []
+             if "__" not in a["name"] and not re.search(r" \((" + "|".join(TIME_INTERVALS) + r")\)", a["name"])
+             and (_num((a.get("profile") or {}).get("distinct_values")) or 2) > 1]
+    inherit: dict[str, str] = {}
+    model = _export_model(export)
+    if not model:
+        return names, inherit
+    table_of = {str((a.get("information") or {}).get("name") or "").lower(): (a.get("attributeLookupTable") or {}).get("name")
+                for a in model.get("attributes") or []}
+    prof = {a["name"]: _num((a.get("profile") or {}).get("distinct_values")) or 0 for a in scope.get("attributes") or []}
+    chosen: dict[str, str] = {}
+    for n in sorted(names, key=lambda x: -prof.get(x, 0)):
+        t = table_of.get(n.lower())
+        if not t:
+            chosen[n] = n
+            continue
+        if t in chosen:
+            inherit[n] = chosen[t]
+        else:
+            chosen[t] = n
+    return [n for n in names if n not in inherit], inherit
+
+
+def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export: dict | None = None,
+                     previous: dict | None = None, where: str = "", round_no: int | None = None,
+                     max_attributes: int = 300, log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
+    """Does every attribute join each fact table? Through the connector: COUNT(<anchor>) grouped by the
+    attribute, two smallest groups; if both equal the anchor's total, every value gets every fact row (a
+    cross join). An error naming a join is the same verdict. From the export: tables each attribute reaches.
+    Metrics whose formulas name an unjoined attribute filter nothing. With the previous round's output, the
+    declared relationships that were lost or added."""
+    model = scope["model"]
+    graph = export_join_graph(export) if export else {}
+    facts = _anchors_by_fact(scope)
+    todo, inherit = _testable_attributes(scope, export)
+    todo = todo[:max_attributes]
+    results: dict[str, dict[str, dict]] = {}
+    for fact in facts:
+        if runner is None:
+            break
+        anchor = fact["anchor"]
+        clause = f" WHERE {where}" if where else ""
+        try:
+            tot = parse_query_result(runner.call("query", {"project": project, "query":
+                                                           f"SELECT COUNT({quote_ident(anchor)}) AS n FROM {quote_model(model)}{clause}"}))  # nosec B608  # identifiers are quoted; the connector is read-only
+        except PendingReply:
+            fact["total"] = "pending"
+            continue
+        fact["total"] = _num(tot["rows"][0].get("n")) if tot["ok"] and tot["rows"] else None
+        log(f"join paths against {anchor}: {len(todo)} attributes")
+        for n in todo:
+            try:
+                parsed = parse_query_result(runner.call("query", {"project": project,
+                                                                  "query": join_path_sql(model, n, anchor, where)}))
+            except PendingReply:
+                results.setdefault(n, {})[anchor] = {"verdict": "pending"}
+                continue
+            if not parsed["ok"]:
+                err = parsed["error"] or "no reply"
+                results.setdefault(n, {})[anchor] = {"verdict": "join_error" if _JOIN_ERROR.search(err) else "error",
+                                                     "error": err[:300]}
+                continue
+            counts = [_num(r.get("n")) for r in parsed["rows"]]
+            total = fact["total"]
+            if len(counts) < 2:
+                verdict = "single_value"
+            elif total and all(c is not None and _close(c, total) for c in counts):
+                verdict = "cross_join"
+            else:
+                verdict = "joined"
+            results.setdefault(n, {})[anchor] = {"verdict": verdict, "smallest_groups": counts, "total": total}
+    for n, rep in inherit.items():
+        if rep in results:
+            results[n] = {k: {**v, "inherited_from": rep} for k, v in results[rep].items()}
+    unjoined: dict[str, list[str]] = {}
+    for n, by_anchor in results.items():
+        bad = [a for a, r in by_anchor.items() if r["verdict"] in ("cross_join", "join_error")]
+        if bad:
+            unjoined[n] = bad
+    for u in graph.get("unreachable") or []:
+        if u["attribute"] not in unjoined and u["reaches_no_fact"]:
+            unjoined[u["attribute"]] = ["(export: no shared column with any fact table)"]
+    filtering = []
+    for m in scope.get("metrics") or []:
+        f = (m.get("formula") or "").lower()
+        for n in unjoined:
+            if n.lower() in f:
+                filtering.append({"metric": m["name"], "attribute": n})
+    changes = {}
+    if previous is not None and graph.get("relationships") is not None and previous.get("relationships") is not None:
+        old = {(r["parent"], r["child"]) for r in previous["relationships"]}
+        new = {(r["parent"], r["child"]) for r in graph["relationships"]}
+        changes = {"lost": [{"parent": p, "child": c} for p, c in sorted(old - new)],
+                   "added": [{"parent": p, "child": c} for p, c in sorted(new - old)]}
+    findings = []
+    all_anchors = [f["anchor"] for f in facts]
+    for n, bad in sorted(unjoined.items()):
+        none = all(a in bad for a in all_anchors) or bad[0].startswith("(export")
+        mets = [x["metric"] for x in filtering if x["attribute"] == n]
+        ev = results.get(n, {})
+        detail = "; ".join(f"with {a}: {r['verdict']}" + (f" (every group = {r.get('total')})"
+                                                         if r["verdict"] == "cross_join" else
+                                                         f" ({r.get('error')})" if r.get("error") else "")
+                           for a, r in ev.items() if a in bad)
+        exp = next((u for u in graph.get("unreachable") or [] if u["attribute"] == n.lower()), None)
+        findings.append(integrity_finding(
+            f"J-{_slug(n)}", f"'{n}' has no join path to " + ("any fact table" if none else "every fact table"),
+            "relationship",
+            (detail or "no shared column with a fact table in the export")
+            + (f". Export: its tables {exp['tables']} reach none of {exp['facts_not_reached']}" if exp else "")
+            + (f". Metrics that may filter on it (filtering nothing): {mets}" if mets else ""),
+            "Every value of the attribute gets the fact's full total (a cross join). Map the attribute's key to the "
+            "fact's column (or the lookup table's key to an attribute the fact has), or remove the attribute. Say "
+            "which, or decline if it is meant to stand alone.", round_no=round_no,
+            impact="high" if none else "medium", source="join-paths"))
+    for r in changes.get("lost") or []:
+        findings.append(integrity_finding(
+            f"L-{_slug(r['parent'])}-{_slug(r['child'])}", f"Relationship {r['parent']} -> {r['child']} was lost",
+            "relationship", "declared in the previous round's export, missing from this one",
+            "Restore it (wire_relationships), or decline if the change was intended. Metrics and SQL that filter "
+            "on the parent may now repeat totals or ignore the filter.", round_no=round_no, source="join-paths"))
+    return {"version": 1, "model": model, "facts": facts, "attributes": results,
+            "not_tested": [n for n in todo if n not in results] if runner is not None else todo,
+            "unjoined": unjoined, "metrics_filtering_unjoined": filtering,
+            "export": {k: v for k, v in graph.items() if k != "relationships"} if graph else None,
+            "relationships": graph.get("relationships") if graph else (previous or {}).get("relationships"),
+            "relationship_changes": changes, "findings": findings,
+            "note": "single_value attributes can't be tested: one value looks the same joined or cross-joined"}
+
+
+def merge_findings(doc: dict, new: list[dict]) -> dict[str, Any]:
+    """Add findings from references / join-paths. A finding already there keeps its status and decision (the
+    user answered it); its evidence is refreshed. Returns what was added and what was already there."""
+    have = {f.get("id"): f for f in doc.setdefault("findings", [])}
+    added, kept = [], []
+    for f in new:
+        old = have.get(f["id"])
+        if old is None:
+            doc["findings"].append(f)
+            added.append(f["id"])
+        else:
+            old["evidence"] = f["evidence"]
+            kept.append({"id": f["id"], "status": old.get("status")})
+    return {"added": added, "already_there": kept}
+
+
 # ── lookup tables ────────────────────────────────────────────────────────────────────────────
 
 _CODE_NAME = re.compile(r"\b(code|status|type|indicator|flag|channel|method|purpose|program|class|category|"
@@ -2495,7 +2902,7 @@ def baseline_check(q: dict, res: dict) -> dict[str, Any]:
             "baseline_comparison": cmp}
 
 
-BEST_ANSWER_REASONS = ("initial", "decision", "definition", "data_change", "sql_error")
+BEST_ANSWER_REASONS = ("initial", "decision", "definition", "data_change", "sql_error", "model_change")
 # decision: the user decided a definition. definition: Claude chose one; the workbook asks the user to confirm.
 _WS = re.compile(r"\s+")
 
@@ -2515,8 +2922,8 @@ def set_best_answer(bank: dict, qid: str, *, sql: str = "", not_answerable: str 
         problems.append("give the best-answer SQL or a not-answerable reason, not both")
     current = q.get("best_answer")
     if reason_kind == "initial" and current:
-        problems.append(f"{qid} has a best answer; change it with reason kind decision, definition, data_change "
-                        f"or sql_error")
+        problems.append(f"{qid} has a best answer; change it with reason kind decision, definition, data_change, "
+                        f"sql_error or model_change")
     if reason_kind != "initial" and not current:
         problems.append(f"{qid} has no best answer yet; set it with reason kind initial")
     if reason_kind != "initial" and not reason.strip():
@@ -2536,7 +2943,9 @@ def set_best_answer(bank: dict, qid: str, *, sql: str = "", not_answerable: str 
     return {"ok": True, "id": qid, "version": best_answer_version(q)}
 
 
-QUESTION_SQL_REASONS = ("new_object", "sql_error", "type_change", "decision")
+QUESTION_SQL_REASONS = ("new_object", "sql_error", "type_change", "decision", "model_change")
+# model_change: the model renamed a column the SQL names (a form added, an object renamed); rewritten by
+# `references --apply`, never to change what the SQL computes.
 
 
 def set_question_sql(bank: dict, qid: str, *, sql: str = "", not_answerable: bool = False, reason_kind: str,
@@ -3322,10 +3731,35 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                        "after": after})
     planned_ids = {f.get("id") for f in chosen}
     skipped = [{"id": f.get("id"), "status": f.get("status")} for f in every if f.get("id") not in planned_ids]
+    # Every phase enforces answers: a finding nobody decided (proposed) blocks the phases of its actions, or its
+    # own phase when it has none, whether the assessment, verify-changes or a check found it.
+    unanswered = unanswered_by_phase(every)
+    for ph in phases:
+        if unanswered.get(ph["phase"]):
+            ph["blocked_by"] = unanswered[ph["phase"]]
+            warnings.append(f"phase {ph['phase']}: no script until these findings are answered: "
+                            f"{', '.join(unanswered[ph['phase']])}")
+    digest = hashlib.sha256(json.dumps({"findings": [{k: f.get(k) for k in ("id", "status", "actions", "decision_note",
+                                                                         "applied_phases")} for f in every],
+                                        "model_id": model_id, "statuses": list(statuses)},
+                                       sort_keys=True, default=str).encode()).hexdigest()[:12]
     return {"version": 1, "model": findings_doc.get("model"), "model_id": model_id or None,
-            "generated": time.strftime("%Y-%m-%d"), "statuses_planned": list(statuses),
+            "generated": time.strftime("%Y-%m-%d"), "statuses_planned": list(statuses), "plan_id": digest,
             "phases": phases, "files": files, "not_planned": skipped, "problems": problems,
-            "warnings": warnings}
+            "warnings": warnings, "unanswered": {str(k): v for k, v in sorted(unanswered.items())}}
+
+
+def unanswered_by_phase(findings: list[dict]) -> dict[int, list[str]]:
+    """Phase -> findings still awaiting a decision (status proposed) that bear on it: the phases of their
+    actions, else the finding's own phase."""
+    out: dict[int, list[str]] = {}
+    for f in findings:
+        if (f.get("status") or "proposed") != "proposed":
+            continue
+        phases = {action_phase(f, a) for a in f.get("actions") or []} - {None} or {_phase_of(f)} - {None}
+        for n in phases:
+            out.setdefault(int(n), []).append(str(f.get("id")))
+    return out
 
 
 # ── check ────────────────────────────────────────────────────────────────────────────────────
@@ -3681,6 +4115,33 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--rationale", default="", help="what the SQL does and why it is the right definition")
     sp.add_argument("--round", type=int, default=None)
 
+    sp = sub.add_parser("references", help="names saved SQL uses that the model no longer has: compare this "
+                        "round's scope with the previous one, rewrite SQL where the replacement is certain")
+    sp.add_argument("--old-scope", required=True, help="the previous round's scope (scope_round<N-1>.json)")
+    sp.add_argument("--scope", required=True)
+    sp.add_argument("--bank", required=True)
+    sp.add_argument("--model-export", help="this round's export: the key form a plain name became")
+    sp.add_argument("--old-model-export", help="the previous round's export: objects renamed (same id)")
+    sp.add_argument("--apply", action="store_true", help="rewrite the SQL (reason kind model_change) in --bank")
+    sp.add_argument("--round", type=int)
+    sp.add_argument("--out", required=True)
+
+    sp = sub.add_parser("join-paths", help="does every attribute join each fact table (a cross join otherwise); "
+                        "relationships lost since the previous round")
+    sp.add_argument("--project", required=True)
+    sp.add_argument("--scope", required=True)
+    sp.add_argument("--model-export", help="the export: tables each attribute reaches, declared relationships")
+    sp.add_argument("--previous", help="the previous round's join_paths.json, to compare relationships")
+    sp.add_argument("--where", default="")
+    sp.add_argument("--round", type=int)
+    sp.add_argument("--max-attributes", type=int, default=300)
+    sp.add_argument("--out", required=True)
+
+    sp = sub.add_parser("add-findings", help="merge the findings references / join-paths proposed into "
+                        "findings.json (existing ones keep their status)")
+    sp.add_argument("--findings", required=True)
+    sp.add_argument("--from", dest="sources", action="append", required=True, help="references or join-paths output")
+
     sp = sub.add_parser("plan", help="order approved findings into phases with commands and test plans")
     sp.add_argument("--findings", required=True)
     sp.add_argument("--out", required=True)
@@ -3801,6 +4262,18 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
         return 0
     if args.cmd == "check-lookup":
         return _check_lookup_cmd(args, runner)
+    if args.cmd == "join-paths":
+        scope = _load_json(args.scope)
+        out = check_join_paths(runner(), args.project, scope,
+                               export=_load_json(args.model_export) if args.model_export else None,
+                               previous=_load_json(args.previous) if args.previous else None, where=args.where,
+                               round_no=args.round, max_attributes=args.max_attributes, log=log)
+        _write_json(args.out, out)
+        print(json.dumps({"out": args.out, "facts": out["facts"], "unjoined": out["unjoined"],
+                          "metrics_filtering_unjoined": out["metrics_filtering_unjoined"],
+                          "relationship_changes": out["relationship_changes"],
+                          "findings": [f["id"] for f in out["findings"]]}, indent=2))
+        return _pending(runner)
     if args.cmd == "lookups":
         scope = _load_json(args.scope)
         rel = _load_json(args.relationships) if args.relationships else None
@@ -3832,7 +4305,7 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
     return 2
 
 
-LIVE_COMMANDS = ("scope", "run", "relationships", "roles", "probe", "lookups")   # commands that query the model
+LIVE_COMMANDS = ("scope", "run", "relationships", "roles", "probe", "lookups", "join-paths")   # commands that query the model
 
 
 def _pending(runner: Callable[[], Runner]) -> bool:
@@ -3879,6 +4352,28 @@ def _check_lookup_cmd(args: argparse.Namespace, runner: Callable[[], Runner] | N
 def _offline(args: argparse.Namespace) -> int:
     if args.cmd == "check-lookup":
         return _check_lookup_cmd(args)
+    if args.cmd == "references":
+        old, new, bank = _load_json(args.old_scope), _load_json(args.scope), _load_json(args.bank)
+        changes = reference_changes(old, new, export=_load_json(args.model_export) if args.model_export else None,
+                                    old_export=_load_json(args.old_model_export) if args.old_model_export else None)
+        usage = apply_reference_changes(bank, changes, round_no=args.round, apply=args.apply)
+        if args.apply and usage["rewritten"]:
+            _write_json(args.bank, bank)
+        out = {"version": 1, "model": new.get("model"), "removed": changes, "usage": usage,
+               "findings": reference_findings(changes, usage, args.round)}
+        _write_json(args.out, out)
+        print(json.dumps({"out": args.out, "names_gone": [c["name"] for c in changes],
+                          "rewritten": len(usage["rewritten"]), "applied": args.apply,
+                          "unresolved": usage["unresolved"], "findings": [f["id"] for f in out["findings"]]},
+                         indent=2))
+        return 0
+    if args.cmd == "add-findings":
+        doc = _load_json(args.findings)
+        new = [f for src in args.sources for f in _load_json(src).get("findings") or []]
+        res = merge_findings(doc, new)
+        _write_json(args.findings, doc)
+        print(json.dumps(res, indent=2))
+        return 0
     if args.cmd == "grade":
         bank = _load_json(args.bank)
         out = grade_bank(bank, _load_json(args.results), bank_dir=os.path.dirname(os.path.abspath(args.bank)),

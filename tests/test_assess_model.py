@@ -2211,3 +2211,189 @@ class LookupPlanCheckTests(unittest.TestCase):
         self.assertIn("source column", text)
         self.assertIn("check-lookup failed", text)
         self.assertIn("separator ';', no quote character", out["manual"])
+
+
+class ReferenceChangeTests(unittest.TestCase):
+    """Names saved SQL uses that the model no longer has, and their rewrite."""
+
+    OLD = {"model": "M", "attributes": [{"name": "status code"}, {"name": "region"}, {"name": "channel__id"},
+                                        {"name": "channel__desc"}, {"name": "open date"}, {"name": "promo"}],
+           "metrics": [{"name": "net sales"}, {"name": "units"}]}
+    NEW = {"model": "M", "attributes": [{"name": "status code__id"}, {"name": "status code__desc"},
+                                        {"name": "region"}, {"name": "channel"},
+                                        {"name": "open date (month)__id"}, {"name": "promo__a"}, {"name": "promo__b"}],
+           "metrics": [{"name": "net sales"}, {"name": "unit count"}]}
+
+    def test_replacements(self):
+        ch = {c["name"]: c for c in am.reference_changes(self.OLD, self.NEW)}
+        self.assertEqual(ch["status code"]["replacement"], "status code__id")      # a form was added
+        self.assertEqual(ch["channel__id"]["replacement"], "channel")               # forms dropped
+        self.assertIsNone(ch["open date"]["replacement"])                           # time intervals don't count
+        self.assertEqual(ch["promo"]["candidates"], ["promo__a", "promo__b"])       # ambiguous
+        self.assertIsNone(ch["promo"]["replacement"])
+        self.assertIsNone(ch["units"]["replacement"])
+        self.assertNotIn("region", ch)
+
+    def test_renamed_object_found_by_id(self):
+        old_x = {"model": [{"factMetrics": [{"information": {"objectId": "M1", "name": "Units"}}]}]}
+        new_x = {"model": [{"factMetrics": [{"information": {"objectId": "M1", "name": "Unit Count"}}]}]}
+        ch = {c["name"]: c for c in am.reference_changes(self.OLD, self.NEW, export=new_x, old_export=old_x)}
+        self.assertEqual(ch["units"]["replacement"], "unit count")
+
+    def test_replace_identifier_leaves_literals_and_counts_bare_mentions(self):
+        sql, done, left = am.replace_identifier(
+            """SELECT "Status Code", COUNT("net sales") FROM t WHERE x = '"status code"' AND status_x = 1""",
+            "status code", "status code__id")
+        self.assertIn('"status code__id"', sql)
+        self.assertIn("'\"status code\"'", sql)          # inside a literal: untouched
+        self.assertEqual((done, left), (1, 0))
+        _, _, left = am.replace_identifier("SELECT promo, units FROM t", "units", "unit count")
+        self.assertEqual(left, 1)
+
+    def test_rewrite_saved_sql_with_history_and_findings(self):
+        bank = {"model": "M", "questions": [
+            {"id": "Q1", "sql": 'SELECT "status code", COUNT("net sales") AS n FROM [[MODEL]] GROUP BY 1',
+             "best_answer": {"sql": 'SELECT "status code", SUM(CASE WHEN "net sales" IS NULL THEN 0 ELSE 1 END) '
+                                    'FROM [[MODEL]] GROUP BY 1', "reason_kind": "initial"},
+             "expected": {"source": "same_model_sql", "sql": 'SELECT "status code" FROM [[MODEL]]'}},
+            {"id": "Q2", "sql": 'SELECT "promo", SUM("units") FROM [[MODEL]] GROUP BY 1'}]}
+        changes = am.reference_changes(self.OLD, self.NEW)
+        res = am.apply_reference_changes(bank, changes, round_no=3, apply=True)
+        q1, q2 = bank["questions"]
+        self.assertIn('"status code__id"', q1["sql"])
+        self.assertEqual(q1["sql_history"][-1]["reason_kind"], "model_change")
+        self.assertEqual(q1["best_answer"]["reason_kind"], "model_change")
+        self.assertIn('"status code__id"', q1["best_answer"]["sql"])
+        self.assertIn('"status code__id"', q1["expected"]["sql"])
+        self.assertEqual(q2["sql"], 'SELECT "promo", SUM("units") FROM [[MODEL]] GROUP BY 1')   # unresolved: kept
+        self.assertEqual({u["name"] for u in res["unresolved"]}, {"promo", "units"})
+        fs = am.reference_findings(changes, res, 3)
+        self.assertEqual({f["id"] for f in fs}, {"N-promo", "N-units"})
+        self.assertTrue(all(f["needs_answer"] and f["status"] == "proposed" and f["introduced_in_round"] == 3
+                            for f in fs))
+
+    def test_references_command(self):
+        d = tempfile.mkdtemp(prefix="refs-")
+        self.addCleanup(shutil.rmtree, d, True)
+        paths = {}
+        for name, obj in (("old", self.OLD), ("new", self.NEW), ("bank", {"model": "M", "questions": [
+                {"id": "Q1", "sql": 'SELECT "status code" FROM [[MODEL]]'}]})):
+            paths[name] = os.path.join(d, name + ".json")
+            with open(paths[name], "w", encoding="utf-8") as f:
+                json.dump(obj, f)
+        out = os.path.join(d, "references.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            am.main(["references", "--old-scope", paths["old"], "--scope", paths["new"], "--bank", paths["bank"],
+                     "--apply", "--round", "2", "--out", out])
+        with open(paths["bank"], encoding="utf-8") as f:
+            self.assertIn("status code__id", json.load(f)["questions"][0]["sql"])
+
+
+class _ErrRunner(_SqlRunner):
+    def call(self, tool, args):
+        self.calls.append((tool, args))
+        rows = self.answer(args["query"])
+        if isinstance(rows, str):
+            return _text(rows, error=True)
+        return _table_reply(rows)
+
+
+class JoinPathTests(unittest.TestCase):
+    SCOPE = {"model": "Store Sales", "anchor": {"metric": "net sales", "counts": {"net sales": 100}},
+             "attributes": [{"name": "region", "profile": {"distinct_values": 3}},
+                            {"name": "store", "profile": {"distinct_values": 40}},
+                            {"name": "flag", "profile": {"distinct_values": 2}},
+                            {"name": "one", "profile": {"distinct_values": 1}},
+                            {"name": "store__desc", "profile": {"distinct_values": 40}}],
+             "metrics": [{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
+                         {"name": "regional sales", "type": "double", "formula": "net sales where region = 'a'"}]}
+
+    def _answer(self, sql):
+        if sql.startswith('SELECT COUNT("net sales") AS n'):
+            return [["n"], ["100"]]
+        if 'GROUP BY "region"' in sql:
+            return [["v", "n"], ["a", "100"], ["b", "100"]]
+        if 'GROUP BY "store"' in sql:
+            return [["v", "n"], ["s1", "1"], ["s2", "2"]]
+        if 'GROUP BY "flag"' in sql:
+            return "Query failed: no join path between the tables"
+        raise AssertionError(sql)
+
+    def test_cross_join_join_error_and_filtering_metrics(self):
+        runner = _ErrRunner(self._answer)
+        out = am.check_join_paths(runner, "P", self.SCOPE, round_no=2)
+        self.assertEqual(out["attributes"]["region"]["net sales"]["verdict"], "cross_join")
+        self.assertEqual(out["attributes"]["store"]["net sales"]["verdict"], "joined")
+        self.assertEqual(out["attributes"]["flag"]["net sales"]["verdict"], "join_error")
+        self.assertNotIn("one", out["attributes"])              # one value: can't tell
+        self.assertNotIn("store__desc", out["attributes"])      # forms share the attribute's join
+        self.assertEqual(set(out["unjoined"]), {"region", "flag"})
+        self.assertEqual(out["metrics_filtering_unjoined"], [{"metric": "regional sales", "attribute": "region"}])
+        ids = {f["id"]: f for f in out["findings"]}
+        self.assertEqual(set(ids), {"J-region", "J-flag"})
+        self.assertIn("regional sales", ids["J-region"]["evidence"]["observed"])
+        self.assertTrue(ids["J-region"]["needs_answer"])
+
+    EXPORT = {"model": [{
+        "factMetrics": [{"information": {"objectId": "FM", "name": "Net Sales"},
+                         "expressions": [{"tables": [{"name": "facts.csv"}]}]}],
+        "attributes": [
+            {"information": {"objectId": "A1", "name": "Store"}, "attributeLookupTable": {"name": "stores.csv"},
+             "forms": [{"expressions": [{"tables": [{"name": "stores.csv"}, {"name": "facts.csv"}]}]}],
+             "relationships": [{"parent": {"objectId": "A2"}, "child": {"objectId": "A1"},
+                                "relationshipType": "one_to_many"}]},
+            {"information": {"objectId": "A2", "name": "Region"}, "attributeLookupTable": {"name": "stores.csv"},
+             "forms": [{"expressions": [{"tables": [{"name": "stores.csv"}]}]}]},
+            {"information": {"objectId": "A3", "name": "Promo"}, "attributeLookupTable": {"name": "promos.csv"},
+             "forms": [{"expressions": [{"tables": [{"name": "promos.csv"}]}]}]}]}]}
+
+    def test_export_graph_and_lost_relationships(self):
+        g = am.export_join_graph(self.EXPORT)
+        self.assertEqual(g["fact_tables"], ["facts.csv"])
+        self.assertEqual([u["attribute"] for u in g["unreachable"]], ["promo"])    # region reaches through stores
+        self.assertEqual(g["relationships"], [{"parent": "region", "child": "store", "type": "one_to_many"}])
+        prev = {"relationships": [{"parent": "region", "child": "store"}, {"parent": "country", "child": "region"}]}
+        out = am.check_join_paths(None, "P", self.SCOPE, export=self.EXPORT, previous=prev, round_no=3)
+        self.assertEqual(out["relationship_changes"]["lost"], [{"parent": "country", "child": "region"}])
+        ids = {f["id"] for f in out["findings"]}
+        self.assertIn("L-country-region", ids)
+        self.assertIn("J-promo", ids)                 # export alone: no shared column with the fact
+
+    def test_one_query_per_lookup_table_with_the_export(self):
+        scope = {**self.SCOPE, "attributes": [{"name": "store", "profile": {"distinct_values": 40}},
+                                               {"name": "region", "profile": {"distinct_values": 3}}]}
+        runner = _ErrRunner(lambda sql: [["n"], ["100"]] if sql.startswith("SELECT COUNT") else
+                            [["v", "n"], ["s1", "1"], ["s2", "2"]])
+        out = am.check_join_paths(runner, "P", scope, export=self.EXPORT)
+        self.assertEqual(out["attributes"]["region"]["net sales"]["inherited_from"], "store")
+        self.assertEqual(len([c for c in runner.calls if "GROUP BY" in c[1]["query"]]), 1)
+
+    def test_merge_findings_keeps_answers(self):
+        doc = {"findings": [{"id": "J-region", "status": "declined", "evidence": {"observed": "old"}}]}
+        new = [am.integrity_finding("J-region", "t", "relationship", "new", "r", round_no=4),
+               am.integrity_finding("J-flag", "t", "relationship", "x", "r", round_no=4)]
+        res = am.merge_findings(doc, new)
+        self.assertEqual(res["added"], ["J-flag"])
+        self.assertEqual(doc["findings"][0]["status"], "declined")
+        self.assertEqual(doc["findings"][0]["evidence"]["observed"], "new")
+
+
+class PhaseGateTests(unittest.TestCase):
+    def _doc(self, f2_status="proposed"):
+        act = {"kind": "patch_model_object", "args": {"kind": "metric", "object_id": "X", "json": {}}}
+        return {"model": "M", "findings": [
+            {"id": "F1", "category": "metric_defect", "impact": "high", "effort": "small", "status": "approved",
+             "actions": [act], "tests": ["Q1"]},
+            {"id": "F2", "category": "metric_defect", "impact": "low", "effort": "small", "status": f2_status,
+             "actions": [act], "tests": ["Q2"]},
+            {"id": "J-x", "category": "relationship", "impact": "high", "effort": "small", "status": "proposed",
+             "actions": [], "needs_answer": True}]}
+
+    def test_unanswered_findings_block_their_phase(self):
+        plan = am.build_plan(self._doc(), model_id="MID")
+        ph4 = next(p for p in plan["phases"] if p["phase"] == 4)
+        self.assertEqual(ph4["blocked_by"], ["F2"])
+        self.assertEqual(plan["unanswered"], {"3": ["J-x"], "4": ["F2"]})
+        answered = am.build_plan(self._doc("declined"), model_id="MID")
+        self.assertNotIn("blocked_by", next(p for p in answered["phases"] if p["phase"] == 4))
+        self.assertNotEqual(plan["plan_id"], answered["plan_id"])     # a newer plan has another id

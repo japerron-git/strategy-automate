@@ -56,7 +56,7 @@ folder kept local — they hold tenant data). Script: `skills/strategy-model-ass
 the maturity estimate from step 1 sets the emphasis (see "Maturity levels" in the memory note).
 
 **Sessions where the script cannot sign in** (a cloud workspace with the Mosaic connector attached):
-add `--replies <folder>` to `scope`, `relationships`, `roles`, `probe`, `lookups` and `run`. The script then lists the
+add `--replies <folder>` to `scope`, `relationships`, `roles`, `probe`, `join-paths`, `lookups` and `run`. The script then lists the
 calls it needs in `<folder>/pending.json`; call each connector tool with the listed arguments, save
 the reply text to the listed file (start it with `ERROR:` if the tool failed), and run the same
 command again until nothing is pending (exit code 3 means "replies still needed").
@@ -148,6 +148,27 @@ CAST, depends on the query's shape, or ignores a filter that drops most entities
 group, summed metrics whose groups don't add up, metrics on a lookup table, gaps in a partner's periods,
 latest-only metrics that don't say so. Each confirmed warning is a finding. After a phase, probe only what it touched:
 `--changed-since <previous scope.json> --findings findings.json --phases <N>`.
+
+### 1b4. Join paths → `join_paths.json`
+
+```bash
+python3 assess_model.py join-paths --project "<project>" --scope scope.json [--model-export export.json] \
+  [--previous join_paths_round<N-1>.json] --round <N> --out join_paths.json
+```
+
+With no join path between an attribute's table and a fact table, Mosaic cross-joins: every value of the
+attribute gets the fact's full total, and a metric filtering on it filters nothing. For each fact table's
+anchor, the command groups `COUNT(<anchor>)` by each attribute (two smallest groups): both equal to the
+total is a cross join; an error naming a join is the same verdict. With the export it also says which
+tables each attribute reaches and records the declared relationships, so the next round reports those
+lost or added. An attribute with one value can't be tested. Its findings need the user's answer
+(`needs_answer`); merge them with `add-findings --findings findings.json --from join_paths.json`.
+
+After any change to the model, also run `references --old-scope <previous scope.json> --scope scope.json
+--bank question_bank.json [--model-export ...] [--old-model-export ...] --apply --round <N>`: it finds
+names saved SQL uses that the model no longer has (a form added makes `attr` answer as `attr__id`; a
+renamed object keeps its export id), rewrites question, best-answer and expected SQL where one name
+replaces it (reason kind `model_change`, history kept), and proposes a finding for the rest.
 
 ### 1c. Lookup tables → `lookups.json` and CSV templates
 
@@ -297,6 +318,10 @@ it knows (a `--dry-run` command and an apply command), manual steps otherwise. E
   metrics that filter on it (they are deleted with it).
 - **Unit tests:** the questions named in each finding's `tests`.
 - **Regression tests:** the whole bank (`run` + `grade`), compared with the previous `graded.json`.
+- **Answers first:** a finding still `proposed` blocks the phases of its actions (or its own phase when it
+  has none), whoever raised it: the phase gets `blocked_by` and no script until it is answered.
+  `unanswered` lists them by phase. Each plan has a `plan_id`; scripts made from it refuse to run once a
+  newer plan replaces it.
 - **After:** republish when a phase changed tables, attributes or fact metrics; re-certify after any
   edit (edits drop certification, and MCP cannot see an uncertified model).
 
