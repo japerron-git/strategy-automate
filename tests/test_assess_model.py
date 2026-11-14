@@ -2619,3 +2619,36 @@ class OpenItemTests(unittest.TestCase):
         self.assertEqual(info["export"]["file"], "export.json")
         self.assertEqual(len(info["export"]["sha"]), 12)
         self.assertNotIn("scope", info)
+
+
+class CheckExistingTableTests(unittest.TestCase):
+    """check-lookup --table: a table already extended and reloaded, which no suggestion names."""
+
+    def test_table_entry_and_command(self):
+        exp, scope = LookupFormatTests.EXPORT, LookupFormatTests.SCOPE
+        e = am.table_entry(scope, exp, "status_map")                       # with or without .csv
+        self.assertEqual((e["table"], e["columns"], e["load_format"]["separator"]), ("status_map.csv",
+                                                                                     ["STATUS", "BUCKET"], ";"))
+        self.assertTrue(all(not k.startswith("_v_") for k in e["read_as"]))
+        d = tempfile.mkdtemp(prefix="tbl-")
+        self.addCleanup(shutil.rmtree, d, True)
+        paths = {}
+        for name, obj in (("scope", scope), ("export", exp), ("lookups", {"version": 1, "lookups": []})):
+            paths[name] = os.path.join(d, name + ".json")
+            with open(paths[name], "w", encoding="utf-8") as f:
+                json.dump(obj, f)
+        csvp = os.path.join(d, "status_map.csv")
+        with open(csvp, "w", encoding="utf-8", newline="") as f:
+            f.write("STATUS;BUCKET\n00;0\n01;1\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = am.main(["check-lookup", "--table", "status_map.csv", "--scope", paths["scope"], "--model-export",
+                            paths["export"], "--csv", csvp, "--lookups", paths["lookups"], "--record"])
+        self.assertEqual(code, 0)
+        with open(paths["lookups"], encoding="utf-8") as f:
+            (x,) = json.load(f)["lookups"]
+        self.assertEqual((x["kind"], x["check"]["ok"]), ("existing_table", True))
+
+    def test_declined_question_steps_dont_warn(self):
+        f = {"id": "F1", "category": "metric_defect", "status": "declined", "decision_note": "no", "tests": ["Q1"],
+             "actions": [{"kind": "manual", "steps": ["Review the rows with the data owner"]}]}
+        self.assertEqual(am.check_findings({"findings": [f]})["warnings"], [])

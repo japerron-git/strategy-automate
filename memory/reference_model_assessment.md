@@ -88,7 +88,8 @@ live, the loader splits on every separator when the table has no quote character
 `check-lookup --lookups lookups.json --id <id> --csv <file> --record` confirms a filled file is
 load-ready (every line splits into the table's columns, the header matches exactly, the existing
 columns are unchanged from the template row for row, blanks still blank); with `--project` after a
-reload it also compares the reloaded table with the file. Add a lookup by mapping its
+reload it also compares the reloaded table with the file. `--table <name> --scope ... --model-export ...`
+checks a table no suggestion names (one already extended and reloaded) from the export's columns. Add a lookup by mapping its
 key column to the **existing** attribute — replacing the attribute deletes the derived metrics that
 filter on it (`feedback_mosaic_gotchas.md`). Then check the attribute's lookup table, republish and
 re-certify.

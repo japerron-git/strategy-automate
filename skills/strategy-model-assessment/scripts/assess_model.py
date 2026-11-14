@@ -4278,7 +4278,7 @@ def check_findings(doc: dict) -> dict[str, Any]:
         if not f.get("tests"):
             if not f.get("checks"):
                 warnings.append(f"{fid}: no tests named")
-        for st in consult_steps(f):
+        for st in consult_steps(f) if f.get("status") != "declined" else []:
             warnings.append(f"{fid}: a manual step is a question for someone, not a model edit ('{st}'): make it "
                             f"its own finding with needs_answer and no action, so this one holds only steps that run")
     problems += [f"findings: dependency cycle {c}" for c in _cycles(fs)]
@@ -4471,8 +4471,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("check-lookup", help="check a filled lookup file is load-ready: the table's load format, its "
                         "header, the existing columns unchanged from the template; with --project, also against the "
                         "reloaded table")
-    sp.add_argument("--lookups", required=True, help="lookups.json from the lookups command")
-    sp.add_argument("--id", required=True, help="the suggestion's id (X-..., L-...)")
+    sp.add_argument("--lookups", help="lookups.json from the lookups command (needed with --id, and for --record)")
+    sp.add_argument("--id", help="the suggestion's id (X-..., L-...)")
+    sp.add_argument("--table", help="instead of --id: an existing lookup table of the model (one already extended "
+                    "and reloaded, which no suggestion names); needs --scope and --model-export")
+    sp.add_argument("--scope", help="scope.json (with --table)")
+    sp.add_argument("--model-export", help="the model export (with --table): the table's columns and load format")
     sp.add_argument("--csv", help="the filled file (default: the template path in lookups.json)")
     sp.add_argument("--project", help="query the model: compare the reloaded table with the file (after a reload)")
     sp.add_argument("--model", help="model name (default: lookups.json)")
@@ -4722,12 +4726,39 @@ def _pending(runner: Callable[[], Runner]) -> bool:
     return any(getattr(r, "pending", None) for r in made)
 
 
+def table_entry(scope: dict, export: dict, table: str) -> dict[str, Any] | None:
+    """A check-lookup entry for an existing lookup table, from the export: its columns, how the connector
+    answers each, its load format. For a table already extended and reloaded, which no suggestion names."""
+    groups = existing_lookup_tables(scope, export=export)
+    key = _table_key(table)
+    name = next((t for t in groups if _table_key(t) == key), None)
+    if name is None:
+        return None
+    g = groups[name]
+    return {"id": f"T-{_slug(key)}", "kind": "existing_table", "table": name, "attribute": g.get("key"),
+            "columns": list(g.get("columns") or []),
+            "read_as": {c: v for c, v in (g.get("read_as") or {}).items() if not str(c).startswith("_v_")},
+            "load_format": load_formats(export).get(key), "source": "check-lookup --table"}
+
+
 def _check_lookup_cmd(args: argparse.Namespace, runner: Callable[[], Runner] | None = None) -> int:
-    data = _load_json(args.lookups)
-    entry = next((x for x in data.get("lookups") or [] if x.get("id") == args.id), None)
-    if not entry:
-        print(json.dumps({"ok": False, "error": f"no suggestion '{args.id}' in {args.lookups}"}, indent=2))
-        return 2
+    data = _load_json(args.lookups) if args.lookups else {"lookups": []}
+    if args.table:
+        if not (args.scope and args.model_export):
+            print(json.dumps({"ok": False, "error": "--table needs --scope and --model-export"}, indent=2))
+            return 2
+        entry = table_entry(_load_json(args.scope), _load_json(args.model_export), args.table)
+        if not entry:
+            print(json.dumps({"ok": False, "error": f"no lookup table '{args.table}' in the export"}, indent=2))
+            return 2
+        args.id = entry["id"]
+        data.setdefault("model", _load_json(args.scope).get("model"))
+    else:
+        entry = next((x for x in data.get("lookups") or [] if x.get("id") == args.id), None) if args.id else None
+        if not entry:
+            print(json.dumps({"ok": False, "error": f"no suggestion '{args.id}' in {args.lookups}" if args.id
+                              else "give --id (with --lookups) or --table"}, indent=2))
+            return 2
     path = args.csv or entry.get("csv")
     if not path:
         print(json.dumps({"ok": False, "error": f"'{args.id}' has no CSV file; pass --csv"}, indent=2))
@@ -4747,6 +4778,11 @@ def _check_lookup_cmd(args: argparse.Namespace, runner: Callable[[], Runner] | N
             return 2
     res = check_lookup_csv(entry, path, live_rows=live)
     if args.record:
+        if not args.lookups:
+            print(json.dumps({"ok": False, "error": "--record needs --lookups"}, indent=2))
+            return 2
+        if args.table:   # an existing table joins lookups.json so the workbook shows its check
+            data["lookups"] = [x for x in data.get("lookups") or [] if x.get("id") != entry["id"]] + [{**entry, "csv": path}]
         for x in data.get("lookups") or []:
             if x.get("id") == args.id:
                 x["check"] = {k: res[k] for k in ("ok", "csv", "problems", "warnings") if k in res}
