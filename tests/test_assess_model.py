@@ -2492,6 +2492,10 @@ class PhaseGateTests(unittest.TestCase):
         answered = am.build_plan(self._doc("declined"), model_id="MID")
         self.assertNotIn("blocked_by", next(p for p in answered["phases"] if p["phase"] == 4))
         self.assertNotEqual(plan["plan_id"], answered["plan_id"])     # a newer plan has another id
+        again = am.build_plan(self._doc(), model_id="MID")
+        self.assertEqual(again["plan_id"], plan["plan_id"])              # same inputs, same id
+        other = am.build_plan(self._doc(), model_id="MID", python="py")   # same findings, other steps
+        self.assertNotEqual(other["plan_id"], plan["plan_id"])
 
 
 class UnbracedFormulaTests(unittest.TestCase):

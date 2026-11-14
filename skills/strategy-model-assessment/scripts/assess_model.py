@@ -4106,9 +4106,11 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
             ph["blocked_by"] = unanswered[ph["phase"]]
             warnings.append(f"phase {ph['phase']}: no script until these findings are answered: "
                             f"{', '.join(unanswered[ph['phase']])}")
+    # the id covers what the scripts will run, not only the findings: an engine change that alters a step
+    # (a new check around a manual step) must also retire the scripts made before it
     digest = hashlib.sha256(json.dumps({"findings": [{k: f.get(k) for k in ("id", "status", "actions", "decision_note",
                                                                          "applied_phases")} for f in every],
-                                        "model_id": model_id, "statuses": list(statuses)},
+                                        "phases": phases, "model_id": model_id, "statuses": list(statuses)},
                                        sort_keys=True, default=str).encode()).hexdigest()[:12]
     return {"version": 1, "model": findings_doc.get("model"), "model_id": model_id or None,
             "generated": time.strftime("%Y-%m-%d"), "statuses_planned": list(statuses), "plan_id": digest,
