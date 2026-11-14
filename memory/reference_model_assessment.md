@@ -187,7 +187,8 @@ Resolved:
   through the same PATCH. Running it on a form already shown changes nothing.
 - *Reloading a table:* no API replaces a model's file table in place (Push Data upload sessions are for
   datasets; publish reloads from the existing source), so the reload stays manual. The phase script
-  exports the model before and after it and runs `relationship-diff`, which stops the script when a
+  exports the model before and after it (a lookup reload or the phase-1 source rebuild) and runs
+  `relationship-diff`, which stops the script when a
   relationship was lost and lists the actions that restore it.
 - *Which export and scope each output used:* `lookups`, `join-paths`, `probe` and `roles` record
   `sources` (file name and a short hash); the workbook shows them, warns when outputs were made from

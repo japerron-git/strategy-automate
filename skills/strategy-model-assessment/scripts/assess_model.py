@@ -3817,7 +3817,9 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
              "title": "Rebuild the source data once", "kind": "source_change", "dry_run": None,
              "apply": None, "manual": source_change_text(sc),
              "risks": ["Re-map existing attributes and fact metrics to the reloaded columns; deleting "
-                       "them deletes the derived metrics that reference them."]})
+                       "them deletes the derived metrics that reference them."],
+             # a rebuild reloads tables by hand, like a lookup reload: it can drop attribute relationships
+             **_reload_guards(python, mid, cmd, "phase1_source")})
     by_table: dict[str, list[dict]] = {}
     for c in merged["change_column_type"]:
         by_table.setdefault(c.get("table") or "", []).append(c)
@@ -4057,10 +4059,7 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                     "risks": list(dict.fromkeys(risks))}
             if any(la.get("extends_table") for la, _ in lookups):
                 # a table reloaded by hand can lose attribute relationships: export before and after, stop if so
-                b4, af = f"ignore/exports/before_phase{n}_reload.json", f"ignore/exports/after_phase{n}_reload.json"
-                step["guard_before"] = [cmd([python, BUILD_SCRIPT, "export-model", "--model-id", mid, "--out", b4])]
-                step["guard_after"] = [cmd([python, BUILD_SCRIPT, "export-model", "--model-id", mid, "--out", af]),
-                                       cmd([python, ASSESS_SCRIPT, "relationship-diff", "--before", b4, "--after", af])]
+                step.update(_reload_guards(python, mid, cmd, f"phase{n}_reload"))
             steps[lookup_at:lookup_at] = [step] + retypes
         before = ["Save a backup copy of the model before applying this phase."]
         if n == 3:
@@ -4133,6 +4132,15 @@ def consult_steps(f: dict) -> list[str]:
             if _CONSULT.search(str(st)):
                 out.append(str(st)[:120])
     return out
+
+
+def _reload_guards(python: str, mid: str, cmd: Callable, label: str) -> dict[str, list]:
+    """Around a step that reloads tables by hand (a source rebuild, a lookup reload): export the model before
+    and after (to ignore/, never committed) and stop the script when a relationship was lost."""
+    b4, af = f"ignore/exports/before_{label}.json", f"ignore/exports/after_{label}.json"
+    return {"guard_before": [cmd([python, BUILD_SCRIPT, "export-model", "--model-id", mid, "--out", b4])],
+            "guard_after": [cmd([python, BUILD_SCRIPT, "export-model", "--model-id", mid, "--out", af]),
+                            cmd([python, ASSESS_SCRIPT, "relationship-diff", "--before", b4, "--after", af])]}
 
 
 def unanswered_by_phase(findings: list[dict]) -> dict[int, list[str]]:
@@ -4774,6 +4782,9 @@ def _check_lookup_cmd(args: argparse.Namespace, runner: Callable[[], Runner] | N
         live, err = _read_table_rows(runner(), args.project, args.model or data.get("model") or "",
                                      entry.get("read_as") or {}, cols)
         if live is None:
+            if re.search(r"COLUMN_NOT_FOUND|does not exist", str(err or ""), re.I):
+                err = (f"{err} — the connector no longer has a name this check used: the scope (or lookups.json) "
+                       f"is older than the model. Re-run scope (and lookups) on the current model first.")
             print(json.dumps({"ok": False, "error": err}, indent=2))
             return 2
     res = check_lookup_csv(entry, path, live_rows=live)

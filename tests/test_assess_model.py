@@ -2603,6 +2603,14 @@ class OpenItemTests(unittest.TestCase):
         self.assertTrue(all("ignore/exports/" in " ".join(g["argv"]) for g in step["guard_before"] + step["guard_after"]))
         self.assertTrue(any("manual step" in w for w in plan["warnings"]))
 
+    def test_source_rebuild_is_guarded_too(self):
+        doc = {"model": "M", "findings": [{"id": "F1", "category": "source_data", "status": "approved", "tests": ["Q1"],
+                                           "actions": [{"kind": "source_change", "args": {"change": "Map blank codes"}}]}]}
+        plan = am.build_plan(doc, model_id="MID")
+        (step,) = [s for p in plan["phases"] for s in p["steps"] if s["kind"] == "source_change"]
+        self.assertIn("ignore/exports/before_phase1_source.json", step["guard_before"][0]["argv"])
+        self.assertIn("relationship-diff", step["guard_after"][1]["argv"])
+
     def test_questions_in_manual_steps_are_flagged(self):
         f = {"id": "F1", "category": "metric_defect", "status": "proposed", "tests": ["Q1"], "actions": [
             {"kind": "manual", "steps": ["Design SMM/CPR with the data owner", "Edit the model description"]}]}
