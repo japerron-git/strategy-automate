@@ -172,13 +172,12 @@ answered wrong. The maturity check for summed rates leaves out weighted-average 
 
 ## Open items (engine and plugin)
 
-- **Descriptions for derived metrics and the model.** `rename_describe` covers attributes and fact
-  metrics only, so these fall back to manual steps. To verify live: a full-body PUT of a derived metric
-  (read with `--show-expression-as tokens`, so the PUT keeps its expression) changes only its
-  description; a PATCH of the data model sets the model description. Then both join the one phase-6
-  command.
+- **The model's description.** To verify live: a PATCH of the data model sets the model description
+  (`patch-model-object --kind data_model ... --yes`). Then it joins the one phase-6 command.
 
 Resolved:
+- *Derived-metric descriptions:* `rename_describe` items with `object_type: metric` (verified live: the
+  full-body PUT changed only the description, and the connector showed it with no republish).
 - *Showing hidden forms:* `show_forms` / `build_mosaic.py show-forms` adds forms to the attribute's report
   and browse displays. Verified by comparing two exports: the forms that became visible to the connector
   were exactly those added to both display lists (set in the UI); the build already sets displays

@@ -37,7 +37,9 @@ class ItemTests(unittest.TestCase):
                                                   "description": "d"}]})
         self.assertEqual(ok, [{"object_type": "attribute", "current_name": "Region", "new_name": None,
                                "description": "d"}])
-        _dies(bm.rename_describe_items, [{"object_type": "metric", "current_name": "x", "description": "d"}])
+        self.assertEqual(bm.rename_describe_items([{"object_type": "metric", "current_name": "x",
+                                                     "description": "d"}])[0]["object_type"], "metric")
+        _dies(bm.rename_describe_items, [{"object_type": "derived", "current_name": "x", "description": "d"}])
         _dies(bm.rename_describe_items, [{"object_type": "attribute", "current_name": "x", "description": "d" * 251}])
         _dies(bm.rename_describe_items, [{"object_type": "attribute", "current_name": "x"}])
         _dies(bm.rename_describe_items, {"items": []})
@@ -116,6 +118,43 @@ class WriteTests(unittest.TestCase):
             self.assertEqual(writes, [] if dry else [("POST", "/api/model/changesets"), ("PATCH", f"{MP}/attributes/A1"),
                                                       ("POST", "/api/model/changesets/CS1/commit")])
             self.assertEqual(json.loads(out.getvalue())["changed"], ["attribute 'Region': description"])
+
+
+class DerivedMetricTests(unittest.TestCase):
+    """A derived metric's description: read with its expression as tokens, PUT back whole (verified live)."""
+
+    def test_derived_metric_written_with_a_full_put(self):
+        d = tempfile.mkdtemp()
+        spec = os.path.join(d, "spec.json")
+        self.addCleanup(lambda: (os.remove(spec), os.rmdir(d)))
+        with open(spec, "w", encoding="utf-8") as f:
+            json.dump({"items": [{"object_type": "metric", "current_name": "Original UPB (once per loan)",
+                                  "description": "new text"}]}, f)
+        model = {**MODEL, "metrics": [{"information": {"objectId": "D1", "name": "Original UPB (once per loan)",
+                                                       "description": "old text"}}]}
+        body = {"information": {"objectId": "D1", "name": "Original UPB (once per loan)", "description": "old text",
+                                "subType": "metric"},
+                "expression": {"tokens": [{"value": "Sum"}], "text": "Sum(Max({x}))"}, "format": {"x": 1}}
+        routes = {("POST", f"{MP}/export"): _Resp(200, {"model": [model]}),
+                  ("GET", f"{MP}/metrics/D1"): _Resp(200, body),
+                  ("PUT", f"{MP}/metrics/D1"): _Resp(200, {}),
+                  ("POST", "/api/model/changesets"): _Resp(201, {"id": "CS1"}),
+                  ("POST", "/api/model/changesets/CS1/commit"): _Resp(204),
+                  ("DELETE", "/api/model/changesets/CS1"): _Resp(204)}
+        fake = _Fake(routes)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            bm.cmd_rename_describe(fake, types.SimpleNamespace(model_id="M1", spec=spec, dry_run=False))
+        calls = [(m, p) for m, p, _, _ in fake.calls if p.endswith("/metrics/D1")]
+        self.assertEqual(calls, [("GET", f"{MP}/metrics/D1"), ("PUT", f"{MP}/metrics/D1")])
+        get = next(c for c in fake.calls if c[0] == "GET" and c[1].endswith("/metrics/D1"))
+        self.assertEqual(get[2]["params"], {"showExpressionAs": "tokens"})
+        put_call = next(c for c in fake.calls if c[0] == "PUT")
+        self.assertEqual(put_call[3], "CS1")                              # inside the changeset
+        put = put_call[2]["json"]
+        self.assertEqual(put["information"]["description"], "new text")
+        self.assertEqual(put["expression"], body["expression"])          # the expression goes back unchanged
+        self.assertEqual(put["format"], body["format"])
+        self.assertNotIn("_full_put", json.dumps(put))
 
 
 if __name__ == "__main__":

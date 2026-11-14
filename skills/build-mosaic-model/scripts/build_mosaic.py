@@ -6081,10 +6081,29 @@ def column_type_object_writes(model: dict, mid: str, cols: dict[str, tuple[str, 
     return writes, notes
 
 
+def _full_put_body(current: dict, info: dict) -> dict:
+    """A derived metric's whole body (read with showExpressionAs=tokens, so the PUT keeps its expression) with
+    only its name and description changed."""
+    out = dict(current)
+    out["information"] = {**(current.get("information") or {}), **info}
+    return out
+
+
 def _patch_in_changeset(m: MSTR, writes: list[tuple], label: str) -> None:
+    """PATCH each write in one changeset. A write marked _full_put (a derived metric) is read with its
+    expression as tokens and PUT back whole with the new name/description (verified live: only the
+    description changed, and the connector showed it with no republish)."""
     cs = open_cs(m)
     try:
         for what, path, body in writes:
+            if body.get("_full_put"):
+                cur = m.get(path, params={"showExpressionAs": "tokens"})
+                if not cur.ok:
+                    die(f"{label}: GET {what}: {format_mstr_error(cur)}")
+                r = m.put(path, json=_full_put_body(cur.json(), body["information"]))
+                if not r.ok:
+                    die(f"{label}: PUT {what}: {format_mstr_error(r)}")
+                continue
             r = m.patch(path, json=body)
             if not r.ok:
                 die(f"{label}: PATCH {what}: {format_mstr_error(r)}")
@@ -6302,9 +6321,8 @@ def rename_describe_items(spec: dict | list) -> list[dict]:
     out = []
     for it in items or []:
         kind = str(it.get("object_type") or "").lower()
-        if kind not in ("attribute", "fact_metric"):
-            die(f"{it.get('current_name')}: object_type must be attribute or fact_metric (derived metrics take "
-                f"their description when created)")
+        if kind not in ("attribute", "fact_metric", "metric"):
+            die(f"{it.get('current_name')}: object_type must be attribute, fact_metric or metric (a derived metric)")
         if not it.get("current_name"):
             die("an item has no current_name")
         desc = it.get("description")
@@ -6326,7 +6344,8 @@ def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[li
     no description of its own, and the connector shows the attribute's on every form. A form name can't be
     renamed here. Every item is checked before anything is written, and all problems are reported together."""
     pools = {"attribute": ("attributes", model.get("attributes") or []),
-             "fact_metric": ("factMetrics", model.get("factMetrics") or [])}
+             "fact_metric": ("factMetrics", model.get("factMetrics") or []),
+             "metric": ("metrics", model.get("metrics") or [])}   # derived metrics: a full-body PUT, see below
     by_name = {k: {(o.get("information") or {}).get("name", "").casefold(): o for o in objs}
                for k, (_, objs) in pools.items()}
     writes, notes, problems = [], [], []
@@ -6345,9 +6364,9 @@ def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[li
             if it["new_name"] and it["new_name"].casefold() in names:
                 notes.append(f"{cur}: already renamed to '{it['new_name']}'")
                 continue
-            other = "fact_metric" if kind == "attribute" else "attribute"
-            hint = (f" (it is a {other}: set object_type to {other})"
-                    if any(c in by_name[other] for c in attribute_name_candidates(cur)) else "")
+            other = next((k for k in pools if k != kind and any(c in by_name[k] for c in attribute_name_candidates(cur))),
+                         None)
+            hint = f" (it is a {other}: set object_type to {other})" if other else ""
             problems.append(f"{kind} '{cur}' not found{hint}")
             continue
         info = o["information"]
@@ -6385,9 +6404,11 @@ def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[li
         names[name.casefold()] = o
         what = " + ".join(x for x in ((f"rename -> '{name}'" if name != info["name"] else ""),
                                        ("description" if desc != info.get("description", "") else "")) if x)
+        body = {"information": {"name": name, "description": desc}}
+        if kind == "metric":
+            body["_full_put"] = True   # a derived metric takes no PATCH: its whole body is read and PUT back
         writes.append((f"{kind} '{info['name']}': {what}",
-                       f"/api/model/dataModels/{mid}/{pools[kind][0]}/{info['objectId']}",
-                       {"information": {"name": name, "description": desc}}))
+                       f"/api/model/dataModels/{mid}/{pools[kind][0]}/{info['objectId']}", body))
     if problems:
         die(f"rename-describe: {len(problems)} of {len(items)} item(s) can't be applied; nothing was written. "
             f"Fix them and run again:\n  - " + "\n  - ".join(problems))
@@ -6395,7 +6416,8 @@ def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[li
 
 
 def cmd_rename_describe(m: MSTR, args):
-    """Rename attributes and fact metrics and/or set their descriptions, by name, in one changeset."""
+    """Rename attributes, fact metrics and derived metrics and/or set their descriptions, by name, in one
+    changeset."""
     items = rename_describe_items(_load_json_arg(None, args.spec))
     m.login(identity=True)
     r = m.post(f"/api/model/dataModels/{args.model_id}/export")
