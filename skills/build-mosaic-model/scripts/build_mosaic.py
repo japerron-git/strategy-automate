@@ -894,6 +894,8 @@ def _redact_body_secrets(value):
 def _write_private(path: str, data) -> None:
     """Write JSON (dict/list) or text to `path`, readable by this user only (0600): responses
     and reports can carry tokens or user data."""
+    if os.path.dirname(path):   # an --out folder that doesn't exist yet (ignore/exports/)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         os.fchmod(fd, 0o600)          # an existing file keeps its old mode otherwise

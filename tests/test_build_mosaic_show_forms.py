@@ -42,3 +42,14 @@ class ShowFormsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WritePrivateTests(unittest.TestCase):
+    def test_creates_the_out_folder(self):
+        import shutil
+        import tempfile
+        d = tempfile.mkdtemp(prefix="wp-")
+        self.addCleanup(shutil.rmtree, d, True)
+        p = os.path.join(d, "ignore", "exports", "x.json")
+        bm._write_private(p, {"a": 1})
+        self.assertTrue(os.path.exists(p))

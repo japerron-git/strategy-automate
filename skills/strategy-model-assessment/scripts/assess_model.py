@@ -114,6 +114,8 @@ def _load_json(path: str) -> Any:
 
 def _write_json(path: str, obj: Any) -> None:
     """Owner-only file (the content is tenant data)."""
+    if os.path.dirname(path):   # an --out folder that doesn't exist yet (ignore/exports/)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
