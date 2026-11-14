@@ -1244,7 +1244,7 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         bad = am.build_plan({"findings": [_finding("F1", "description", actions=[{"kind": "rename_describe", "args": {
             "items": [{"object_type": "derived", "current_name": "x", "description": "y" * 251}]}}])]}, model_id="MID")
         text = " | ".join(bad["problems"])
-        self.assertIn("object_type must be attribute, fact_metric or metric", text)
+        self.assertIn("object_type must be attribute, fact_metric, metric (a derived metric) or model", text)
         self.assertIn("over 250 characters", text)
 
     def test_connector_form_names_in_rename_describe(self):

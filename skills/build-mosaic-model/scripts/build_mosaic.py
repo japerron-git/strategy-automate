@@ -6092,7 +6092,7 @@ def _full_put_body(current: dict, info: dict) -> dict:
 def _patch_in_changeset(m: MSTR, writes: list[tuple], label: str) -> None:
     """PATCH each write in one changeset. A write marked _full_put (a derived metric) is read with its
     expression as tokens and PUT back whole with the new name/description (verified live: only the
-    description changed, and the connector showed it with no republish)."""
+    description changed, and the connector showed it with no republish; re-certify after, as after any edit)."""
     cs = open_cs(m)
     try:
         for what, path, body in writes:
@@ -6321,16 +6321,23 @@ def rename_describe_items(spec: dict | list) -> list[dict]:
     out = []
     for it in items or []:
         kind = str(it.get("object_type") or "").lower()
-        if kind not in ("attribute", "fact_metric", "metric"):
-            die(f"{it.get('current_name')}: object_type must be attribute, fact_metric or metric (a derived metric)")
-        if not it.get("current_name"):
+        if kind not in ("attribute", "fact_metric", "metric", "model"):
+            die(f"{it.get('current_name')}: object_type must be attribute, fact_metric, metric (a derived metric) "
+                f"or model")
+        if kind == "model":
+            # the model's own description (verified live: a PATCH of the data model set it)
+            if it.get("new_name"):
+                die("the model can't be renamed here; give only its description")
+            if it.get("description") is None:
+                die("a model item needs a description")
+        elif not it.get("current_name"):
             die("an item has no current_name")
         desc = it.get("description")
         if desc is not None and len(str(desc)) > DESCRIPTION_LIMIT:
             die(f"{it['current_name']}: description is {len(str(desc))} characters (max {DESCRIPTION_LIMIT})")
         if not (it.get("new_name") or desc is not None):
             die(f"{it['current_name']}: give new_name, description or both")
-        out.append({"object_type": kind, "current_name": str(it["current_name"]),
+        out.append({"object_type": kind, "current_name": str(it.get("current_name") or "model"),
                     "new_name": it.get("new_name") or None, "description": desc})
     if not out:
         die("no items")
@@ -6349,6 +6356,16 @@ def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[li
     by_name = {k: {(o.get("information") or {}).get("name", "").casefold(): o for o in objs}
                for k, (_, objs) in pools.items()}
     writes, notes, problems = [], [], []
+    for it in [x for x in items if x["object_type"] == "model"][:1]:
+        current = str((model.get("information") or {}).get("description") or "")
+        if current == str(it["description"]):
+            notes.append("model description: unchanged")
+        else:
+            writes.append(("model: description", f"/api/model/dataModels/{mid}",
+                           {"information": {"description": str(it["description"])}}))
+    if len([x for x in items if x["object_type"] == "model"]) > 1:
+        problems.append("more than one model description: give one")
+    items = [x for x in items if x["object_type"] != "model"]
     wanted: dict[str, dict] = {}             # objectId -> merged request for that object
     renamed: dict[str, dict] = {k: {} for k in pools}
     for it in items:

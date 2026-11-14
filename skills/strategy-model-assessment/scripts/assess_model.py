@@ -3618,10 +3618,14 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         if not isinstance(items, list) or not items:
             problems.append(f"{kind}: args.items must list object_type, current_name and new_name or description")
         for it in items if isinstance(items, list) else []:
-            if str(it.get("object_type") or "").lower() not in ("attribute", "fact_metric", "metric"):
-                problems.append(f"{kind}: '{it.get('current_name')}': object_type must be attribute, fact_metric or "
-                                f"metric (a derived metric)")
-            if not it.get("current_name") or not (it.get("new_name") or it.get("description") is not None):
+            otype = str(it.get("object_type") or "").lower()
+            if otype not in ("attribute", "fact_metric", "metric", "model"):
+                problems.append(f"{kind}: '{it.get('current_name')}': object_type must be attribute, fact_metric, "
+                                f"metric (a derived metric) or model")
+            if otype == "model":
+                if it.get("new_name") or it.get("description") is None:
+                    problems.append(f"{kind}: a model item takes only a description")
+            elif not it.get("current_name") or not (it.get("new_name") or it.get("description") is not None):
                 problems.append(f"{kind}: each item needs current_name and a new_name or description")
             if len(str(it.get("description") or "")) > DESCRIPTION_LIMIT:
                 problems.append(f"{kind}: the description of '{it.get('current_name')}' is over {DESCRIPTION_LIMIT} "

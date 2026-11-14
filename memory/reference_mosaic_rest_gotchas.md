@@ -45,8 +45,9 @@ so a second pass to align them found nothing to write. `build_mosaic.py set-colu
 Descriptions over 250 characters are refused. Derived metrics need a full-body PUT instead: read the
 metric with `?showExpressionAs=tokens` (otherwise the expression comes back as read-only text), change
 `information.description`, PUT the whole body back. Verified live (2026-11-14): only the description
-changed, the expression was unchanged, and the connector showed the new text at once, with no republish
-or re-certification. `rename-describe` does this for `object_type: metric`. Certifying a model that is
+changed, the expression was unchanged, and `get_semantics` showed the new text at once, with no
+republish. The write still drops the model's certification (it left `get_models`, though queries still
+ran), so re-certify after it, as after any edit. `rename-describe` does this for `object_type: metric`. Certifying a model that is
 already certified answers HTTP 500 iServerCode -2147202272 ("already been certified"): `certify` treats
 it as done.
 `build_mosaic.py rename-describe` sends this shape.

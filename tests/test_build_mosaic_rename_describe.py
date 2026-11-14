@@ -157,5 +157,23 @@ class DerivedMetricTests(unittest.TestCase):
         self.assertNotIn("_full_put", json.dumps(put))
 
 
+class ModelDescriptionTests(unittest.TestCase):
+    """The model's own description: a PATCH of the data model (verified live)."""
+
+    def test_model_item(self):
+        items = bm.rename_describe_items([{"object_type": "model", "description": "Loan performance by month"},
+                                          {"object_type": "attribute", "current_name": "Region", "description": "d"}])
+        model = {**MODEL, "information": {"description": "old"}}
+        writes, _ = bm.rename_describe_writes(model, "M1", items)
+        self.assertEqual(writes[0], ("model: description", "/api/model/dataModels/M1",
+                                     {"information": {"description": "Loan performance by month"}}))
+        self.assertEqual(len(writes), 2)
+        same = {**MODEL, "information": {"description": "Loan performance by month"}}
+        w2, notes = bm.rename_describe_writes(same, "M1", items[:1])
+        self.assertEqual((w2, notes), ([], ["model description: unchanged"]))
+        _dies(bm.rename_describe_items, [{"object_type": "model", "new_name": "x", "description": "d"}])
+        _dies(bm.rename_describe_items, [{"object_type": "model"}])
+
+
 if __name__ == "__main__":
     unittest.main()
