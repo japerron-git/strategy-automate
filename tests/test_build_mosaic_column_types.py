@@ -160,6 +160,18 @@ class NameResolutionTests(unittest.TestCase):
         out, _ = bm.resolve_column_targets(self.model, self.cols, bm.column_type_targets([["status__id", "text"]], None))
         self.assertEqual(list(out), ["status code"])          # the connector's "<attribute>__<form>" name
 
+    def test_form_read_on_several_tables_resolves_on_this_one(self):
+        # seen live: the ID form reads the code in the fact and in a mapping table, one expression each
+        form = self.model["attributes"][0]["forms"][0]
+        form["expressions"] = [
+            {"expression": {"text": "[ZB CODE]"}, "tables": [{"objectId": "MAP"}]},
+            {"expression": {"text": "[STATUS CODE]"}, "tables": [{"objectId": "T1"}]}]
+        out, notes = bm.resolve_column_targets(self.model, self.cols, bm.column_type_targets([["Status", "text"]], None),
+                                               "T1")
+        self.assertEqual(out, {"status code": ("STATUS CODE", "text", "")})
+        out, _ = bm.resolve_column_targets(self.model, self.cols, bm.column_type_targets([["Status", "text"]], None))
+        self.assertEqual(list(out), ["status code"])           # without the table id: the column this table has
+
     def test_unknown_names_and_conflicts_stop(self):
         _dies(bm.resolve_column_targets, self.model, self.cols, bm.column_type_targets([["Nothing", "text"]], None))
         _dies(bm.resolve_column_targets, self.model, self.cols,

@@ -5904,26 +5904,44 @@ def _pick_table(tables: list[dict], name: str | None) -> dict:
     return max(tables, key=lambda t: len((t.get("physicalTable") or {}).get("columns") or []))
 
 
+def _column_on_table(exprs: list[dict], cols: dict[str, tuple[str, str]], table_id: str | None) -> str | None:
+    """The column an ID form or a fact reads on the table being changed. A form read on several tables (the fact
+    and a lookup keyed on the same code) has one expression per table: take the one on this table, by its table
+    id when known, else the one whose column this table has. One expression reads one column directly."""
+    picks = []
+    for e in exprs:
+        col = _simple_column((e.get("expression") or {}).get("text"))
+        if not col or col.casefold() not in cols:
+            continue
+        tids = {t.get("objectId") for t in e.get("tables") or []}
+        picks.append((0 if table_id and table_id in tids else 1, col))
+    if not picks:
+        return None
+    best = min(p[0] for p in picks)
+    found = {c for rank, c in picks if rank == best}
+    return found.pop() if len(found) == 1 else None
+
+
 def resolve_column_targets(model: dict, cols: dict[str, tuple[str, str]],
-                           targets: dict[str, tuple[str, str, str]]) -> tuple[dict[str, tuple[str, str, str]], list[str]]:
+                           targets: dict[str, tuple[str, str, str]],
+                           table_id: str | None = None) -> tuple[dict[str, tuple[str, str, str]], list[str]]:
     """Let --set name an attribute or a fact metric as well as a column: the connector shows attribute names,
-    not the columns behind them. An attribute resolves through its ID form, a fact metric through its fact;
-    either must read one column directly. -> (targets keyed by column, notes on what was resolved)."""
+    not the columns behind them. An attribute resolves through its ID form, a fact metric through its fact,
+    to the column it reads on the table being changed (a form read on several tables included). -> (targets
+    keyed by column, notes on what was resolved)."""
     via: dict[str, list[str]] = {}
     for a in model.get("attributes") or []:
         name = (a.get("information") or {}).get("name") or ""
         for f in a.get("forms") or []:
             if str(f.get("category") or f.get("name") or "").upper() != "ID":
                 continue
-            exprs = f.get("expressions") or []
-            col = _simple_column((exprs[0].get("expression") or {}).get("text")) if len(exprs) == 1 else None
-            if col and col.casefold() in cols:
+            col = _column_on_table(f.get("expressions") or [], cols, table_id)
+            if col:
                 via.setdefault(name.casefold(), []).append(cols[col.casefold()][1])
     for fm in model.get("factMetrics") or []:
         name = (fm.get("information") or {}).get("name") or ""
-        exprs = (fm.get("fact") or {}).get("expressions") or []
-        col = _simple_column((exprs[0].get("expression") or {}).get("text")) if len(exprs) == 1 else None
-        if col and col.casefold() in cols:
+        col = _column_on_table((fm.get("fact") or {}).get("expressions") or [], cols, table_id)
+        if col:
             via.setdefault(name.casefold(), []).append(cols[col.casefold()][1])
     out, notes, unknown = {}, [], []
     for key, (name, t, fmt) in targets.items():
@@ -6137,7 +6155,7 @@ def cmd_set_column_types(m: MSTR, args):
             die(f"GET {path}: {format_mstr_error(g)}")
         return g.json() or {}
 
-    targets, resolved = resolve_column_targets(model, cols, targets)
+    targets, resolved = resolve_column_targets(model, cols, targets, tinfo.get("objectId"))
     for n in resolved:
         print(f"  = {n}", file=sys.stderr)
     cur_table = get(f"/api/model/dataModels/{mid}/tables/{tinfo['objectId']}")
@@ -6254,7 +6272,8 @@ def cmd_create_formula_attribute(m: MSTR, args):
     cols = {c["columnName"].casefold(): (c["information"]["objectId"], c["columnName"])
             for c in table["physicalTable"]["columns"]}
     if getattr(args, "column", None):   # add-column-attribute: one column as-is, named as column, attribute or metric
-        targets, notes = resolve_column_targets(model, cols, {args.column.casefold(): (args.column, "", "")})
+        targets, notes = resolve_column_targets(model, cols, {args.column.casefold(): (args.column, "", "")},
+                                                tinfo.get("objectId"))
         ((col, _t, _f),) = targets.values()
         for n in notes:
             print(f"  = {n}", file=sys.stderr)
