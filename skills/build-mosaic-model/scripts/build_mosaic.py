@@ -6509,6 +6509,87 @@ def cmd_add_time_attributes(m: MSTR, args):
                                                 "'<attribute> (<interval>)__id / __start / __desc'"}, indent=2))
 
 
+def _display_ids(entries) -> list[str]:
+    out = []
+    for d in entries or []:
+        i = d.get("id") if isinstance(d, dict) else d
+        if i and str(i) not in out:
+            out.append(str(i))
+    return out
+
+
+def show_forms_body(attr: dict, forms: list[str]) -> tuple[dict | None, list[str], list[str]]:
+    """The displays body that adds forms (by name or category, such as ID or DESC) to an attribute's report and
+    browse displays, keeping the ones it has. A form in neither list is hidden: the connector doesn't list it
+    (verified: adding a form to both lists made the connector list it as '<attribute>__<form>').
+    Returns (body or None when nothing changes, forms added, problems)."""
+    by_key: dict[str, str] = {}
+    for f in attr.get("forms") or []:
+        fid = f.get("id") or (f.get("information") or {}).get("objectId")
+        for k in (f.get("name"), (f.get("information") or {}).get("name"), f.get("category")):
+            if k and fid:
+                by_key.setdefault(str(k).casefold(), str(fid))
+    disp = attr.get("displays") or {}
+    report, browse = _display_ids(disp.get("reportDisplays")), _display_ids(disp.get("browseDisplays"))
+    problems, ids, added = [], [], []
+    for name in forms:
+        fid = by_key.get(str(name).strip().casefold())
+        if not fid:
+            problems.append(f"form '{name}' not found (forms: {', '.join(sorted({k for k in by_key}))})")
+            continue
+        ids.append(fid)
+        if fid not in report or fid not in browse:
+            added.append(str(name))
+    new_report = report + [i for i in ids if i not in report]
+    new_browse = browse + [i for i in ids if i not in browse]
+    if problems or (new_report == report and new_browse == browse):
+        return None, added, problems
+    return ({"displays": {"reportDisplays": [{"id": i} for i in new_report],
+                          "browseDisplays": [{"id": i} for i in new_browse]}}, added, problems)
+
+
+def cmd_show_forms(m: MSTR, args):
+    """Make hidden forms visible: add them to the attribute's report and browse displays, keeping the ones it
+    has. A form already in both is left alone, so running it twice changes nothing. One changeset; republish
+    and re-certify after, then check the connector lists the form."""
+    forms = [x.strip() for x in (args.forms or "").split(",") if x.strip()]
+    if not forms:
+        die("show-forms: give --forms (names or categories, comma-separated)")
+    m.login(identity=True)
+    r = m.post(f"/api/model/dataModels/{args.model_id}/export")
+    if not r.ok:
+        die(f"export model: {format_mstr_error(r)}")
+    model = (r.json().get("model") or [{}])[0]
+    by_name = {(a.get("information") or {}).get("name", "").casefold(): a for a in model.get("attributes") or []}
+    a = next((by_name[c] for c in attribute_name_candidates(args.attribute) if c in by_name), None)
+    if a is None:
+        die(f"show-forms: attribute '{args.attribute}' not found")
+    body, added, problems = show_forms_body(a, forms)
+    if problems:
+        die("show-forms: nothing was written:\n  - " + "\n  - ".join(problems))
+    aname, aid = a["information"]["name"], a["information"]["objectId"]
+    if body is None:
+        print(json.dumps({"ok": True, "dry_run": bool(args.dry_run), "changed": [],
+                          "skipped": [f"'{aname}': {', '.join(forms)} already shown"]}, indent=2))
+        return
+    print(f"  ~ attribute '{aname}': show {', '.join(added)}", file=sys.stderr)
+    if args.dry_run:
+        print(json.dumps(body, indent=2), file=sys.stderr)
+    else:
+        cs = open_cs(m)
+        try:
+            resp = m.patch(f"/api/model/dataModels/{args.model_id}/attributes/{aid}", json=body)
+            if not resp.ok:
+                die(f"show-forms: PATCH '{aname}': {format_mstr_error(resp)}")
+            commit_cs(m, cs)
+        except BaseException:
+            discard_cs(m, cs)
+            raise
+    print(json.dumps({"ok": True, "dry_run": bool(args.dry_run), "changed": [f"'{aname}': {', '.join(added)}"],
+                      "next": "republish and re-certify; the connector then lists the form as "
+                              "'<attribute>__<form>'"}, indent=2))
+
+
 def cmd_patch_fact_metrics(m: MSTR, args):
     """Set aggregation function and/or number format on many fact metrics in ONE
     changeset: list → per-metric GET (diff) → PATCH only what differs → commit →
@@ -7476,6 +7557,14 @@ def build_parser():
     sp.add_argument("--spec", help="JSON {items: [{attribute, intervals: [...]}]} instead of --attribute")
     sp.add_argument("--dry-run", action="store_true", help="print the request bodies; open no changeset")
 
+    sp = sub.add_parser("show-forms",
+        help="Make hidden forms visible: add them to the attribute's report and browse displays (the connector lists "
+             "only displayed forms). Keeps the displays it has. Republish and re-certify afterwards.")
+    sp.add_argument("--model-id", required=True)
+    sp.add_argument("--attribute", required=True, help="attribute (name as the connector shows it, or the model's)")
+    sp.add_argument("--forms", required=True, help="comma-separated form names or categories (ID, DESC)")
+    sp.add_argument("--dry-run", action="store_true", help="print the request body; open no changeset")
+
     sp = sub.add_parser("add-column-attribute",
         help="Attribute that reads one existing column as-is, so a numeric column read as a fact metric can also be "
              "grouped and filtered on (number of units, a score band, a code stored as a number). Not a formula: "
@@ -7600,6 +7689,7 @@ def main():
             "create-formula-attribute": cmd_create_formula_attribute,
             "add-column-attribute": cmd_create_formula_attribute,
             "add-time-attributes": cmd_add_time_attributes,
+            "show-forms": cmd_show_forms,
             "export-model": cmd_export_model,
             "set-column-types": cmd_set_column_types,
             "patch-fact-metrics": cmd_patch_fact_metrics,

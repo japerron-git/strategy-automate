@@ -73,7 +73,7 @@ ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_d
                 "create_level_metric", "create_weighted_average", "patch_model_object", "patch_fact_metrics",
                 "add_lookup_table", "change_column_type", "source_change", "wire_relationships",
                 "create_formula_attribute", "add_column_attribute", "add_time_attributes", "rename_describe",
-                "publish", "certify", "manual")
+                "show_forms", "publish", "certify", "manual")
 COLUMN_TYPES = ("text", "integer", "bigint", "double", "date", "timestamp")   # build_mosaic.py set-column-types
 # Changes made once for the whole plan, at the start of one phase; other phases get a note.
 MERGED_KINDS = {"source_change": 1, "change_column_type": 2, "wire_relationships": 3, "add_time_attributes": 3,
@@ -1787,7 +1787,9 @@ def export_join_graph(export: dict | None) -> dict[str, Any]:
         if facts and missing:
             unreachable.append({"attribute": name, "tables": sorted(tabs), "facts_not_reached": missing,
                                 "reaches_no_fact": len(missing) == len(facts)})
-    return {"fact_tables": facts, "unreachable": unreachable,
+    tables = sorted({str((t.get("information") or {}).get("name") or t.get("name")) for t in model.get("tables") or []
+                     if (t.get("information") or {}).get("name") or t.get("name")} | {x for v in attr_tables.values() for x in v})
+    return {"fact_tables": facts, "tables": tables, "unreachable": unreachable,
             "relationships": _export_relationships(model, export)}
 
 
@@ -2078,6 +2080,37 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
             "relationships": graph.get("relationships") if graph else (previous or {}).get("relationships"),
             "relationship_changes": changes, "findings": findings,
             "note": "single_value: only one group, so a cross join can't be told apart (its filter is still tested)"}
+
+
+def source_info(**paths: str | None) -> dict[str, Any]:
+    """Which scope and export an output was made from: file name and a short content hash, so outputs made
+    from different exports (a table replaced in between) can be told apart. Names only, never content."""
+    out: dict[str, Any] = {}
+    for key, path in paths.items():
+        if not path:
+            continue
+        try:
+            with open(path, "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()[:12]
+        except OSError:
+            digest = None
+        out[key] = {"file": os.path.basename(path), "sha": digest}
+    return out
+
+
+def relationship_diff(before: dict, after: dict) -> dict[str, Any]:
+    """Relationships in one export and not the other (by attribute name), with the action that restores each
+    lost one where the export shows its table."""
+    b = {(r["parent"], r["child"]): r for r in _export_relationships(_export_model(before), before)}
+    a = {(r["parent"], r["child"]): r for r in _export_relationships(_export_model(after), after)}
+    lost = [b[k] for k in sorted(set(b) - set(a))]
+    restore = []
+    for r in lost:
+        spec = _lost_relationship_spec(after, r, r.get("type"))
+        if spec:
+            restore.append(_relationship_action(spec))
+    return {"before": len(b), "after": len(a), "lost": lost, "added": [a[k] for k in sorted(set(a) - set(b))],
+            "restore_actions": restore}
 
 
 def merge_findings(doc: dict, new: list[dict]) -> dict[str, Any]:
@@ -2415,6 +2448,7 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                                  "source use" if h.get("key") else "")
                               + f". It should answer as \"{h['query_as']}\" (check with a query). Make it visible "
                                 f"instead of adding a column that duplicates it",
+                    "action": {"kind": "show_forms", "args": {"attribute": h["attribute"], "forms": [h["form"]]}},
                     "columns": [], "new_forms": [], "new_attributes": []})
     period_attr = period
     if not period_attr:
@@ -3648,7 +3682,23 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         chk = a.get("check") or {}
         if chk and not chk.get("ok"):
             problems.append(f"{kind}: check-lookup failed for {a.get('csv')}: " + "; ".join(chk.get("problems") or []))
-        return {"dry_run": None, "apply": None, "manual": lookup_steps(a), "problems": problems}
+        out = {"dry_run": None, "apply": None, "manual": lookup_steps(a), "problems": problems}
+        if a.get("extends_table"):
+            # no API replaces a file table's data in place, so the reload is by hand, and a reload has dropped
+            # attribute relationships (seen live): export before and after, and stop if any was lost
+            slug = _slug(str(a["extends_table"]))
+            before, after = f"ignore/exports/before_reload_{slug}.json", f"ignore/exports/after_reload_{slug}.json"
+            out["guard_before"] = [base + ["export-model", "--model-id", model_id, "--out", before]]
+            out["guard_after"] = [base + ["export-model", "--model-id", model_id, "--out", after],
+                                  [python, ASSESS_SCRIPT, "relationship-diff", "--before", before, "--after", after]]
+        return out
+    if kind == "show_forms":
+        forms = _arg_list(a.get("forms"))
+        if not a.get("attribute") or not forms:
+            problems.append(f"{kind}: args need attribute and forms (names or categories)")
+        argv = base + ["show-forms", "--model-id", model_id, "--attribute", str(a.get("attribute", "")),
+                       "--forms", ",".join(forms)]
+        return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "publish":
         return {"dry_run": None, "apply": base + ["publish", "--model-id", model_id] + PUBLISH_WAIT, "manual": None,
                 "problems": problems}
@@ -3995,10 +4045,17 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         if lookups:
             ids = list(dict.fromkeys(lookup_findings))
             risks = [r for fid in ids for f in items if f["id"] == fid for r in (f.get("risks") or [])]
-            steps[lookup_at:lookup_at] = [{"finding": ", ".join(ids), "title": f"Add {len(lookups)} lookup table"
-                                           f"{'s' if len(lookups) > 1 else ''}", "kind": "add_lookup_table",
-                                           "dry_run": None, "apply": None, "manual": lookups_checklist(lookups),
-                                           "risks": list(dict.fromkeys(risks))}] + retypes
+            step = {"finding": ", ".join(ids), "title": f"Add {len(lookups)} lookup table"
+                    f"{'s' if len(lookups) > 1 else ''}", "kind": "add_lookup_table",
+                    "dry_run": None, "apply": None, "manual": lookups_checklist(lookups),
+                    "risks": list(dict.fromkeys(risks))}
+            if any(la.get("extends_table") for la, _ in lookups):
+                # a table reloaded by hand can lose attribute relationships: export before and after, stop if so
+                b4, af = f"ignore/exports/before_phase{n}_reload.json", f"ignore/exports/after_phase{n}_reload.json"
+                step["guard_before"] = [cmd([python, BUILD_SCRIPT, "export-model", "--model-id", mid, "--out", b4])]
+                step["guard_after"] = [cmd([python, BUILD_SCRIPT, "export-model", "--model-id", mid, "--out", af]),
+                                       cmd([python, ASSESS_SCRIPT, "relationship-diff", "--before", b4, "--after", af])]
+            steps[lookup_at:lookup_at] = [step] + retypes
         before = ["Save a backup copy of the model before applying this phase."]
         if n == 3:
             before.append("For every attribute removed or replaced: list the derived metrics that filter on "
@@ -4037,6 +4094,9 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
     # own phase when it has none, whether the assessment, verify-changes or a check found it.
     unanswered = unanswered_by_phase(every)
     for ph in phases:
+        ph["manual_steps"] = sum(1 for st in ph.get("steps") or [] if st.get("manual"))
+        if ph["manual_steps"]:
+            warnings.append(f"phase {ph['phase']}: {ph['manual_steps']} manual step(s)")
         if unanswered.get(ph["phase"]):
             ph["blocked_by"] = unanswered[ph["phase"]]
             warnings.append(f"phase {ph['phase']}: no script until these findings are answered: "
@@ -4049,6 +4109,24 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
             "generated": time.strftime("%Y-%m-%d"), "statuses_planned": list(statuses), "plan_id": digest,
             "phases": phases, "files": files, "not_planned": skipped, "problems": problems,
             "warnings": warnings, "unanswered": {str(k): v for k, v in sorted(unanswered.items())}}
+
+
+_CONSULT = re.compile(r"\b(consult|confirm with|check with|ask (the )?(data )?owner|data owner|agree with|decide|"
+                      r"design (it|the|a|this)|review (it )?with|discuss)\b", re.I)
+
+
+def consult_steps(f: dict) -> list[str]:
+    """Manual steps that are a question for someone (a design, a data owner's review) rather than a model
+    edit: they belong in a finding of their own that needs an answer, not inside one being approved."""
+    out = []
+    for a in f.get("actions") or []:
+        if a.get("kind") != "manual":
+            continue
+        steps = a.get("steps") or (a.get("args") or {}).get("steps") or []
+        for st in steps if isinstance(steps, list) else [steps]:
+            if _CONSULT.search(str(st)):
+                out.append(str(st)[:120])
+    return out
 
 
 def unanswered_by_phase(findings: list[dict]) -> dict[int, list[str]]:
@@ -4194,6 +4272,9 @@ def check_findings(doc: dict) -> dict[str, Any]:
         if not f.get("tests"):
             if not f.get("checks"):
                 warnings.append(f"{fid}: no tests named")
+        for st in consult_steps(f):
+            warnings.append(f"{fid}: a manual step is a question for someone, not a model edit ('{st}'): make it "
+                            f"its own finding with needs_answer and no action, so this one holds only steps that run")
     problems += [f"findings: dependency cycle {c}" for c in _cycles(fs)]
     return {"problems": problems, "warnings": warnings}
 
@@ -4445,6 +4526,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-attributes", type=int, default=300)
     sp.add_argument("--out", required=True)
 
+    sp = sub.add_parser("relationship-diff", help="relationships one model export has and another lacks (by "
+                        "name); exits 1 when any was lost, with the actions that restore them")
+    sp.add_argument("--before", required=True)
+    sp.add_argument("--after", required=True)
+
     sp = sub.add_parser("add-findings", help="merge the findings references / join-paths proposed into "
                         "findings.json (existing ones keep their status)")
     sp.add_argument("--findings", required=True)
@@ -4542,6 +4628,7 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
         entity = args.entity or ((_load_json(args.relationships) or {}).get("entity") if args.relationships else "")
         out = review_roles(runner(), args.project, _load_json(args.scope), entity=entity or "", where=args.where,
                            batch=args.batch, low_span=args.low_span, log=log)
+        out["sources"] = source_info(scope=args.scope)
         _write_json(args.out, out)
         if _pending(runner):
             return 3
@@ -4562,6 +4649,7 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
         out = probe_objects(runner(), args.project, scope, attributes=attrs, metrics=mets, period=args.period,
                             split=args.split, filter_spec=args.filter, where=args.where, max_values=args.max_values,
                             batch=args.batch, log=log)
+        out["sources"] = source_info(scope=args.scope)
         _write_json(args.out, out)
         if _pending(runner):
             return 3
@@ -4578,6 +4666,7 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
                                round_no=args.round, max_attributes=args.max_attributes, log=log)
         if args.findings:
             out["earlier_findings"] = resolved_findings(_load_json(args.findings), out["findings"])
+        out["sources"] = source_info(scope=args.scope, export=args.model_export)
         _write_json(args.out, out)
         print(json.dumps({"out": args.out, "facts": out["facts"], "unjoined": out["unjoined"],
                           "filter_problems": sorted(out["filter_problems"]),
@@ -4595,7 +4684,8 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
                                   export=_load_json(args.model_export) if args.model_export else None)
         export = _load_json(args.model_export) if args.model_export else None
         built = build_lookups(runner(), args.project, scope, sugg, args.csv_dir, where=args.where, export=export)
-        _write_json(args.out, {"version": 1, "model": scope.get("model"), "lookups": built})
+        _write_json(args.out, {"version": 1, "model": scope.get("model"), "lookups": built,
+                               "sources": source_info(scope=args.scope, export=args.model_export)})
         if _pending(runner):
             return 3
         print(json.dumps({"ok": True, "out": args.out, "suggestions": len(built),
@@ -4682,6 +4772,15 @@ def _offline(args: argparse.Namespace) -> int:
                           "rewritten": len(usage["rewritten"]), "applied": args.apply,
                           "unresolved": usage["unresolved"], "findings": [f["id"] for f in out["findings"]]},
                          indent=2))
+        return 0
+    if args.cmd == "relationship-diff":
+        res = relationship_diff(_load_json(args.before), _load_json(args.after))
+        print(json.dumps(res, indent=2))
+        if res["lost"]:
+            print(f"STOP: {len(res['lost'])} relationship(s) lost: "
+                  + "; ".join(f"{r['parent']} -> {r['child']}" for r in res["lost"])
+                  + ". Run /verify-changes: it proposes restoring them. Don't continue this phase.", file=sys.stderr)
+            return 1
         return 0
     if args.cmd == "add-findings":
         doc = _load_json(args.findings)

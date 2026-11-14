@@ -2546,3 +2546,76 @@ class SqlLintTests(unittest.TestCase):
         results = {"results": [{"id": "Q1", "ok": False, "error": 'tool "query" timed out after 230s'}]}
         g = am.grade_bank(bank, results)
         self.assertEqual(g["questions"][0]["verdict"], "timeout")
+
+
+class OpenItemTests(unittest.TestCase):
+    """Show hidden forms, guard hand reloads, sources of each output, questions out of approved findings."""
+
+    def test_show_forms_action_and_hidden_form_proposal(self):
+        c = am.action_commands({"kind": "show_forms", "args": {"attribute": "Channel", "forms": ["ID"]}}, "MID")
+        self.assertEqual(c["apply"][-6:], ["--model-id", "MID", "--attribute", "Channel", "--forms", "ID"])
+        self.assertEqual(c["dry_run"][-1], "--dry-run")
+        sugg = am.lookup_suggestions(FormListingTests.MAP_SCOPE, export=FormListingTests.MAP_EXPORT,
+                                     time_attributes=False)
+        (h,) = [s for s in sugg if s["kind"] == "hidden_form" and s["attribute"] == "channel"]
+        self.assertEqual(h["action"], {"kind": "show_forms", "args": {"attribute": "channel", "forms": ["ID"]}})
+
+    def _export(self, rels):
+        return {"model": [{"hierarchy": {"relationships": [
+            {"parent": {"objectId": p}, "child": {"objectId": c}, "relationshipType": "one_to_many"} for p, c in rels]},
+            "factMetrics": [{"fact": {"expressions": [{"tables": [{"name": "facts.csv"}]}]}}],
+            "attributes": [
+                {"information": {"objectId": "S", "name": "Status"}, "attributeLookupTable": {"name": "map.csv"},
+                 "forms": [{"expressions": [{"tables": [{"name": "map.csv"}, {"name": "facts.csv"}]}]}]},
+                {"information": {"objectId": "B", "name": "Bucket"}, "attributeLookupTable": {"name": "map.csv"},
+                 "forms": [{"expressions": [{"tables": [{"name": "map.csv"}]}]}]}]}]}
+
+    def test_relationship_diff_and_its_exit_code(self):
+        before, after = self._export([("B", "S")]), self._export([])
+        res = am.relationship_diff(before, after)
+        self.assertEqual([(r["parent"], r["child"]) for r in res["lost"]], [("bucket", "status")])
+        self.assertEqual(res["restore_actions"][0]["args"]["relationships"][0]["relationship_table"], "map.csv")
+        d = tempfile.mkdtemp(prefix="reldiff-")
+        self.addCleanup(shutil.rmtree, d, True)
+        paths = []
+        for i, x in enumerate((before, after, before)):
+            paths.append(os.path.join(d, f"{i}.json"))
+            with open(paths[-1], "w", encoding="utf-8") as f:
+                json.dump(x, f)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(am.main(["relationship-diff", "--before", paths[0], "--after", paths[1]]), 1)
+            self.assertEqual(am.main(["relationship-diff", "--before", paths[0], "--after", paths[2]]), 0)
+
+    def test_hand_reload_is_guarded_in_the_plan(self):
+        d = tempfile.mkdtemp(prefix="guard-")
+        self.addCleanup(shutil.rmtree, d, True)
+        csvp = os.path.join(d, "map.csv")
+        with open(csvp, "w", encoding="utf-8") as f:
+            f.write("STATUS,BUCKET,desc\n01,1,x\n")
+        doc = {"model": "M", "findings": [{"id": "F1", "category": "lookup", "status": "approved", "tests": ["Q1"],
+                                           "actions": [{"kind": "add_lookup_table", "args": {
+                                               "csv": csvp, "key_attribute": "status", "extends_table": "map.csv",
+                                               "keep_columns": ["STATUS", "BUCKET"]}}]}]}
+        plan = am.build_plan(doc, model_id="MID")
+        (step,) = [s for p in plan["phases"] for s in p["steps"] if s["kind"] == "add_lookup_table"]
+        self.assertIn("export-model", step["guard_before"][0]["argv"])
+        self.assertIn("relationship-diff", step["guard_after"][1]["argv"])
+        self.assertTrue(all("ignore/exports/" in " ".join(g["argv"]) for g in step["guard_before"] + step["guard_after"]))
+        self.assertTrue(any("manual step" in w for w in plan["warnings"]))
+
+    def test_questions_in_manual_steps_are_flagged(self):
+        f = {"id": "F1", "category": "metric_defect", "status": "proposed", "tests": ["Q1"], "actions": [
+            {"kind": "manual", "steps": ["Design SMM/CPR with the data owner", "Edit the model description"]}]}
+        w = am.check_findings({"findings": [f]})["warnings"]
+        self.assertEqual(len([x for x in w if "question for someone" in x]), 1)
+
+    def test_source_info(self):
+        d = tempfile.mkdtemp(prefix="src-")
+        self.addCleanup(shutil.rmtree, d, True)
+        p = os.path.join(d, "export.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{}")
+        info = am.source_info(scope=None, export=p)
+        self.assertEqual(info["export"]["file"], "export.json")
+        self.assertEqual(len(info["export"]["sha"]), 12)
+        self.assertNotIn("scope", info)

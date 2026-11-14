@@ -172,25 +172,26 @@ answered wrong. The maturity check for summed rates leaves out weighted-average 
 
 ## Open items (engine and plugin)
 
-- **Which export and scope each output used.** `lookups.json`, `join_paths.json` and `probes.json` don't
-  record it, so outputs from different exports mix unnoticed (a table replaced since the lookups ran
-  still shows as the one to extend). Record it in each output; the workbook warns when they differ or a
-  table named has been replaced, and marks a lookup check "out of date".
 - **Descriptions for derived metrics and the model.** `rename_describe` covers attributes and fact
   metrics only, so these fall back to manual steps. To verify live: a full-body PUT of a derived metric
-  changes only its description; a PATCH of the data model sets the model description. Then both join
-  the one phase-6 command.
-- **Showing hidden forms.** No command makes a hidden form visible. To verify live: adding the form to
-  the attribute's report and browse displays makes the connector list it. Then a `show_forms` action,
-  proposed by the hidden-form suggestions and re-checked on a fresh export before planning.
-- **Questions out of approved findings.** A step that is a question for the data owner (a design, a
-  data review) sits inside approved findings as a manual step. It should be its own finding that needs
-  an answer, with no action; `plan` should report the manual steps per phase.
-- **Reloading a table.** No command replaces a file table's data, so lookup extensions are reloaded by
-  hand, which has dropped attribute relationships (seen live: four filters stopped applying). To find:
-  whether the API can replace a table's data (`build_mosaic.py openapi-search`). If it can, the lookup
-  step reloads, re-runs `join-paths` and proposes lost relationships back in the same phase; if not, the
-  script stops after the manual reload until the relationships check passes.
+  (read with `--show-expression-as tokens`, so the PUT keeps its expression) changes only its
+  description; a PATCH of the data model sets the model description. Then both join the one phase-6
+  command.
+
+Resolved:
+- *Showing hidden forms:* `show_forms` / `build_mosaic.py show-forms` adds forms to the attribute's report
+  and browse displays. Verified by comparing two exports: the forms that became visible to the connector
+  were exactly those added to both display lists (set in the UI); the build already sets displays
+  through the same PATCH. Running it on a form already shown changes nothing.
+- *Reloading a table:* no API replaces a model's file table in place (Push Data upload sessions are for
+  datasets; publish reloads from the existing source), so the reload stays manual. The phase script
+  exports the model before and after it and runs `relationship-diff`, which stops the script when a
+  relationship was lost and lists the actions that restore it.
+- *Which export and scope each output used:* `lookups`, `join-paths`, `probe` and `roles` record
+  `sources` (file name and a short hash); the workbook shows them, warns when outputs were made from
+  different exports, and marks a lookup "out of date" when its table is no longer in the model.
+- *Questions out of approved findings:* `check --findings` warns about a manual step that is a question
+  for someone; `plan` counts manual steps per phase.
 
 ## Question levels
 
