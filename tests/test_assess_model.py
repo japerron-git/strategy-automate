@@ -2664,3 +2664,37 @@ class CheckExistingTableTests(unittest.TestCase):
         f = {"id": "F1", "category": "metric_defect", "status": "declined", "decision_note": "no", "tests": ["Q1"],
              "actions": [{"kind": "manual", "steps": ["Review the rows with the data owner"]}]}
         self.assertEqual(am.check_findings({"findings": [f]})["warnings"], [])
+
+
+class FreshRepliesTests(unittest.TestCase):
+    """Replies saved before a model change are asked again, and the probe sees data changes."""
+
+    def test_stale_reply_is_asked_again(self):
+        d = tempfile.mkdtemp(prefix="fresh-")
+        self.addCleanup(shutil.rmtree, d, True)
+        sql = "SELECT 1"
+        path = os.path.join(d, am.query_id(sql) + ".txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("| x |\n| --- |\n| 1 |\n")
+        os.utime(path, (1_000_000, 1_000_000))                          # saved long ago
+        self.assertIsNotNone(am.ReplayRunner(d).call("query", {"query": sql}))
+        r = am.ReplayRunner(d, fresh_since=2_000_000)
+        with self.assertRaises(am.PendingReply):
+            r.call("query", {"query": sql})
+        self.assertEqual(r.stale, [os.path.basename(path)])
+        self.assertIsNotNone(am._moment("2026-11-14T16:00"))
+        self.assertEqual(am._moment(path), 1_000_000)
+
+    def test_data_change_counts_as_changed(self):
+        old = {"attributes": [{"name": "exit type", "type": "varchar",
+                               "profile": {"distinct_values": 5, "values": ["Prepaid", "REO"]}},
+                              {"name": "region", "type": "varchar", "profile": {"distinct_values": 3, "values": ["a"]}}],
+               "metrics": []}
+        new = {"attributes": [{"name": "exit type", "type": "varchar",
+                               "profile": {"distinct_values": 6, "values": ["Active", "Prepaid", "REO"]}},
+                              {"name": "region", "type": "varchar", "profile": {"distinct_values": 3, "values": ["a"]}}],
+               "metrics": []}
+        self.assertEqual(am.changed_objects(old, new)["attributes"], ["exit type"])
+        unprofiled = {"attributes": [{"name": "exit type", "type": "varchar"}, {"name": "region", "type": "varchar"}],
+                      "metrics": []}
+        self.assertEqual(am.changed_objects(unprofiled, new)["attributes"], [])   # nothing to compare

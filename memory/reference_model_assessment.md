@@ -161,6 +161,12 @@ Aggregates of fact metrics run on the fact. So:
   facts can be steered to one fact by adding a hint metric from that fact to the query; use one anchor
   per fact table, and say in descriptions which hint metric to add.
 
+**Replies don't outlive a model change.** A replay folder's replies answer the SQL as the model was when
+they were saved; after a source rebuild or a reload the same SQL can give other rows. Use a new folder each
+round, or `--fresh-since <time of the change>`, which asks again for every older reply. The probe's
+`--changed-since` also counts an attribute whose profile changed (its number of values or its sampled
+values) as changed, so a data change it can't see in names or formulas still gets probed.
+
 **Saved SQL is checked for the no-regroup rule.** `question-sql` and `best-answer` refuse SQL that groups
 by an expression instead of a plain column, at any level (an outer query over a subquery too), and
 `check --bank` warns about any already in the bank. Seen live: a vintage grouped by

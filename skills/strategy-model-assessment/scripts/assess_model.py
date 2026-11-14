@@ -293,6 +293,18 @@ def query_id(sql: str) -> str:
     return hashlib.sha256(sql.encode("utf-8")).hexdigest()[:12]
 
 
+def _moment(value: str) -> float | None:
+    """A point in time from an ISO date-time (local time) or a file's modification time."""
+    if not value:
+        return None
+    if os.path.exists(value):
+        return os.path.getmtime(value)
+    try:
+        return datetime.datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        raise SystemExit(f"--fresh-since: '{value}' is neither a file nor an ISO date-time")
+
+
 class ReplayRunner:
     """Answers MCP calls from replies an agent saved after calling the connector tools itself — for
     sessions where this script cannot sign in (a cloud workspace with the Mosaic connector attached).
@@ -302,13 +314,19 @@ class ReplayRunner:
     Calls with no saved reply are collected in `pending` and written to `pending.json`; save those
     replies and run the same command again until nothing is pending."""
 
-    def __init__(self, folder: str):
+    def __init__(self, folder: str, fresh_since: float | None = None):
         self.folder = folder
         self.pending: dict[str, dict[str, Any]] = {}
+        # replies saved before this moment (a model change) are stale: ask again instead of reusing them
+        self.fresh_since = fresh_since
+        self.stale: list[str] = []
 
     def _read(self, name: str) -> dict | None:
         path = os.path.join(self.folder, name)
         if not os.path.exists(path):
+            return None
+        if self.fresh_since is not None and os.path.getmtime(path) < self.fresh_since:
+            self.stale.append(name)
             return None
         with open(path, encoding="utf-8") as f:
             text = f.read()
@@ -337,6 +355,7 @@ class ReplayRunner:
         os.makedirs(self.folder, exist_ok=True)   # a first run into a new replies folder
         path = os.path.join(self.folder, "pending.json")
         _write_json(path, {"folder": self.folder, "count": len(self.pending),
+                           "stale_asked_again": len(set(self.stale)),
                            "instructions": "Call each tool with its arguments; save the reply text to "
                                            "<folder>/<file> (start it with ERROR: if the tool failed); "
                                            "then run the same command again.",
@@ -881,16 +900,29 @@ PROBE_MAX_VALUES = 200
 _LATEST_WORDS = re.compile(r"\b(latest|current period|as of|point in time|most recent)\b", re.I)
 
 
+def _profile_sig(o: dict) -> tuple | None:
+    """What a data change shows in a scope profile: the number of values and the sampled values."""
+    p = o.get("profile") or {}
+    if not p:
+        return None
+    vals = p.get("values") or p.get("sample_values") or []
+    return (_num(p.get("distinct_values")), tuple(sorted(str(v) for v in vals)[:50]))
+
+
 def changed_objects(old_scope: dict | None, new_scope: dict, findings: dict | None = None,
                     phases: list[int] | None = None) -> dict[str, list[str]]:
     """Attributes and metrics added or changed since the old scope, plus objects named by the actions of findings
     applied in `phases`: what a phase touched, for verify-changes to probe."""
     def index(scope, key):
-        return {o["name"]: (o.get("type"), o.get("formula"), o.get("description")) for o in (scope or {}).get(key) or []}
+        return {o["name"]: (o.get("type"), o.get("formula"), o.get("description"), _profile_sig(o))
+                for o in (scope or {}).get(key) or []}
     out: dict[str, list[str]] = {}
     for key in ("attributes", "metrics"):
         old, new = index(old_scope, key), index(new_scope, key)
-        out[key] = [n for n, sig in new.items() if old_scope is None or n not in old or old[n][:2] != sig[:2]]
+        # changed: a new object, a new type or formula, or (data changed under it, as a source rebuild or a
+        # reloaded lookup does) a different profile when both rounds profiled it
+        out[key] = [n for n, sig in new.items() if old_scope is None or n not in old or old[n][:2] != sig[:2]
+                    or (old[n][3] is not None and sig[3] is not None and old[n][3] != sig[3])]
     names = {"attributes": {a["name"].lower(): a["name"] for a in new_scope.get("attributes") or []},
              "metrics": {m["name"].lower(): m["name"] for m in new_scope.get("metrics") or []}}
     for f in (findings or {}).get("findings") or []:
@@ -4387,6 +4419,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--replies", default="",
                     help="replay mode: read MCP replies saved in this folder instead of signing in; missing ones "
                          "are listed in <folder>/pending.json (for sessions that call the connector tools directly)")
+    ap.add_argument("--fresh-since", default="",
+                    help="with --replies: a reply saved before this moment is stale and asked again (the model changed "
+                         "since). An ISO time (2026-11-14T16:00) or a file whose modification time marks the change")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("scope", help="list attributes and metrics and profile each attribute")
@@ -4588,7 +4623,7 @@ def main(argv: list[str] | None = None, runner_factory: Callable[[argparse.Names
         if runner_factory is not None:
             r = runner_factory(args)
         elif args.replies:
-            r = ReplayRunner(args.replies)
+            r = ReplayRunner(args.replies, fresh_since=_moment(args.fresh_since))
         else:
             r = McpRunner(args.base, args.mcp_url, args.server)
         made.append(r)
