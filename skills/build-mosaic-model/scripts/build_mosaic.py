@@ -3457,6 +3457,10 @@ def _certify(m: MSTR, object_id: str, obj_type: int = 3) -> bool:
     if r.ok:
         print(f"  ✓ certified {object_id}", file=sys.stderr)
         return True
+    if "already been certified" in (r.text or "") or "-2147202272" in (r.text or ""):
+        # verified live: certifying a certified model is HTTP 500 iServerCode -2147202272; it is already done
+        print(f"  = {object_id} is already certified", file=sys.stderr)
+        return True
     print(f"  WARN certify {object_id}: {format_mstr_error(r)}", file=sys.stderr)
     return False
 

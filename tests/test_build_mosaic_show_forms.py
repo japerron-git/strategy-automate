@@ -53,3 +53,21 @@ class WritePrivateTests(unittest.TestCase):
         p = os.path.join(d, "ignore", "exports", "x.json")
         bm._write_private(p, {"a": 1})
         self.assertTrue(os.path.exists(p))
+
+
+class CertifyTests(unittest.TestCase):
+    def test_already_certified_is_success(self):
+        class _R:
+            ok, status_code = False, 500
+            text = '{"code":"ERR001","iServerCode":-2147202272,"message":"The Report Definition has already been certified"}'
+
+            def json(self):
+                return {}
+
+        class _M:
+            def put(self, *a, **k):
+                return _R()
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(bm._certify(_M(), "X"))
