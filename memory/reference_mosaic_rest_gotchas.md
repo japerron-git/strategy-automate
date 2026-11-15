@@ -199,6 +199,21 @@ Always tell the helper how to sign in per tenant: `MSTR_AUTH_METHOD` (`sso` for 
   `(month)__id` = the old integer, quarters grouping 3 months, and a yyyyMM filter on `(month)__id` working.
 - After a conversion, a description that says how the value was stored ("stored as YYYYMM integer") is
   wrong: change it in the same finding (`rename_describe`).
+- **Tables with a wrangle step (seen live 2026-11-14).** That verification was on a `root(source)` table.
+  A source rebuild with a find-and-replace (or any wrangle operation) makes the pipeline
+  `root(wrangle(source))`, and many lookup tables already are. Studio writes a type change on the
+  **source** node (its "data source definition") and lets it carry up; a type written on the wrangle node
+  only made the publish fail ("Metric Data Redundancy Reduction Process Failed") when the column was a
+  join key read in two tables, and was **discarded** by the next Studio edit of that table even where it
+  published. `set-column-types` now writes every node down to and including the source node, matching the
+  column by its pipeline id, leaves a column a wrangle operation produces at that node's type (it writes
+  the source only and says "check by hand"), leaves `sourceDataType`/`sparkDataType` alone, and patches the
+  table and its joined tables in one changeset. The same writes made Strategy re-choose the lookup table of
+  11 attributes (`autoDetectLookupTable`), so the plan wraps each type change with an export before and
+  after and `relationship-diff --stop-on-lookup-change`.
+- Strategy can also mark relationships `relationshipStatus: invalid` (seen: a time-varying attribute such
+  as a period or a status declared as a parent of the entity); `join-paths` with the export reports them
+  as one finding.
 
 
 ## File tables: the import settings decide how a reload splits (verified live, 2026-11-13)

@@ -1774,8 +1774,9 @@ def _export_relationships(model: dict, export: dict | None) -> list[dict[str, st
             continue
         p, c = _ref_name(r.get("parent"), ids), _ref_name(r.get("child"), ids)
         if p and c:
-            rels.add((p, c, str(r.get("relationshipType") or r.get("type") or "")))
-    return [{"parent": p, "child": c, "type": t} for p, c, t in sorted(rels)]
+            rels.add((p, c, str(r.get("relationshipType") or r.get("type") or ""),
+                      str(r.get("relationshipStatus") or r.get("status") or "")))
+    return [{"parent": p, "child": c, "type": t, **({"status": st} if st else {})} for p, c, t, st in sorted(rels)]
 
 
 def _attribute_tables(model: dict) -> dict[str, set[str]]:
@@ -2095,6 +2096,15 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
             round_no=round_no, source="join-paths",
             actions=[_relationship_action(joins[base])] if base in joins and not mine else None,
             checks=[{"command": "join-paths", "attribute": n, "expect": "filter ok"}]))
+    invalid = [r for r in graph.get("relationships") or [] if str(r.get("status") or "").lower() == "invalid"]
+    if invalid:
+        findings.append(integrity_finding(
+            "R-invalid-relationships", f"{len(invalid)} relationship(s) the model marks invalid", "relationship",
+            "; ".join(f"{r['parent']} -> {r['child']}" for r in invalid[:30]) + (" …" if len(invalid) > 30 else ""),
+            "Strategy flags these parent-child relationships as invalid (a parent that changes over time, such as a "
+            "period or a status, can't be a fixed parent of the entity). Delete them or re-wire them correctly; say "
+            "which, or decline.", round_no=round_no, impact="medium", source="join-paths",
+            checks=[{"command": "join-paths", "expect": "no invalid relationships"}]))
     prev_types = {(r["parent"], r["child"]): r.get("type") for r in prev_rels or []}
     for r in changes.get("lost") or []:
         spec = _lost_relationship_spec(export, r, prev_types.get((r["parent"], r["child"])))
@@ -2143,8 +2153,14 @@ def relationship_diff(before: dict, after: dict) -> dict[str, Any]:
         spec = _lost_relationship_spec(after, r, r.get("type"))
         if spec:
             restore.append(_relationship_action(spec))
+    def lookups(x: dict) -> dict[str, str]:
+        return {str((at.get("information") or {}).get("name") or "").lower(): str((at.get("attributeLookupTable") or {})
+                                                                                   .get("name") or "")
+                for at in _export_model(x).get("attributes") or []}
+    lb, la = lookups(before), lookups(after)
+    moved = [{"attribute": n, "before": lb[n], "after": la[n]} for n in sorted(lb) if n in la and lb[n] != la[n]]
     return {"before": len(b), "after": len(a), "lost": lost, "added": [a[k] for k in sorted(set(a) - set(b))],
-            "restore_actions": restore}
+            "restore_actions": restore, "lookup_changed": moved}
 
 
 def merge_findings(doc: dict, new: list[dict]) -> dict[str, Any]:
@@ -3868,7 +3884,10 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
              "kind": "change_column_type", "dry_run": cmd(argv + ["--dry-run"]), "apply": cmd(argv),
              "manual": None,
              "risks": ["The data changes only after the republish at the end of this phase; check the values "
-                       "then (codes keep leading zeros, letter codes survive, dates parse)."]})
+                       "then (codes keep leading zeros, letter codes survive, dates parse)."],
+             # seen live: a type change made Strategy re-choose attributes' lookup tables; stop if it did, or if a
+             # relationship was lost
+             **_reload_guards(python, mid, cmd, f"types_{_slug(table or 'main')}", lookup_changes=True)})
     rels = [dict(r) for c in merged["wire_relationships"] for r in c.get("relationships") or []
             if isinstance(r, dict)]
     files: dict[str, Any] = {}
@@ -4168,13 +4187,15 @@ def consult_steps(f: dict) -> list[str]:
     return out
 
 
-def _reload_guards(python: str, mid: str, cmd: Callable, label: str) -> dict[str, list]:
-    """Around a step that reloads tables by hand (a source rebuild, a lookup reload): export the model before
-    and after (to ignore/, never committed) and stop the script when a relationship was lost."""
+def _reload_guards(python: str, mid: str, cmd: Callable, label: str, lookup_changes: bool = False) -> dict[str, list]:
+    """Around a step that reloads tables by hand (a source rebuild, a lookup reload) or retypes columns: export
+    the model before and after (to ignore/, never committed) and stop the script when a relationship was lost,
+    and, with lookup_changes, when an attribute's lookup table changed (a reload changes lookups on purpose)."""
     b4, af = f"ignore/exports/before_{label}.json", f"ignore/exports/after_{label}.json"
+    diff = [python, ASSESS_SCRIPT, "relationship-diff", "--before", b4, "--after", af]
     return {"guard_before": [cmd([python, BUILD_SCRIPT, "export-model", "--model-id", mid, "--out", b4])],
             "guard_after": [cmd([python, BUILD_SCRIPT, "export-model", "--model-id", mid, "--out", af]),
-                            cmd([python, ASSESS_SCRIPT, "relationship-diff", "--before", b4, "--after", af])]}
+                            cmd(diff + (["--stop-on-lookup-change"] if lookup_changes else []))]}
 
 
 def unanswered_by_phase(findings: list[dict]) -> dict[int, list[str]]:
@@ -4585,6 +4606,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "name); exits 1 when any was lost, with the actions that restore them")
     sp.add_argument("--before", required=True)
     sp.add_argument("--after", required=True)
+    sp.add_argument("--stop-on-lookup-change", action="store_true",
+                    help="also exit 1 when an attribute's lookup table changed (after a type change, where none should)")
 
     sp = sub.add_parser("add-findings", help="merge the findings references / join-paths proposed into "
                         "findings.json (existing ones keep their status)")
@@ -4866,12 +4889,18 @@ def _offline(args: argparse.Namespace) -> int:
     if args.cmd == "relationship-diff":
         res = relationship_diff(_load_json(args.before), _load_json(args.after))
         print(json.dumps(res, indent=2))
+        stop = False
         if res["lost"]:
             print(f"STOP: {len(res['lost'])} relationship(s) lost: "
                   + "; ".join(f"{r['parent']} -> {r['child']}" for r in res["lost"])
                   + ". Run /verify-changes: it proposes restoring them. Don't continue this phase.", file=sys.stderr)
-            return 1
-        return 0
+            stop = True
+        if res["lookup_changed"] and args.stop_on_lookup_change:
+            print(f"STOP: Strategy changed the lookup table of {len(res['lookup_changed'])} attribute(s): "
+                  + "; ".join(f"{x['attribute']}: {x['before']} -> {x['after']}" for x in res["lookup_changed"][:10])
+                  + ". Don't republish; run /verify-changes with both exports.", file=sys.stderr)
+            stop = True
+        return 1 if stop else 0
     if args.cmd == "add-findings":
         doc = _load_json(args.findings)
         new = [f for src in args.sources for f in _load_json(src).get("findings") or []]

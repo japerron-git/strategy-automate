@@ -2698,3 +2698,45 @@ class FreshRepliesTests(unittest.TestCase):
         unprofiled = {"attributes": [{"name": "exit type", "type": "varchar"}, {"name": "region", "type": "varchar"}],
                       "metrics": []}
         self.assertEqual(am.changed_objects(unprofiled, new)["attributes"], [])   # nothing to compare
+
+
+class TypeChangeGuardTests(unittest.TestCase):
+    def _export(self, lookup, rels=(), status=""):
+        r = [{"parent": {"objectId": p}, "child": {"objectId": c}, "relationshipType": "one_to_many",
+              **({"relationshipStatus": status} if status else {})} for p, c in rels]
+        return {"model": [{"hierarchy": {"relationships": r},
+                           "factMetrics": [{"fact": {"expressions": [{"tables": [{"name": "facts.csv"}]}]}}],
+                           "attributes": [
+                               {"information": {"objectId": "P", "name": "Period"},
+                                "attributeLookupTable": {"name": lookup},
+                                "forms": [{"expressions": [{"tables": [{"name": "facts.csv"}, {"name": "map.csv"}]}]}]},
+                               {"information": {"objectId": "L", "name": "Loan"},
+                                "attributeLookupTable": {"name": "facts.csv"},
+                                "forms": [{"expressions": [{"tables": [{"name": "facts.csv"}]}]}]}]}]}
+
+    def test_lookup_change_reported_and_stops_with_the_flag(self):
+        res = am.relationship_diff(self._export("facts.csv"), self._export("map.csv"))
+        self.assertEqual(res["lookup_changed"], [{"attribute": "period", "before": "facts.csv", "after": "map.csv"}])
+        d = tempfile.mkdtemp(prefix="lk-")
+        self.addCleanup(shutil.rmtree, d, True)
+        a, b = os.path.join(d, "a.json"), os.path.join(d, "b.json")
+        for p, x in ((a, self._export("facts.csv")), (b, self._export("map.csv"))):
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(x, f)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(am.main(["relationship-diff", "--before", a, "--after", b]), 0)
+            self.assertEqual(am.main(["relationship-diff", "--before", a, "--after", b, "--stop-on-lookup-change"]), 1)
+
+    def test_type_change_step_is_guarded(self):
+        doc = {"model": "M", "findings": [{"id": "F5", "category": "data_type", "status": "approved", "tests": ["Q1"],
+                                           "actions": [{"kind": "change_column_type",
+                                                        "args": {"column": "PERIOD", "type": "date",
+                                                                 "date_format": "yyyyMM"}}]}]}
+        plan = am.build_plan(doc, model_id="MID")
+        (st,) = [s for p in plan["phases"] for s in p["steps"] if s["kind"] == "change_column_type"]
+        self.assertIn("--stop-on-lookup-change", st["guard_after"][1]["argv"])
+
+    def test_invalid_relationships_are_a_finding(self):
+        out = am.check_join_paths(None, "P", {"model": "M", "attributes": [], "metrics": []},
+                                  export=self._export("facts.csv", rels=[("P", "L")], status="invalid"))
+        self.assertIn("R-invalid-relationships", {f["id"] for f in out["findings"]})

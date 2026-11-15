@@ -5960,7 +5960,16 @@ def resolve_column_targets(model: dict, cols: dict[str, tuple[str, str]],
             die(f"column {col} is given two types: {out[col.casefold()][1]} and {t}")
         out[col.casefold()] = (col, t, fmt)
     if unknown:
-        die(f"not a column, attribute or fact metric of this table: {unknown}. Columns: {sorted(c[1] for c in cols.values())}")
+        hints = []
+        for u in unknown:
+            a = next((a for a in model.get("attributes") or []
+                      if (a.get("information") or {}).get("name", "").casefold() in attribute_name_candidates(u)), None)
+            tabs = sorted({str(t.get("name") or t.get("objectId")) for f in (a or {}).get("forms") or []
+                           for e in f.get("expressions") or [] for t in e.get("tables") or []})
+            if tabs:
+                hints.append(f"'{u}' is on {tabs}: give that table with --table (one command per table)")
+        die(f"not a column, attribute or fact metric of this table: {unknown}. Columns: "
+            f"{sorted(c[1] for c in cols.values())}" + ("\n  " + "\n  ".join(hints) if hints else ""))
     return out, notes
 
 
@@ -5986,15 +5995,39 @@ def joined_column_targets(model: dict, table_id: str,
     return out
 
 
+def _pipeline_nodes(pipeline: dict) -> list[dict]:
+    """Every node under the pipeline's root, top down: a plain file table is root(source); a table with a
+    wrangle step (find-and-replace, a type transform) is root(wrangle(source))."""
+    out, todo = [], list((pipeline.get("rootTable") or {}).get("children") or [])
+    while todo:
+        n = todo.pop(0)
+        out.append(n)
+        todo.extend(n.get("children") or [])
+    return out
+
+
+def _op_names_column(op: dict, name: str, cid: str | None) -> bool:
+    vals = [op.get("columnName"), op.get("column"), op.get("columnId")]
+    vals += [c.get("name") if isinstance(c, dict) else c for c in op.get("columns") or []]
+    vals += [c.get("id") if isinstance(c, dict) else None for c in op.get("columns") or []]
+    return any(v and (str(v).casefold() == name.casefold() or (cid and str(v) == str(cid))) for v in vals)
+
+
 def column_type_table_patch(table: dict, targets: dict[str, tuple[str, str, str]]):
-    """-> (physicalTable body for PATCH /tables/{id}, [(column, old type, new type, fmt)], [unchanged columns]).
-    Sets each type in physicalTable.columns AND the pipeline; both must agree."""
+    """-> (physicalTable body for PATCH /tables/{id}, [(column, old type, new type, fmt, where written)],
+    [unchanged columns]). Sets each type in physicalTable.columns AND in every pipeline node down to and
+    including the source node, as Studio does (its "data source definition" is the source node): a type
+    written on a wrangle node only fails the publish on a join key and is discarded by the next Studio edit
+    (seen live). Columns are matched by their pipeline id, the same on every level. A column a wrangle
+    operation produces (a find-and-replace, a text transform) keeps that node's type: only the nodes below
+    it are written, and the change says so. sourceDataType and sparkDataType are left alone, as Studio does."""
     keep = lambda i: {k: i[k] for k in ("objectId", "subType", "name") if k in (i or {})}  # noqa: E731
     pt = copy.deepcopy(table["physicalTable"])
     pt["information"] = keep(pt.get("information"))
     pipeline = json.loads(pt["pipeline"])
-    pipe_cols = {c["name"].casefold(): c for ch in (pipeline.get("rootTable") or {}).get("children") or []
-                 for c in ch.get("columns") or []}
+    nodes = _pipeline_nodes(pipeline)
+    top = [n for n in (pipeline.get("rootTable") or {}).get("children") or []]
+    pipe_cols = {c["name"].casefold(): c for ch in top for c in ch.get("columns") or []}
     present = {c["columnName"].casefold() for c in pt["columns"]}
     missing = [v[0] for k, v in targets.items() if k not in present]
     if missing:
@@ -6013,14 +6046,30 @@ def column_type_table_patch(table: dict, targets: dict[str, tuple[str, str, str]
         pc = pipe_cols.get(key)
         if pc is None:
             die(f"{c['columnName']} is not in the table's pipeline")
-        changed.append((c["columnName"], (c.get("dataType") or {}).get("type"), new["type"], fmt))
+        cid = pc.get("id")
+        written, kept = [], []
+        for node in nodes:
+            col = next((x for x in node.get("columns") or []
+                        if (cid and x.get("id") == cid) or (not cid and str(x.get("name", "")).casefold() == key)),
+                       None)
+            if col is None:
+                continue
+            kind = str(node.get("type") or "node")
+            if any(_op_names_column(op, c["columnName"], cid) for op in node.get("operations") or []):
+                kept.append(f"{kind} ({(col.get('dataType') or {}).get('type')}, made by its operation)")
+                continue
+            col["dataType"] = dict(new)
+            col["format"] = fmt
+            written.append(kind)
+        if not written:
+            die(f"{c['columnName']}: no pipeline node to write the type on")
+        where = "+".join(written) + (f"; kept {', '.join(kept)}: check by hand" if kept else "")
+        changed.append((c["columnName"], (c.get("dataType") or {}).get("type"), new["type"], fmt, where))
         c["dataType"] = dict(new)
         if fmt:
             c["format"] = fmt
         else:
             c.pop("format", None)
-        pc["dataType"] = dict(new)
-        pc["format"] = fmt
     pt["pipeline"] = json.dumps(pipeline, separators=(",", ":"))
     return pt, changed, same
 
@@ -6162,11 +6211,10 @@ def cmd_set_column_types(m: MSTR, args):
     pt, changed, same = column_type_table_patch(cur_table, targets)
     print(f"→ table '{tinfo['name']}': {len(changed)} column type(s) to change, {len(same)} already set",
           file=sys.stderr)
-    for col, old, new, fmt in changed:
-        print(f"  ~ {col}: {old} -> {new}{' (' + fmt + ')' if fmt else ''}", file=sys.stderr)
-    if changed and not args.dry_run:
-        _patch_in_changeset(m, [(f"table '{tinfo['name']}'", f"/api/model/dataModels/{mid}/tables/{tinfo['objectId']}",
-                                 {"physicalTable": pt})], "table")
+    for col, old, new, fmt, where in changed:
+        print(f"  ~ {col}: {old} -> {new}{' (' + fmt + ')' if fmt else ''} [{where}]", file=sys.stderr)
+    table_writes = [(f"table '{tinfo['name']}'", f"/api/model/dataModels/{mid}/tables/{tinfo['objectId']}",
+                     {"physicalTable": pt})] if changed else []
     # A lookup or mapping table keyed on a retyped column takes the same type, or its join breaks.
     joined = [] if args.no_joined else [(t, tgt) for t, tgt in joined_column_targets(model, tinfo["objectId"],
                                                                                      targets).items()]
@@ -6175,20 +6223,23 @@ def cmd_set_column_types(m: MSTR, args):
         other = get(f"/api/model/dataModels/{mid}/tables/{tid}")
         oname = (other.get("information") or {}).get("name", tid)
         opt, ochanged, _ = column_type_table_patch(other, tgt)
-        for col, old, new, fmt in ochanged:
-            print(f"  ~ {oname}.{col}: {old} -> {new} (joined)", file=sys.stderr)
-            joined_changed.append({"table": oname, "column": col, "from": old, "to": new})
-        if ochanged and not args.dry_run:
-            _patch_in_changeset(m, [(f"table '{oname}'", f"/api/model/dataModels/{mid}/tables/{tid}",
-                                     {"physicalTable": opt})], f"joined table {oname}")
+        for col, old, new, fmt, where in ochanged:
+            print(f"  ~ {oname}.{col}: {old} -> {new} (joined) [{where}]", file=sys.stderr)
+            joined_changed.append({"table": oname, "column": col, "from": old, "to": new, "written_on": where})
+        if ochanged:
+            table_writes.append((f"table '{oname}'", f"/api/model/dataModels/{mid}/tables/{tid}",
+                                 {"physicalTable": opt}))
+    if table_writes and not args.dry_run:
+        # the table and every table joined on its retyped columns change together: the join's two sides agree
+        _patch_in_changeset(m, table_writes, "tables")
     writes, notes = column_type_object_writes(model, mid, cols, targets, get)
     for n in notes:
         print(f"  ! {n}", file=sys.stderr)
     if writes and not args.dry_run:
         _patch_in_changeset(m, writes, "align attributes and fact metrics")
     print(json.dumps({"ok": True, "dry_run": bool(args.dry_run), "table": tinfo["name"],
-                      "changed": [{"column": c, "from": o, "to": n, "date_format": f or None}
-                                  for c, o, n, f in changed],
+                      "changed": [{"column": c, "from": o, "to": n, "date_format": f or None, "written_on": w}
+                                  for c, o, n, f, w in changed],
                       "already_set": same, "resolved": resolved, "joined": joined_changed,
                       "aligned": [w[0] for w in writes],
                       "check_by_hand": notes,

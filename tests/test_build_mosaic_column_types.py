@@ -221,7 +221,7 @@ class JoinedTableTests(unittest.TestCase):
         fake = _Fake(routes)
         out = _run(fake, _args())
         self.assertEqual(out["joined"], [{"table": "status_lookup.csv", "column": "STATUS", "from": "integer",
-                                          "to": "utf8_char"}])
+                                          "to": "utf8_char", "written_on": "node"}])
         body = next(kw["json"] for m, p, kw, _ in fake.calls if (m, p) == ("PATCH", f"{MP}/tables/T2"))
         self.assertEqual(body["physicalTable"]["columns"][0]["dataType"], TXT)
         fake = _Fake(routes)
@@ -308,3 +308,54 @@ class FlowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _wrangled_table(op_on=None):
+    """root(wrangle(source)): the shape a source rebuild with a find-and-replace leaves (seen live)."""
+    src_cols = [{"id": "p1", "name": "PERIOD", "dataType": dict(INT), "sourceDataType": dict(INT),
+                 "sparkDataType": {"type": "integer"}},
+                {"id": "z1", "name": "ZB CODE", "dataType": dict(INT), "sourceDataType": dict(INT)}]
+    wr_cols = [{"id": "p1", "name": "PERIOD", "dataType": dict(INT)},
+               {"id": "z1", "name": "ZB CODE", "dataType": {"type": "utf8_char", "precision": 255}}]
+    ops = [{"op": "core/text-transform", "columnName": op_on}] if op_on else []
+    pipeline = {"rootTable": {"children": [{"type": "wrangle", "columns": wr_cols, "operations": ops,
+                                            "children": [{"type": "source", "columns": src_cols}]}]}}
+    t = _table()
+    t["physicalTable"]["columns"] = [{"information": {"objectId": "C" + c["id"], "name": c["name"]},
+                                      "columnName": c["name"], "dataType": dict(c["dataType"])} for c in wr_cols]
+    t["physicalTable"]["pipeline"] = json.dumps(pipeline)
+    return t
+
+
+class WrangledPipelineTests(unittest.TestCase):
+    def test_type_written_down_to_the_source_node(self):
+        pt, changed, _ = bm.column_type_table_patch(_wrangled_table(),
+                                                    bm.column_type_targets([["PERIOD", "date", "yyyyMM"]], None))
+        self.assertEqual(changed, [("PERIOD", "integer", "date", "yyyyMM", "wrangle+source")])
+        nodes = bm._pipeline_nodes(json.loads(pt["pipeline"]))
+        for n in nodes:
+            col = next(c for c in n["columns"] if c["id"] == "p1")
+            self.assertEqual((col["dataType"]["type"], col["format"]), ("date", "yyyyMM"))
+        src = next(c for c in nodes[1]["columns"] if c["id"] == "p1")
+        self.assertEqual((src["sourceDataType"], src["sparkDataType"]), (INT, {"type": "integer"}))   # left alone
+
+    def test_column_made_by_an_operation_keeps_its_wrangle_type(self):
+        pt, changed, _ = bm.column_type_table_patch(_wrangled_table(op_on="ZB CODE"),
+                                                    bm.column_type_targets([["ZB CODE", "text"]], None))
+        ((col, _old, new, _fmt, where),) = changed
+        self.assertTrue(where.startswith("source; kept wrangle"))
+        self.assertIn("check by hand", where)
+        nodes = bm._pipeline_nodes(json.loads(pt["pipeline"]))
+        self.assertEqual(next(c for c in nodes[0]["columns"] if c["id"] == "z1")["dataType"]["type"], "utf8_char")
+        self.assertEqual(next(c for c in nodes[1]["columns"] if c["id"] == "z1")["dataType"]["type"], new)
+
+    def test_attribute_on_another_table_gets_a_hint(self):
+        model = _model()
+        model["attributes"].append({"information": {"objectId": "A9", "name": "Activity Month"}, "forms": [
+            {"category": "ID", "expressions": [{"expression": {"text": "[ACT]"},
+                                                "tables": [{"objectId": "MM", "name": "Month_Map.csv"}]}]}]})
+        cols = {c["columnName"].casefold(): (c["information"]["objectId"], c["columnName"])
+                for c in _table()["physicalTable"]["columns"]}
+        with self.assertRaises(SystemExit) as e, contextlib.redirect_stderr(io.StringIO()) as err:
+            bm.resolve_column_targets(model, cols, bm.column_type_targets([["activity month", "date", "yyyyMM"]], None))
+        self.assertIn("--table", err.getvalue() + str(e.exception))
