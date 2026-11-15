@@ -2739,4 +2739,13 @@ class TypeChangeGuardTests(unittest.TestCase):
     def test_invalid_relationships_are_a_finding(self):
         out = am.check_join_paths(None, "P", {"model": "M", "attributes": [], "metrics": []},
                                   export=self._export("facts.csv", rels=[("P", "L")], status="invalid"))
-        self.assertIn("R-invalid-relationships", {f["id"] for f in out["findings"]})
+        f = next(x for x in out["findings"] if x["id"] == "R-invalid-relationships")
+        self.assertEqual(f["actions"][0]["kind"], "remove_relationships")
+        self.assertEqual(f["actions"][0]["args"]["relationships"], [{"parent_attribute": "Period",
+                                                                      "child_attribute": "Loan"}])
+        c = am.action_commands(f["actions"][0], "MID")
+        self.assertEqual(c["apply"][-2:], ["--pair", "Period -> Loan"])
+
+    def test_dates_shown_as_text_filter_as_dates(self):
+        self.assertEqual(am._typed_literal("2018-12-01", "bigint"), "DATE '2018-12-01'")   # an older scope's type
+        self.assertEqual(am._typed_literal("2018-12-01", "varchar"), "'2018-12-01'")

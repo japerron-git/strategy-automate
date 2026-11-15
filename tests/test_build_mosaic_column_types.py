@@ -131,6 +131,12 @@ class TablePatchTests(unittest.TestCase):
     def test_already_set_and_missing_column(self):
         t = _table()
         t["physicalTable"]["columns"][0]["dataType"] = dict(TXT)
+        # the table's column is text but its pipeline still says integer: not set yet (seen live after a wrangle)
+        _, changed, same = bm.column_type_table_patch(t, bm.column_type_targets([["STATUS CODE", "text"]], None))
+        self.assertEqual((len(changed), same), (1, []))
+        pipe = json.loads(t["physicalTable"]["pipeline"])
+        pipe["rootTable"]["children"][0]["columns"][0]["dataType"] = dict(TXT)
+        t["physicalTable"]["pipeline"] = json.dumps(pipe)
         _, changed, same = bm.column_type_table_patch(t, bm.column_type_targets([["STATUS CODE", "text"]], None))
         self.assertEqual((changed, same), ([], ["STATUS CODE"]))
         _dies(bm.column_type_table_patch, _table(), bm.column_type_targets([["NOPE", "text"]], None))
@@ -359,3 +365,12 @@ class WrangledPipelineTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as e, contextlib.redirect_stderr(io.StringIO()) as err:
             bm.resolve_column_targets(model, cols, bm.column_type_targets([["activity month", "date", "yyyyMM"]], None))
         self.assertIn("--table", err.getvalue() + str(e.exception))
+
+
+class RemoveRelationshipTests(unittest.TestCase):
+    def test_plan_by_name(self):
+        model = {"attributes": [{"information": {"objectId": "P", "name": "Reporting Period"}},
+                                {"information": {"objectId": "L", "name": "Loan"}}]}
+        plan, problems = bm.remove_relationship_plan(model, bm._pairs(["Reporting Period -> Loan", "X -> Loan"]))
+        self.assertEqual(plan, {"L": ["P"]})
+        self.assertIn("'X -> Loan'", problems[0])

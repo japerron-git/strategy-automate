@@ -213,7 +213,12 @@ Always tell the helper how to sign in per tenant: `MSTR_AUTH_METHOD` (`sso` for 
   after and `relationship-diff --stop-on-lookup-change`.
 - Strategy can also mark relationships `relationshipStatus: invalid` (seen: a time-varying attribute such
   as a period or a status declared as a parent of the entity); `join-paths` with the export reports them
-  as one finding.
+  as one finding that proposes `remove_relationships` (`build_mosaic.py remove-relationships`: each child's
+  list PUT back without them). Not yet run live.
+- "Already set" means the table's column and every pipeline node down to the source have the type: a
+  find-and-replace can make the table's column text while the source stays a number.
+- Studio gave a converted yyyyMM date attribute the form role `month` in one case and `date` in another
+  (2026-11-12 export); `set-column-types` writes `date`. Not known to matter for the connector.
 
 
 ## File tables: the import settings decide how a reload splits (verified live, 2026-11-13)

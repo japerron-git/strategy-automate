@@ -73,7 +73,7 @@ ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_d
                 "create_level_metric", "create_weighted_average", "patch_model_object", "patch_fact_metrics",
                 "add_lookup_table", "change_column_type", "source_change", "wire_relationships",
                 "create_formula_attribute", "add_column_attribute", "add_time_attributes", "rename_describe",
-                "show_forms", "publish", "certify", "manual")
+                "show_forms", "remove_relationships", "publish", "certify", "manual")
 COLUMN_TYPES = ("text", "integer", "bigint", "double", "date", "timestamp")   # build_mosaic.py set-column-types
 # Changes made once for the whole plan, at the start of one phase; other phases get a note.
 MERGED_KINDS = {"source_change": 1, "change_column_type": 2, "wire_relationships": 3, "add_time_attributes": 3,
@@ -1839,6 +1839,8 @@ def _typed_literal(value: Any, typ: str) -> str:
     """A literal of the attribute's type. The connector shows numbers with thousands separators
     ("201,812"), so a numeric value loses them and is written unquoted."""
     t = (typ or "").lower()
+    if not t.startswith(("varchar", "char")) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value).strip()):
+        return f"DATE '{str(value).strip()}'"   # a date shown as text, whatever an older scope called the type
     if t in _NUMERIC or t.startswith(("decimal", "numeric")):
         raw = str(value).strip()
         if re.fullmatch(r"-?\d{1,3}(,\d{3})+(\.\d+)?|-?\d+(\.\d+)?", raw):
@@ -1928,6 +1930,14 @@ def _lost_relationship_spec(export: dict | None, r: dict, typ: str | None) -> di
     shared = sorted(set(_attribute_tables(model).get(r["parent"], set())) & set(_attribute_tables(model).get(r["child"], set())))
     return {"parent": str(p["information"]["name"]), "child": str(c["information"]["name"]),
             "table": shared[0] if len(shared) == 1 else "", "type": typ or "one_to_many"}
+
+
+def _display_name(export: dict | None, lower: str) -> str:
+    for a in _export_model(export).get("attributes") or []:
+        n = str((a.get("information") or {}).get("name") or "")
+        if n.lower() == lower:
+            return n
+    return lower
 
 
 def _relationship_action(spec: dict[str, str]) -> dict[str, Any]:
@@ -2102,8 +2112,12 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
             "R-invalid-relationships", f"{len(invalid)} relationship(s) the model marks invalid", "relationship",
             "; ".join(f"{r['parent']} -> {r['child']}" for r in invalid[:30]) + (" …" if len(invalid) > 30 else ""),
             "Strategy flags these parent-child relationships as invalid (a parent that changes over time, such as a "
-            "period or a status, can't be a fixed parent of the entity). Delete them or re-wire them correctly; say "
-            "which, or decline.", round_no=round_no, impact="medium", source="join-paths",
+            "period or a status, can't be a fixed parent of the entity). Proposed: remove them all "
+            "(remove_relationships). Approve, Modify to keep some (name them), or Decline.", round_no=round_no,
+            impact="medium", source="join-paths",
+            actions=[{"kind": "remove_relationships", "args": {"relationships": [
+                {"parent_attribute": _display_name(export, r["parent"]), "child_attribute": _display_name(export, r["child"])}
+                for r in invalid]}}],
             checks=[{"command": "join-paths", "expect": "no invalid relationships"}]))
     prev_types = {(r["parent"], r["child"]): r.get("type") for r in prev_rels or []}
     for r in changes.get("lost") or []:
@@ -3746,6 +3760,14 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
             out["guard_after"] = [base + ["export-model", "--model-id", model_id, "--out", after],
                                   [python, ASSESS_SCRIPT, "relationship-diff", "--before", before, "--after", after]]
         return out
+    if kind == "remove_relationships":
+        rels = a.get("relationships") or []
+        if not rels:
+            problems.append(f"{kind}: args need relationships [{{parent_attribute, child_attribute}}]")
+        argv = base + ["remove-relationships", "--model-id", model_id]
+        for r in rels:
+            argv += ["--pair", f"{r.get('parent_attribute')} -> {r.get('child_attribute')}"]
+        return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "show_forms":
         forms = _arg_list(a.get("forms"))
         if not a.get("attribute") or not forms:

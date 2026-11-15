@@ -6040,13 +6040,24 @@ def column_type_table_patch(table: dict, targets: dict[str, tuple[str, str, str]
             continue
         _, t, fmt = targets[key]
         new = COLUMN_TYPES[t]
-        if c.get("dataType") == new and c.get("format", "") == fmt:
-            same.append(c["columnName"])
-            continue
         pc = pipe_cols.get(key)
         if pc is None:
             die(f"{c['columnName']} is not in the table's pipeline")
         cid = pc.get("id")
+
+        def _node_col(node):
+            return next((x for x in node.get("columns") or []
+                         if (cid and x.get("id") == cid) or (not cid and str(x.get("name", "")).casefold() == key)),
+                        None)
+        # set only when the table's column AND every node a type is written on (down to the source) agree: a
+        # wrangle step can make the table's column text while its source stays a number
+        lagging = [n for n in nodes if _node_col(n) is not None
+                   and not any(_op_names_column(op, c["columnName"], cid) for op in n.get("operations") or [])
+                   and ((_node_col(n).get("dataType") or {}).get("type") != new["type"]
+                        or (_node_col(n).get("format") or "") != fmt)]
+        if c.get("dataType") == new and c.get("format", "") == fmt and not lagging:
+            same.append(c["columnName"])
+            continue
         written, kept = [], []
         for node in nodes:
             col = next((x for x in node.get("columns") or []
@@ -6661,6 +6672,75 @@ def show_forms_body(attr: dict, forms: list[str]) -> tuple[dict | None, list[str
         return None, added, problems
     return ({"displays": {"reportDisplays": [{"id": i} for i in new_report],
                           "browseDisplays": [{"id": i} for i in new_browse]}}, added, problems)
+
+
+def remove_relationship_plan(model: dict, pairs: list[tuple[str, str]]) -> tuple[dict[str, list[str]], list[str]]:
+    """Pairs (parent, child) by attribute name -> ({child id: [parent ids to drop]}, problems)."""
+    by_name = {(a.get("information") or {}).get("name", "").casefold(): a for a in model.get("attributes") or []}
+
+    def find(n):
+        return next((by_name[c] for c in attribute_name_candidates(n) if c in by_name), None)
+    plan, problems = {}, []
+    for parent, child in pairs:
+        p, c = find(parent), find(child)
+        if not p or not c:
+            problems.append(f"'{parent} -> {child}': attribute not found ({parent if not p else child})")
+            continue
+        plan.setdefault(c["information"]["objectId"], []).append(p["information"]["objectId"])
+    return plan, problems
+
+
+def _pairs(values: list[str]) -> list[tuple[str, str]]:
+    out = []
+    for v in values:
+        if "->" not in v:
+            die(f"--pair '{v}': write it as 'Parent -> Child'")
+        a, b = v.split("->", 1)
+        out.append((a.strip(), b.strip()))
+    return out
+
+
+def cmd_remove_relationships(m: MSTR, args):
+    """Remove parent-child relationships (Strategy marks some invalid, such as a time-varying attribute declared
+    a parent of the entity). An attribute's relationships are written as one full list, so each child's list
+    is read and PUT back without the named parents, keeping all the others; one changeset."""
+    pairs = _pairs(args.pair or [])
+    if not pairs:
+        die("remove-relationships: give at least one --pair 'Parent -> Child'")
+    m.login(identity=True)
+    r = m.post(f"/api/model/dataModels/{args.model_id}/export")
+    if not r.ok:
+        die(f"export model: {format_mstr_error(r)}")
+    model = (r.json().get("model") or [{}])[0]
+    plan, problems = remove_relationship_plan(model, pairs)
+    if problems:
+        die("remove-relationships: nothing was written:\n  - " + "\n  - ".join(problems))
+    writes, skipped = [], []
+    for child, parents in plan.items():
+        existing = get_attribute_relationships(m, args.model_id, child)
+        if existing is None:
+            die(f"could not read {child}'s relationships; nothing was written")
+        keep = [x for x in existing if not (_rel_key(x)[1] == child and _rel_key(x)[0] in parents)]
+        if len(keep) == len(existing):
+            skipped.append(f"{child}: none of {parents} is its parent now")
+            continue
+        writes.append((child, keep, len(existing) - len(keep)))
+    for child, keep, n in writes:
+        print(f"  - {child}: remove {n} relationship(s), keep {len(keep)}", file=sys.stderr)
+    if writes and not args.dry_run:
+        cs = open_cs(m)
+        try:
+            for child, keep, _ in writes:
+                resp = m.put(f"/api/model/dataModels/{args.model_id}/attributes/{child}/relationships",
+                             json={"relationships": keep}, headers={"X-MSTR-MS-Changeset": cs})
+                if not resp.ok:
+                    die(f"remove-relationships: PUT {child}: {format_mstr_error(resp)}")
+            commit_cs(m, cs)
+        except BaseException:
+            discard_cs(m, cs)
+            raise
+    print(json.dumps({"ok": True, "dry_run": bool(args.dry_run), "removed": sum(w[2] for w in writes),
+                      "skipped": skipped, "next": "republish and re-certify"}, indent=2))
 
 
 def cmd_show_forms(m: MSTR, args):
@@ -7672,6 +7752,13 @@ def build_parser():
     sp.add_argument("--spec", help="JSON {items: [{attribute, intervals: [...]}]} instead of --attribute")
     sp.add_argument("--dry-run", action="store_true", help="print the request bodies; open no changeset")
 
+    sp = sub.add_parser("remove-relationships",
+        help="Remove parent-child relationships by attribute name (each child's list is PUT back without them, the "
+             "others kept). One changeset; republish and re-certify afterwards.")
+    sp.add_argument("--model-id", required=True)
+    sp.add_argument("--pair", action="append", help="'Parent -> Child' (repeatable)")
+    sp.add_argument("--dry-run", action="store_true", help="list what would be removed; write nothing")
+
     sp = sub.add_parser("show-forms",
         help="Make hidden forms visible: add them to the attribute's report and browse displays (the connector lists "
              "only displayed forms). Keeps the displays it has. Republish and re-certify afterwards.")
@@ -7805,6 +7892,7 @@ def main():
             "add-column-attribute": cmd_create_formula_attribute,
             "add-time-attributes": cmd_add_time_attributes,
             "show-forms": cmd_show_forms,
+            "remove-relationships": cmd_remove_relationships,
             "export-model": cmd_export_model,
             "set-column-types": cmd_set_column_types,
             "patch-fact-metrics": cmd_patch_fact_metrics,
