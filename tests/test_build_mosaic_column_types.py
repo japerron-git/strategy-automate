@@ -460,3 +460,31 @@ class KeptWrangleNoteTests(unittest.TestCase):
                 json.dump({"model": [{"tables": [_wrangled_table(op_on="ZB CODE")], "attributes": []}]}, f)
             out = _run(bm.ExportClient(p), _args(set=[["ZB CODE", "text"]], dry_run=True))
         self.assertTrue(any(n.startswith("sales.ZB CODE: ") and "check by hand" in n for n in out["check_by_hand"]))
+
+
+class ExportShapeTests(unittest.TestCase):
+    """An export-model file holds each table's pipeline as an object; the live GET gives a JSON string."""
+
+    def _export_with_object_pipeline(self, d):
+        model = _model()
+        for t in model.get("tables") or []:
+            t["physicalTable"]["pipeline"] = json.loads(t["physicalTable"]["pipeline"])
+        p = os.path.join(d, "export.json")
+        with open(p, "w") as f:
+            json.dump({"model": [model]}, f)
+        return p
+
+    def test_a_dry_run_on_an_export_with_object_pipelines(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = bm.ExportClient(self._export_with_object_pipeline(d))
+            out = _run(m, _args(dry_run=True))
+        self.assertEqual([c["column"] for c in out["changed"]], ["STATUS CODE"])
+
+    def test_the_patch_accepts_either_shape(self):
+        t = _table()
+        as_object = copy.deepcopy(t)
+        as_object["physicalTable"]["pipeline"] = json.loads(t["physicalTable"]["pipeline"])
+        targets = {"status code": ("STATUS CODE", "text", "")}
+        a, b = bm.column_type_table_patch(t, targets), bm.column_type_table_patch(as_object, targets)
+        self.assertEqual(a[0], b[0])
+        self.assertIsInstance(b[0]["pipeline"], str)

@@ -212,6 +212,18 @@ Resolved:
 - *Saved yyyyMM filters on a column that became a date:* `references` rewrites them to
   `"<date>" = DATE 'yyyy-MM-01'` (also `<`, `>`, `BETWEEN`, `IN`) while there is no month attribute, then
   to `"<date> (month)__id" = yyyyMM` once time attributes add it (reason kind `model_change`).
+- *Bundle slug:* `plan` takes it from `slug` in the assessment's `meta.json`, else the assessment folder's
+  name, so the bundle and the workbook match; the model's name is the last resort.
+- *Phase logs:* each script writes `phase_N.log` beside itself (`Start-Transcript`, appended per run,
+  stopped however the script ends), merges python's stderr into plain text (Windows PowerShell shows each
+  stderr line as a red NativeCommandError otherwise) and reads output as UTF-8. Run it with no redirection.
+- *Lost relationships:* an `L-` finding is resolved only when its relationship is in the current export (it
+  is raised only in the round the relationship goes missing, so its absence from later rounds proves
+  nothing).
+- *Dependencies:* met when the dependency's actions reached the model (`applied_phases` covers their
+  phases), whatever its status.
+- *Type-change probes:* an attribute whose only change is its type and whose profile kept every value
+  (same count, same range read as digits) is listed under `type_checks`, not probed value by value.
 - *Previewing a phase without the tenant:* `set-column-types`, `wire-relationships` and `rename-describe`
   take `--from-export <export.json>`: a dry run answered from the file, any write refused.
 

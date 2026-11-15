@@ -6043,7 +6043,8 @@ def column_type_table_patch(table: dict, targets: dict[str, tuple[str, str, str]
     keep = lambda i: {k: i[k] for k in ("objectId", "subType", "name") if k in (i or {})}  # noqa: E731
     pt = copy.deepcopy(table["physicalTable"])
     pt["information"] = keep(pt.get("information"))
-    pipeline = json.loads(pt["pipeline"])
+    # the live GET gives the pipeline as a JSON string; an export-model file holds it as an object
+    pipeline = json.loads(pt["pipeline"]) if isinstance(pt["pipeline"], str) else copy.deepcopy(pt["pipeline"])
     nodes = _pipeline_nodes(pipeline)
     top = [n for n in (pipeline.get("rootTable") or {}).get("children") or []]
     pipe_cols = {c["name"].casefold(): c for ch in top for c in ch.get("columns") or []}
@@ -7946,6 +7947,10 @@ class ExportClient:
                         if (o.get("information") or {}).get("objectId") == oid or o.get("id") == oid), None)
             if obj is None:
                 return _OfflineResponse(404, {"message": f"{oid} is not in the export"})
+            if parts[-2] == "tables":                           # as the live GET gives it: the pipeline as a string
+                pt = obj.get("physicalTable") or {}
+                if isinstance(pt.get("pipeline"), (dict, list)):
+                    obj = {**obj, "physicalTable": {**pt, "pipeline": json.dumps(pt["pipeline"])}}
             if parts[-2] == "attributes":                       # its relationships, from the export's hierarchy
                 rels = [r for r in ((self.model.get("hierarchy") or {}).get("relationships") or [])
                         if oid in ((r.get("parent") or {}).get("objectId"), (r.get("child") or {}).get("objectId"))]

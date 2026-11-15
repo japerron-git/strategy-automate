@@ -2857,3 +2857,59 @@ class PlanMergeTests(unittest.TestCase):
         self.assertTrue(any("L1" in p and "isn't a finding" in p for p in res["problems"]))
         self.assertTrue(any("L2" in w and "actions of its own" in w for w in res["warnings"]))
         self.assertTrue(any("L3" in w and "declined" in w for w in res["warnings"]))
+
+
+class DevOpenItemTests(unittest.TestCase):
+    def test_the_bundle_slug_comes_from_the_assessment(self):
+        with tempfile.TemporaryDirectory() as d:
+            folder = os.path.join(d, "assessments", "sales-c")
+            os.makedirs(folder)
+            fp = os.path.join(folder, "findings.json")
+            self.assertEqual(am.assessment_slug(fp), "sales-c")
+            with open(os.path.join(folder, "meta.json"), "w") as f:
+                json.dump({"model": "Sales Model C", "slug": "sales-model-c"}, f)
+            self.assertEqual(am.assessment_slug(fp), "sales-model-c")
+            self.assertIsNone(am.assessment_slug(os.path.join(d, "findings.json")))
+
+    def test_a_lost_relationship_is_resolved_only_when_it_is_back(self):
+        lost = {"id": "L-a-b", "source": "join-paths",
+                "checks": [{"command": "join-paths", "relationship": ["A", "B"], "expect": "present"}]}
+        other = {"id": "J-filter-x", "source": "join-paths", "checks": []}
+        doc = {"findings": [lost, other]}
+        self.assertEqual(am.resolved_findings(doc, [], [{"parent": "X", "child": "Y"}]),
+                         {"resolved": ["J-filter-x"], "still_present": ["L-a-b"]})
+        self.assertEqual(am.resolved_findings(doc, [], [{"parent": "a", "child": "b"}])["resolved"],
+                         ["L-a-b", "J-filter-x"])
+        self.assertEqual(am.resolved_findings(doc, [])["not_checked"], ["L-a-b"])
+
+    def test_a_dependency_whose_change_is_in_the_model_is_met(self):
+        dep = _finding("F4", "data_type", status="failed", applied_phases=[2],
+                       actions=[{"kind": "change_column_type", "args": {}}])
+        self.assertTrue(am._dependency_in_model(dep))
+        self.assertFalse(am._dependency_in_model(dict(dep, applied_phases=[])))
+        plan = am.build_plan({"findings": [dep, _finding("F6", "data_type", depends_on=["F4"])]}, model_id="M")
+        self.assertFalse(any("depends on F4" in w for w in plan["warnings"]))
+
+    def test_the_lint_suggests_computing_the_expression_in_the_subquery(self):
+        outer = ('SELECT YEAR(fpd), COUNT(*) FROM (SELECT "customer", MAX("first order date") AS fpd FROM m '
+                 'GROUP BY "customer") t GROUP BY 1')
+        self.assertIn("subquery's SELECT", am._sql_lint(outer)[0])
+        inner = ('SELECT vintage, COUNT(*) FROM (SELECT "customer", YEAR(MAX("first order date")) AS vintage FROM m '
+                 'GROUP BY "customer") t GROUP BY vintage')
+        self.assertEqual(am._sql_lint(inner), [])
+
+    def test_a_type_change_that_kept_every_value_is_not_probed_value_by_value(self):
+        old = {"attributes": [{"name": "Month", "type": "integer", "formula": "f",
+                               "profile": {"distinct_values": 12, "min": "202201", "max": "202212"}},
+                              {"name": "Code", "type": "integer", "formula": "g",
+                               "profile": {"distinct_values": 5, "min": "1", "max": "9"}},
+                              {"name": "Same", "type": "text", "formula": "h", "profile": {"distinct_values": 3}}]}
+        new = {"attributes": [{"name": "Month", "type": "date", "formula": "f",
+                               "profile": {"distinct_values": 12, "min": "2022-01-01", "max": "2022-12-01"}},
+                              {"name": "Code", "type": "text", "formula": "g",
+                               "profile": {"distinct_values": 6, "min": "01", "max": "09"}},
+                              {"name": "Same", "type": "text", "formula": "h", "profile": {"distinct_values": 3}}]}
+        out = am.type_only_changes(old, new)
+        self.assertEqual(set(out), {"Month", "Code"})
+        self.assertEqual(out["Month"]["verdict"], "values kept")
+        self.assertNotEqual(out["Code"]["verdict"], "values kept")

@@ -97,6 +97,22 @@ RELATIONSHIP_HINTS = "specs/relationships.json"   # written into the bundle by p
 BUNDLE_ROOT = "ignore/apply"
 
 
+def assessment_slug(findings_path: str) -> str | None:
+    """The model's slug as the assessment chose it: `slug` in meta.json beside the findings, else the name of
+    the folder under assessments/ that holds them. The workbook and the bundle use the same one."""
+    folder = os.path.dirname(os.path.abspath(findings_path))
+    try:
+        with open(os.path.join(folder, "meta.json"), encoding="utf-8") as f:
+            slug = (json.load(f) or {}).get("slug")
+        if slug:
+            return str(slug)
+    except (OSError, ValueError, AttributeError):
+        pass
+    if os.path.basename(os.path.dirname(folder)) == "assessments":
+        return os.path.basename(folder)
+    return None
+
+
 def default_bundle_dir(model: str) -> str:
     return f"{BUNDLE_ROOT}/{_slug(model or 'model').replace('_', '-')}"
 
@@ -949,6 +965,33 @@ def changed_objects(old_scope: dict | None, new_scope: dict, findings: dict | No
                     hit = names[key].get(str(v or "").lower())
                     if hit and hit not in out[key]:
                         out[key].append(hit)
+    return out
+
+
+def type_only_changes(old_scope: dict | None, new_scope: dict) -> dict[str, dict[str, Any]]:
+    """Attributes whose type changed and nothing else (same formula), compared from the two scopes' profiles
+    with no query: the number of values, and the range read as digits (202201 and 2022-01-01 agree). "values
+    kept" needs both to agree; anything else, or a profile missing, is left to the full probe."""
+    def digits(v: Any) -> str:
+        return re.sub(r"\D", "", str(v or ""))
+
+    def same_range(a: Any, b: Any) -> bool:
+        x, y = digits(a), digits(b)
+        return bool(x and y) and (x.startswith(y) or y.startswith(x))
+    old = {a["name"]: a for a in (old_scope or {}).get("attributes") or []}
+    out: dict[str, dict[str, Any]] = {}
+    for a in new_scope.get("attributes") or []:
+        o = old.get(a["name"])
+        if not o or o.get("type") == a.get("type") or o.get("formula") != a.get("formula"):
+            continue
+        po, pn = o.get("profile") or {}, a.get("profile") or {}
+        d0, d1 = _num(po.get("distinct_values")), _num(pn.get("distinct_values"))
+        kept = (bool(po and pn) and d0 is not None and d0 == d1
+                and all(same_range(po.get(k), pn.get(k)) or (_blank(po.get(k)) and _blank(pn.get(k)))
+                        for k in ("min", "max")))
+        out[a["name"]] = {"from": o.get("type"), "to": a.get("type"), "distinct_values": [d0, d1],
+                          "min": [po.get("min"), pn.get("min")], "max": [po.get("max"), pn.get("max")],
+                          "verdict": "values kept" if kept else "values changed or not profiled: probed"}
     return out
 
 
@@ -2048,13 +2091,40 @@ def _relationship_action(spec: dict[str, str]) -> dict[str, Any]:
     return {"kind": "wire_relationships", "args": {"relationships": [rel]}}
 
 
-def resolved_findings(findings_doc: dict, current: list[dict]) -> dict[str, list[str]]:
+def _relationship_check(f: dict) -> tuple[str, str] | None:
+    for c in f.get("checks") or []:
+        r = c.get("relationship")
+        if isinstance(r, (list, tuple)) and len(r) == 2 and c.get("expect") == "present":
+            return str(r[0]), str(r[1])
+    return None
+
+
+def resolved_findings(findings_doc: dict, current: list[dict],
+                      relationships: list[dict] | None = None) -> dict[str, list[str]]:
     """Findings an earlier join-paths or references run raised: the ones this run no longer raises are
-    resolved (their check passes now), the rest still present."""
+    resolved (their check passes now), the rest still present. A lost relationship (L-) is raised only in the
+    round it goes missing, so it is resolved only when the relationship is in this export again; without an
+    export it is "not_checked"."""
     now = {f["id"] for f in current}
-    mine = [f for f in findings_doc.get("findings") or [] if f.get("source") in ("join-paths", "references")]
-    return {"resolved": [f["id"] for f in mine if f["id"] not in now],
-            "still_present": [f["id"] for f in mine if f["id"] in now]}
+    have = {(str(r.get("parent") or "").casefold(), str(r.get("child") or "").casefold())
+            for r in relationships or []}
+    out: dict[str, list[str]] = {"resolved": [], "still_present": [], "not_checked": []}
+    for f in findings_doc.get("findings") or []:
+        if f.get("source") not in ("join-paths", "references"):
+            continue
+        rel = _relationship_check(f)
+        if f["id"] in now:
+            out["still_present"].append(f["id"])
+        elif rel is None:
+            out["resolved"].append(f["id"])
+        elif relationships is None:
+            out["not_checked"].append(f["id"])
+        else:
+            key = (rel[0].casefold(), rel[1].casefold())
+            out["resolved" if key in have else "still_present"].append(f["id"])
+    if not out["not_checked"]:
+        del out["not_checked"]
+    return out
 
 
 def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export: dict | None = None,
@@ -3372,8 +3442,10 @@ def grouped_expressions(sql: str) -> list[str]:
 
 def _sql_lint(sql: str) -> list[str]:
     bad = grouped_expressions(sql)
-    return [f"it groups by an expression of an attribute ({', '.join(b[:60] for b in bad)}), which doesn't regroup in "
-            f"Mosaic: group by the attribute itself or its time attribute ((year), (month) forms)"] if bad else []
+    return [f"it groups by an expression ({', '.join(b[:60] for b in bad)}), which doesn't regroup in Mosaic, even in "
+            f"an outer query over a subquery: group by the attribute itself or its time attribute ((year), (month) "
+            f"forms), or compute the expression in the subquery's SELECT (e.g. YEAR(MAX(<date>)) AS vintage) and "
+            f"group the outer query by that column"] if bad else []
 
 
 def best_answer_version(q: dict) -> int:
@@ -3641,6 +3713,17 @@ def _phase_of(f: dict) -> int | None:
 def action_phase(f: dict, action: dict) -> int | None:
     """The phase an action runs in: merged kinds have a fixed phase, the rest run in the finding's."""
     return MERGED_KINDS.get(str(action.get("kind") or "")) or _phase_of(f)
+
+
+def _dependency_in_model(d: dict) -> bool:
+    """A dependency is met when its actions reached the model (`applied_phases` covers every phase they run in),
+    whatever its status: a finding can be `failed` on a test while its change is in the model."""
+    applied = d.get("applied_phases")
+    if not isinstance(applied, list) or not applied:
+        return False
+    done = {int(p) for p in applied if str(p).isdigit()}
+    phases = {action_phase(d, a) for a in d.get("actions") or []} or {_phase_of(d)}
+    return all(p in done for p in phases if p is not None)
 
 
 def pending_actions(f: dict) -> list[dict]:
@@ -3972,8 +4055,9 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
             d = by_id.get(dep)
             if d is None:
                 continue
-            if d.get("status") not in statuses + ("applied", "verified"):
-                warnings.append(f"{f['id']} depends on {dep}, which is {d.get('status')}")
+            if d.get("status") not in statuses + ("applied", "verified") and not _dependency_in_model(d):
+                warnings.append(f"{f['id']} depends on {dep}, which is {d.get('status')}"
+                                + (" and only partly applied" if d.get("applied_phases") else ""))
             elif d.get("status") in statuses and (_phase_of(d) or 0) > (_phase_of(f) or 0):
                 problems.append(f"{f['id']} (phase {_phase_of(f)}) depends on {dep} in a later phase "
                                 f"({_phase_of(d)}); move one of them")
@@ -4663,6 +4747,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--changed-since", help="previous scope.json: probe only what changed since (verify-changes)")
     sp.add_argument("--findings", help="findings.json: also probe objects named by actions of --phases")
     sp.add_argument("--phases", default="", help="comma-separated phases applied this round")
+    sp.add_argument("--probe-type-changes", action="store_true",
+                    help="probe value by value an attribute whose type changed even when its profile shows every "
+                         "value kept (default: listed under type_checks, not probed)")
     sp.add_argument("--period", default="", help="period attribute: metrics are also checked across periods")
     sp.add_argument("--split", default="", help="partner attribute grouped with each object (default: a 3-30 "
                                                 "value attribute)")
@@ -4894,15 +4981,24 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
                                       _load_json(args.findings) if args.findings else None, phases or None)
             attrs = changed["attributes"] if attrs is None else attrs
             mets = changed["metrics"] if mets is None else mets
+        # a type change that kept every value (same count, same range) needs no value-by-value probe: the scope
+        # profiles already answer whether the values parsed; join-paths tests its filter
+        type_checks = type_only_changes(_load_json(args.changed_since), scope) if args.changed_since else {}
+        if type_checks and not args.probe_type_changes and attrs is not None and not args.attributes:
+            attrs = [n for n in attrs if (type_checks.get(n) or {}).get("verdict") != "values kept"]
         out = probe_objects(runner(), args.project, scope, attributes=attrs, metrics=mets, period=args.period,
                             split=args.split, filter_spec=args.filter, where=args.where, max_values=args.max_values,
                             batch=args.batch, log=log)
+        if type_checks:
+            out["type_checks"] = type_checks
         out["sources"] = source_info(scope=args.scope)
         _write_json(args.out, out)
         if _pending(runner):
             return 3
         print(json.dumps({"ok": True, "out": args.out, "attributes": len(out["attributes"]),
-                          "metrics": len(out["metrics"]), "warnings": len(out["warnings"])}, indent=2))
+                          "metrics": len(out["metrics"]), "warnings": len(out["warnings"]),
+                          **({"type_checks": {n: c["verdict"] for n, c in out["type_checks"].items()}}
+                             if out.get("type_checks") else {})}, indent=2))
         return 0
     if args.cmd == "check-lookup":
         return _check_lookup_cmd(args, runner)
@@ -4913,7 +5009,9 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
                                previous=_load_json(args.previous) if args.previous else None, where=args.where,
                                round_no=args.round, max_attributes=args.max_attributes, log=log)
         if args.findings:
-            out["earlier_findings"] = resolved_findings(_load_json(args.findings), out["findings"])
+            out["earlier_findings"] = resolved_findings(
+                _load_json(args.findings), out["findings"],
+                out.get("relationships") if args.model_export else None)
         out["sources"] = source_info(scope=args.scope, export=args.model_export)
         _write_json(args.out, out)
         print(json.dumps({"out": args.out, "facts": out["facts"], "unjoined": out["unjoined"],
@@ -5135,7 +5233,8 @@ def _offline(args: argparse.Namespace) -> int:
             return 2
         out = build_plan(_load_json(args.findings), model_id=args.model_id, statuses=statuses,
                          python=args.python, quoting=args.quoting, project=args.project, bank=args.bank,
-                         bundle_dir=args.bundle_dir)
+                         bundle_dir=args.bundle_dir or (f"{BUNDLE_ROOT}/{slug}"
+                                                        if (slug := assessment_slug(args.findings)) else None))
         _write_json(args.out, out)
         base = os.path.dirname(os.path.abspath(args.out))   # stands for the repo root: paths are relative to it
         for rel, content in (out.get("files") or {}).items():   # spec files the commands read (relative paths)
