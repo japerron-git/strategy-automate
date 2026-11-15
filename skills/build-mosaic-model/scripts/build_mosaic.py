@@ -6058,7 +6058,7 @@ def column_type_table_patch(table: dict, targets: dict[str, tuple[str, str, str]
         if c.get("dataType") == new and c.get("format", "") == fmt and not lagging:
             same.append(c["columnName"])
             continue
-        written, kept = [], []
+        written, kept, was = [], [], {}
         for node in nodes:
             col = next((x for x in node.get("columns") or []
                         if (cid and x.get("id") == cid) or (not cid and str(x.get("name", "")).casefold() == key)),
@@ -6069,13 +6069,20 @@ def column_type_table_patch(table: dict, targets: dict[str, tuple[str, str, str]
             if any(_op_names_column(op, c["columnName"], cid) for op in node.get("operations") or []):
                 kept.append(f"{kind} ({(col.get('dataType') or {}).get('type')}, made by its operation)")
                 continue
+            was[kind] = (col.get("dataType") or {}).get("type")
             col["dataType"] = dict(new)
             col["format"] = fmt
             written.append(kind)
         if not written:
             die(f"{c['columnName']}: no pipeline node to write the type on")
         where = "+".join(written) + (f"; kept {', '.join(kept)}: check by hand" if kept else "")
-        changed.append((c["columnName"], (c.get("dataType") or {}).get("type"), new["type"], fmt, where))
+        old = (c.get("dataType") or {}).get("type")
+        # "from" is the table column's type, plus any node that had another (a source still a number under a
+        # wrangle step that made the column text)
+        other = {k: v for k, v in was.items() if v != old}
+        if other:
+            old = f"{old} ({', '.join(f'{k}: {v}' for k, v in other.items())})"
+        changed.append((c["columnName"], old, new["type"], fmt, where))
         c["dataType"] = dict(new)
         if fmt:
             c["format"] = fmt

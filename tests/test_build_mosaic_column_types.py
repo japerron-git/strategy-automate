@@ -348,7 +348,8 @@ class WrangledPipelineTests(unittest.TestCase):
     def test_column_made_by_an_operation_keeps_its_wrangle_type(self):
         pt, changed, _ = bm.column_type_table_patch(_wrangled_table(op_on="ZB CODE"),
                                                     bm.column_type_targets([["ZB CODE", "text"]], None))
-        ((col, _old, new, _fmt, where),) = changed
+        ((col, old, new, _fmt, where),) = changed
+        self.assertEqual(old, "utf8_char (source: integer)")      # not "utf8_char -> utf8_char"
         self.assertTrue(where.startswith("source; kept wrangle"))
         self.assertIn("check by hand", where)
         nodes = bm._pipeline_nodes(json.loads(pt["pipeline"]))
