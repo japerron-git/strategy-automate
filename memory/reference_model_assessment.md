@@ -201,6 +201,19 @@ Resolved:
   different exports, and marks a lookup "out of date" when its table is no longer in the model.
 - *Questions out of approved findings:* `check --findings` warns about a manual step that is a question
   for someone; `plan` counts manual steps per phase.
+- *Where apply files go:* `plan --bundle-dir` (default `ignore/apply/<model-slug>/`) writes every spec
+  there and copies the lookup CSVs to its `lookups/`; `powershell_plan.py` writes the scripts and
+  `plan_id.txt` there, each script changes to the repo root from `$PSScriptRoot`, stale phase scripts are
+  removed, and an out-dir outside `ignore/` needs `--allow-outside-ignore`. `.gitignore` backstops the old
+  root paths.
+- *The same action from two findings:* `plan` writes a relationship once (the step names both findings);
+  the same pair with another type, or in reverse, is a plan problem. A finding fixed by another's action
+  takes `covered_by: <id>` and no actions: no step, verified by its own tests or checks.
+- *Saved yyyyMM filters on a column that became a date:* `references` rewrites them to
+  `"<date>" = DATE 'yyyy-MM-01'` (also `<`, `>`, `BETWEEN`, `IN`) while there is no month attribute, then
+  to `"<date> (month)__id" = yyyyMM` once time attributes add it (reason kind `model_change`).
+- *Previewing a phase without the tenant:* `set-column-types`, `wire-relationships` and `rename-describe`
+  take `--from-export <export.json>`: a dry run answered from the file, any write refused.
 
 ## Question levels
 

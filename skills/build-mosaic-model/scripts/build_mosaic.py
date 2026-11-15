@@ -4053,6 +4053,21 @@ def infer_relationship_table(parent_full: dict, p_tids, c_tids, tables_by_name: 
                   f"relationship_table")
 
 
+def dedupe_wire_hints(hints: list[dict]) -> tuple[list[dict], list[dict]]:
+    """The same relationship listed twice (two findings asking for it) is one relationship, not a role-playing
+    secondary: keep the first copy."""
+    seen, kept, dupes = set(), [], []
+    for h in hints:
+        key = tuple(str(h.get(k) or "").strip().casefold()
+                    for k in ("parent_attribute", "child_attribute", "relationship_table", "type"))
+        if isinstance(h, dict) and key in seen:
+            dupes.append(h)
+            continue
+        seen.add(key)
+        kept.append(h)
+    return kept, dupes
+
+
 def cmd_wire_relationships(m: MSTR, args):
     """Wire attribute relationships with step-3/step-5 validation.
 
@@ -4074,6 +4089,10 @@ def cmd_wire_relationships(m: MSTR, args):
     if not hints:
         die("wire-relationships: no relationships found in --hints file.")
 
+    hints, dupes = dedupe_wire_hints(hints)
+    for d in dupes:
+        print(f"  = duplicate hint {d.get('parent_attribute')}→{d.get('child_attribute')} listed once",
+              file=sys.stderr)
     # Role-playing dimension detection: when multiple hints share the same
     # (parent_attribute, relationship_table) pair, the second+ hint is a
     # role-playing secondary. Log them explicitly rather than silently
@@ -6111,6 +6130,32 @@ def _tokenized_exprs(exprs: list[dict], cols: dict[str, tuple[str, str]]) -> lis
     return out
 
 
+_TIME_ROLES = ("day", "week", "month", "quarter", "year")
+
+
+def date_role(type_name: str, date_format: str, current: str | None) -> str | None:
+    """A date form's semantic role follows the grain of its date format, as Studio sets it: a full date
+    (yyyy-MM-dd) is "date", a yyyyMM month is "month" (seen in Studio exports), a year alone "year". A
+    quarter format maps to "quarter" (not yet seen in Studio). A role already finer than "date" (a time grain)
+    is kept rather than downgraded to "date"."""
+    if type_name not in ("date", "timestamp"):
+        return current
+    fmt = date_format or ""
+    if type_name == "timestamp" or "d" in fmt or not fmt:
+        role = "date"
+    elif "Q" in fmt:
+        role = "quarter"
+    elif "M" in fmt:
+        role = "month"
+    elif "y" in fmt:
+        role = "year"
+    else:
+        role = "date"
+    if role == "date" and current in _TIME_ROLES:
+        return current
+    return role
+
+
 def column_type_object_writes(model: dict, mid: str, cols: dict[str, tuple[str, str]],
                               targets: dict[str, tuple[str, str, str]], get) -> tuple[list[tuple], list[str]]:
     """Attribute forms and fact metrics that read a target column get the same type. -> (writes, notes);
@@ -6135,12 +6180,12 @@ def column_type_object_writes(model: dict, mid: str, cols: dict[str, tuple[str, 
                 col = _simple_column(f["expressions"][0]["expression"].get("text"))
                 if col and col.casefold() in targets:
                     t = targets[col.casefold()][1]
-                    role = "date" if t in ("date", "timestamp") else f.get("semanticRole")
+                    role = date_role(t, targets[col.casefold()][2], f.get("semanticRole"))
                     if f.get("dataType") != COLUMN_TYPES[t] or f.get("displayFormat") != _FORM_DISPLAY[t] \
                             or f.get("semanticRole") != role:
                         need = True
                     f["dataType"], f["displayFormat"] = dict(COLUMN_TYPES[t]), _FORM_DISPLAY[t]
-                    if role:   # Studio gives a date form the "date" role (an integer yyyyMM had "month")
+                    if role:
                         f["semanticRole"] = role
                 f["expressions"] = ex
             forms.append(f)
@@ -6251,6 +6296,10 @@ def cmd_set_column_types(m: MSTR, args):
         # the table and every table joined on its retyped columns change together: the join's two sides agree
         _patch_in_changeset(m, table_writes, "tables")
     writes, notes = column_type_object_writes(model, mid, cols, targets, get)
+    # a column a wrangle operation produces keeps that step's type: list it with the other checks
+    notes = [f"{tinfo['name']}.{c}: {w}" for c, _o, _n, _f, w in changed if "check by hand" in w] + \
+        [f"{j['table']}.{j['column']}: {j['written_on']}" for j in joined_changed if "check by hand" in j["written_on"]] \
+        + notes
     for n in notes:
         print(f"  ! {n}", file=sys.stderr)
     if writes and not args.dry_run:
@@ -7560,6 +7609,7 @@ def build_parser():
                     help="OVERWRITE existing relationships on each child attribute "
                          "(destructive — wipes incoming rels too). Default is "
                          "merge-aware: fetch existing, dedupe, PUT the union.")
+    sp.add_argument("--from-export", help="offline dry run against a model export file (export-model): no sign-in, nothing written")
 
     sp = sub.add_parser("merge-attributes",
         help="Conform differently-named FK columns by merging child expressions "
@@ -7749,6 +7799,7 @@ def build_parser():
     sp.add_argument("--model-id", required=True)
     sp.add_argument("--spec", required=True, help="JSON file with the items")
     sp.add_argument("--dry-run", action="store_true", help="print the changes; open no changeset")
+    sp.add_argument("--from-export", help="offline dry run against a model export file (export-model): no sign-in, nothing written")
 
     sp = sub.add_parser("add-time-attributes",
         help="Time attributes (year, quarter, month, week, day intervals) on date or timestamp attributes, in one "
@@ -7820,6 +7871,7 @@ def build_parser():
                     help="don't retype the matching key column of lookup/mapping tables joined through the same "
                          "attribute (by default they take the same type, or the join breaks)")
     sp.add_argument("--dry-run", action="store_true", help="print the changes; open no changeset")
+    sp.add_argument("--from-export", help="offline dry run against a model export file (export-model): no sign-in, nothing written")
 
     sp = sub.add_parser("patch-fact-metrics",
         help="Set aggregation function and/or number format on many fact metrics in one changeset, "
@@ -7846,13 +7898,95 @@ def build_parser():
 _SECRET_FLAGS = ("--password", "--auth-token", "--identity-token", "--session-cookie", "--ingress-cookie")
 
 
+class _OfflineResponse:
+    def __init__(self, status: int, body: Any = None, text: str = ""):
+        self.status_code, self._body = status, body
+        self.ok = 200 <= status < 300
+        self.text = text or (json.dumps(body) if body is not None else "")
+        self.headers: dict = {}
+
+    def json(self):
+        return self._body
+
+
+class ExportClient:
+    """An offline stand-in for MSTR that answers from a model export file (export-model): the model export,
+    its attribute, fact metric, metric and table lists, and each object by id. Any write is refused, so the
+    command can only dry-run: a plan's steps can be checked before anyone signs in."""
+
+    def __init__(self, path: str):
+        with open(path, encoding="utf-8") as f:
+            self.export = json.load(f)
+        self.model = (self.export.get("model") or [{}])[0] if isinstance(self.export.get("model"), list) \
+            else (self.export.get("model") or self.export)
+        self.verbose = False
+        self.calls: list[tuple[str, str]] = []
+        self.base, self.s = "", self          # code that calls m.s.get(f"{m.base}{path}") reads the file too
+        self.open_changesets: list = []
+
+    def logout(self):
+        return None
+
+    def login(self, *a, **k):
+        return None
+
+    def _objects(self, kind: str) -> list[dict]:
+        return list(self.model.get(kind) or [])
+
+    def get(self, path: str, params: dict | None = None, **k):
+        self.calls.append(("GET", path))
+        parts = path.rstrip("/").split("/")
+        kinds = {"attributes": "attributes", "factMetrics": "factMetrics", "metrics": "metrics", "tables": "tables"}
+        if parts[-1] in kinds:                                   # a list: everything on the first page
+            items = self._objects(kinds[parts[-1]]) if not (params or {}).get("offset") else []
+            return _OfflineResponse(200, {parts[-1]: items, "total": len(self._objects(kinds[parts[-1]]))})
+        if len(parts) >= 2 and parts[-2] in kinds:
+            oid = parts[-1]
+            obj = next((o for o in self._objects(kinds[parts[-2]])
+                        if (o.get("information") or {}).get("objectId") == oid or o.get("id") == oid), None)
+            if obj is None:
+                return _OfflineResponse(404, {"message": f"{oid} is not in the export"})
+            if parts[-2] == "attributes":                       # its relationships, from the export's hierarchy
+                rels = [r for r in ((self.model.get("hierarchy") or {}).get("relationships") or [])
+                        if oid in ((r.get("parent") or {}).get("objectId"), (r.get("child") or {}).get("objectId"))]
+                obj = {**obj, "relationships": obj.get("relationships") or rels}
+            return _OfflineResponse(200, obj)
+        if len(parts) >= 2 and parts[-2] == "dataModels":
+            return _OfflineResponse(200, {k: v for k, v in self.model.items() if k == "information"})
+        return _OfflineResponse(404, {"message": f"offline: {path} is not answered from the export"})
+
+    def post(self, path: str, **k):
+        self.calls.append(("POST", path))
+        if path.rstrip("/").endswith("/export"):
+            return _OfflineResponse(200, {"model": [self.model]})
+        die(f"offline (--from-export): no write is made ({path})")
+
+    def _refuse(self, method: str, path: str, **k):
+        die(f"offline (--from-export): no write is made ({method} {path})")
+
+    def put(self, path, **k):
+        self._refuse("PUT", path)
+
+    def patch(self, path, **k):
+        self._refuse("PATCH", path)
+
+    def delete(self, path, **k):
+        self._refuse("DELETE", path)
+
+
 def main():
     args = build_parser().parse_args()
     if any(a.split("=", 1)[0] in _SECRET_FLAGS for a in sys.argv[1:]):
         print("[auth] WARN: secrets passed as command-line flags are visible to other processes (ps) and "
               "shell history; use the MSTR_* environment variables or --auth-method sso instead.",
               file=sys.stderr)
-    m = MSTR(args)
+    if getattr(args, "from_export", None):
+        # offline: answer from a model export, dry run only, no sign-in
+        m = ExportClient(args.from_export)
+        args.dry_run = True
+        print(f"[offline] answering from {args.from_export}; dry run only, nothing is written", file=sys.stderr)
+    else:
+        m = MSTR(args)
     t0 = time.monotonic()
     try:
         {

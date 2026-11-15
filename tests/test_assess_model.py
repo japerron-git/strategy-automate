@@ -1086,9 +1086,9 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         (p3,) = plan["phases"]
         (step,) = p3["steps"]
         self.assertEqual(step["apply"]["argv"][2:], ["wire-relationships", "--model-id", "MID", "--hints",
-                                                     "specs/relationships.json"])
+                                                     "ignore/apply/model/specs/relationships.json"])
         self.assertEqual(step["dry_run"]["argv"][-1], "--dry-run")
-        self.assertEqual([r["child_attribute"] for r in plan["files"]["specs/relationships.json"]["relationships"]],
+        self.assertEqual([r["child_attribute"] for r in plan["files"]["ignore/apply/model/specs/relationships.json"]["relationships"]],
                          ["store", "month"])
         bad = am.build_plan({"findings": [_finding("F1", "relationship", actions=[{"kind": "wire_relationships",
             "args": {"relationships": [{"child_attribute": "b", "type": "many"}]}}])]}, model_id="MID")
@@ -1116,8 +1116,8 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
             "metrics": [{"name": "rate", "function": "avg"}]}}])]}
         plan = am.build_plan(doc, model_id="MID")
         (step,) = plan["phases"][0]["steps"]
-        self.assertEqual(step["apply"]["argv"][-2:], ["--spec", "specs/F7_fact_metrics.json"])
-        self.assertEqual(plan["files"]["specs/F7_fact_metrics.json"], {"metrics": [{"name": "rate", "function": "avg"}]})
+        self.assertEqual(step["apply"]["argv"][-2:], ["--spec", "ignore/apply/model/specs/F7_fact_metrics.json"])
+        self.assertEqual(plan["files"]["ignore/apply/model/specs/F7_fact_metrics.json"], {"metrics": [{"name": "rate", "function": "avg"}]})
         self.assertNotIn("spec", doc["findings"][0]["actions"][0]["args"])       # the input is left alone
 
     def test_display_column_as_attribute_is_a_warning(self):
@@ -1138,7 +1138,7 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
                 "metrics": [{"name": "rate", "function": "avg"}]}}])]}, f)
         with contextlib.redirect_stdout(io.StringIO()):
             am.main(["plan", "--findings", fp, "--model-id", "MID", "--out", os.path.join(d, "change_plan.json")])
-        with open(os.path.join(d, "specs", "F7_fact_metrics.json"), encoding="utf-8") as f:
+        with open(os.path.join(d, "ignore", "apply", "model", "specs", "F7_fact_metrics.json"), encoding="utf-8") as f:
             self.assertEqual(json.load(f)["metrics"][0]["function"], "avg")
 
     def test_formula_attribute_needs_the_users_request_and_warns_dependents(self):
@@ -1207,9 +1207,9 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         self.assertEqual([st["kind"] for st in steps], ["change_column_type", "add_lookup_table", "change_column_type"])
         merged = steps[1]
         self.assertEqual((merged["finding"], merged["title"]), ("F2, F3", "Add 3 lookup tables"))
-        self.assertIn("(1) lookups/status_lookup.csv -> key 'status'; attributes: status group; forms: status description.",
+        self.assertIn("(1) ignore/apply/model/lookups/status_lookup.csv -> key 'status'; attributes: status group; forms: status description.",
                       merged["manual"])
-        self.assertIn("(2) lookups/region_lookup.csv -> key 'region'; forms: region name; key column typed like 'region'.",
+        self.assertIn("(2) ignore/apply/model/lookups/region_lookup.csv -> key 'region'; forms: region name; key column typed like 'region'.",
                       merged["manual"])
         self.assertIn("set by the commands right after this step", merged["manual"])
         self.assertEqual(merged["risks"], ["map to the existing attribute"])
@@ -1238,8 +1238,8 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         self.assertEqual([st["kind"] for st in p2["steps"]], ["note"])
         (step,) = p6["steps"]
         self.assertEqual(step["apply"]["argv"][2:], ["rename-describe", "--model-id", "MID", "--spec",
-                                                     "specs/rename_describe.json"])
-        self.assertEqual([i["current_name"] for i in plan["files"]["specs/rename_describe.json"]["items"]],
+                                                     "ignore/apply/model/specs/rename_describe.json"])
+        self.assertEqual([i["current_name"] for i in plan["files"]["ignore/apply/model/specs/rename_describe.json"]["items"]],
                          ["costs", "region"])
         bad = am.build_plan({"findings": [_finding("F1", "description", actions=[{"kind": "rename_describe", "args": {
             "items": [{"object_type": "derived", "current_name": "x", "description": "y" * 251}]}}])]}, model_id="MID")
@@ -1269,7 +1269,7 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         plan = am.build_plan({"findings": [f1]}, model_id="MID")
         self.assertEqual(plan["problems"], [])
         self.assertEqual([p["phase"] for p in plan["phases"]], [6])                  # only the part still to do
-        self.assertEqual(plan["files"]["specs/rename_describe.json"]["items"][0]["current_name"], "latest flag")
+        self.assertEqual(plan["files"]["ignore/apply/model/specs/rename_describe.json"]["items"][0]["current_name"], "latest flag")
         self.assertEqual(plan["not_planned"], [])
         self.assertTrue(any("still planned" in w for w in plan["warnings"]))
         done = am.build_plan({"findings": [dict(f1, applied_phases=[5, 6])]}, model_id="MID")
@@ -1754,7 +1754,7 @@ class TimeAttributePlanTests(unittest.TestCase):
         steps = {p["phase"]: [s["kind"] for s in p["steps"] if s["kind"] != "note"] for p in plan["phases"]}
         self.assertEqual(steps[2], ["change_column_type"])
         self.assertIn("add_time_attributes", steps[3])
-        self.assertEqual(plan["files"]["specs/time_attributes.json"],
+        self.assertEqual(plan["files"]["ignore/apply/model/specs/time_attributes.json"],
                          {"items": [{"attribute": "reporting period", "intervals": ["year", "quarter", "month"]}]})
         bad = am.build_plan({"findings": [_finding("F1", "data_type", actions=[
             {"kind": "add_time_attributes", "args": {"attribute": "x", "intervals": ["fortnight"]}}])]}, model_id="MID")
@@ -2749,3 +2749,111 @@ class TypeChangeGuardTests(unittest.TestCase):
     def test_dates_shown_as_text_filter_as_dates(self):
         self.assertEqual(am._typed_literal("2018-12-01", "bigint"), "DATE '2018-12-01'")   # an older scope's type
         self.assertEqual(am._typed_literal("2018-12-01", "varchar"), "'2018-12-01'")
+
+
+class BundleDirTests(unittest.TestCase):
+    def test_specs_and_lookup_csvs_go_under_ignore(self):
+        d = tempfile.mkdtemp(prefix="bundle-")
+        self.addCleanup(shutil.rmtree, d, True)
+        src = os.path.join(d, "lookups", "status.csv")
+        os.makedirs(os.path.dirname(src))
+        with open(src, "w", encoding="utf-8") as f:
+            f.write("CODE,LABEL\n01,a\n")
+        doc = {"model": "Store Sales", "findings": [
+            {"id": "F1", "category": "lookup", "status": "approved", "tests": ["Q1"], "actions": [
+                {"kind": "add_lookup_table", "args": {"csv": src, "key_attribute": "status"}}]},
+            {"id": "F2", "category": "description", "status": "approved", "tests": ["Q1"], "actions": [
+                {"kind": "rename_describe", "args": {"items": [{"object_type": "attribute", "current_name": "x",
+                                                                "description": "d"}]}}]}]}
+        fp = os.path.join(d, "findings.json")
+        with open(fp, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            am.main(["plan", "--findings", fp, "--model-id", "MID", "--out", os.path.join(d, "change_plan.json")])
+        with open(os.path.join(d, "change_plan.json"), encoding="utf-8") as f:
+            plan = json.load(f)
+        self.assertEqual(plan["bundle_dir"], "ignore/apply/store-sales")
+        self.assertTrue(os.path.exists(os.path.join(d, "ignore", "apply", "store-sales", "lookups", "status.csv")))
+        self.assertTrue(os.path.exists(os.path.join(d, "ignore", "apply", "store-sales", "specs", "rename_describe.json")))
+        text = json.dumps(plan["phases"])
+        self.assertIn("ignore/apply/store-sales/lookups/status.csv", text)
+        self.assertNotIn('"specs/', text)
+
+
+class DateFilterRewriteTests(unittest.TestCase):
+    OLD = {"attributes": [{"name": "reporting period", "type": "bigint"}, {"name": "region", "type": "varchar"}]}
+    MID = {"attributes": [{"name": "reporting period", "type": "date"}, {"name": "region", "type": "varchar"}]}
+    NEW = {"attributes": [{"name": "reporting period", "type": "date"}, {"name": "region", "type": "varchar"},
+                          {"name": "reporting period (month)__id", "type": "bigint"}]}
+    SQL = ('SELECT COUNT("x") FROM [[MODEL]] WHERE "reporting period" = 202201 AND "region" = \'202201\' '
+           'AND "reporting period" BETWEEN 202101 AND 202112 OR "reporting period" IN (202111, 202112)')
+
+    def test_interim_then_month_id(self):
+        (c,) = am.date_filter_changes(self.OLD, self.MID)
+        self.assertEqual((c["change"], c["month_id"]), ("became_date", None))
+        sql, n = am.rewrite_date_filters(self.SQL, c)
+        self.assertEqual(n, 3)
+        self.assertIn('"reporting period" = DATE \'2022-01-01\'', sql)
+        self.assertIn("BETWEEN DATE '2021-01-01' AND DATE '2021-12-01'", sql)
+        self.assertIn("IN (DATE '2021-11-01', DATE '2021-12-01')", sql)
+        self.assertIn('"region" = \'202201\'', sql)                        # another attribute, a literal: kept
+        (c2,) = am.date_filter_changes(self.MID, self.NEW)
+        self.assertEqual(c2["change"], "gained_month")
+        sql2, n2 = am.rewrite_date_filters('WHERE "reporting period" = DATE \'2022-01-01\'', c2)
+        self.assertEqual((sql2, n2), ('WHERE "reporting period (month)__id" = 202201', 1))
+
+    def test_straight_to_month_id_when_both_arrive(self):
+        (c,) = am.date_filter_changes(self.OLD, self.NEW)
+        sql, _ = am.rewrite_date_filters('WHERE "reporting period" >= 202101', c)
+        self.assertEqual(sql, 'WHERE "reporting period (month)__id" >= 202101')
+
+    def test_bank_rewrite_with_history(self):
+        bank = {"model": "M", "questions": [{"id": "Q1", "level": 1, "question": "q",
+                                             "sql": 'SELECT 1 FROM {{MODEL}} WHERE "reporting period" = 202201'}]}
+        done = am.apply_date_filter_changes(bank, am.date_filter_changes(self.OLD, self.MID), round_no=2, apply=True)
+        self.assertEqual(len(done), 1)
+        self.assertEqual(bank["questions"][0]["sql_history"][-1]["reason_kind"], "type_change")
+
+
+class PlanMergeTests(unittest.TestCase):
+    REL = {"parent_attribute": "Flag", "child_attribute": "Period", "relationship_table": "facts",
+           "type": "one_to_many"}
+
+    def _plan(self, *findings):
+        return am.build_plan({"findings": list(findings)}, model_id="MID")
+
+    def _wire(self, fid, *rels):
+        return _finding(fid, "relationship", actions=[{"kind": "wire_relationships",
+                                                       "args": {"relationships": [dict(r) for r in rels]}}])
+
+    def test_the_same_relationship_from_two_findings_is_written_once(self):
+        plan = self._plan(self._wire("J1", self.REL), self._wire("L1", dict(self.REL, parent_attribute="flag")))
+        self.assertEqual(plan["problems"], [])
+        rels = plan["files"]["ignore/apply/model/specs/relationships.json"]["relationships"]
+        self.assertEqual(len(rels), 1)
+        (step,) = [st for ph in plan["phases"] for st in ph["steps"] if st["kind"] == "wire_relationships"]
+        self.assertEqual(step["finding"], "J1, L1")
+
+    def test_a_different_type_or_direction_is_a_problem(self):
+        plan = self._plan(self._wire("J1", self.REL), self._wire("L1", dict(self.REL, type="many_to_many")))
+        self.assertTrue(any("keep one" in p for p in plan["problems"]))
+        rev = dict(self.REL, parent_attribute="Period", child_attribute="Flag")
+        plan = self._plan(self._wire("J1", self.REL), self._wire("L1", rev))
+        self.assertTrue(any("reverse" in p for p in plan["problems"]))
+
+    def test_a_covered_finding_emits_no_step(self):
+        plan = self._plan(self._wire("J1", self.REL), _finding("L1", "relationship", actions=[], covered_by="J1"))
+        kinds = [st["kind"] for ph in plan["phases"] for st in ph["steps"]]
+        self.assertNotIn("manual", kinds)
+        self.assertEqual(kinds.count("wire_relationships"), 1)
+
+    def test_check_findings_validates_covered_by(self):
+        doc = {"findings": [self._wire("J1", self.REL),
+                            _finding("L1", "relationship", actions=[], covered_by="NOPE"),
+                            _finding("L2", "relationship", covered_by="J1"),
+                            _finding("D1", "relationship", status="declined"),
+                            _finding("L3", "relationship", actions=[], covered_by="D1")]}
+        res = am.check_findings(doc)
+        self.assertTrue(any("L1" in p and "isn't a finding" in p for p in res["problems"]))
+        self.assertTrue(any("L2" in w and "actions of its own" in w for w in res["warnings"]))
+        self.assertTrue(any("L3" in w and "declined" in w for w in res["warnings"]))

@@ -33,6 +33,7 @@ import io
 import json
 import os
 import re
+import shutil
 import shlex
 import sys
 import time
@@ -83,7 +84,7 @@ MERGED_NOTES = {"source_change": "Source change done in the phase {phase} rebuil
                 "wire_relationships": "Relationships declared in phase {phase} (wire-relationships)",
                 "add_time_attributes": "Time attributes added in phase {phase} (add-time-attributes)",
                 "rename_describe": "Names and descriptions set in phase {phase} (rename-describe)"}
-TIME_ATTRIBUTES_SPEC = "specs/time_attributes.json"
+TIME_ATTRIBUTES_SPEC = "specs/time_attributes.json"     # under the plan's bundle dir (see bundle_path)
 RENAME_DESCRIBE_SPEC = "specs/rename_describe.json"
 # A republish of a large model runs well past publish's 180 s default; the wait ends as soon as every table is done.
 PUBLISH_WAIT = ["--poll-seconds", "1800"]
@@ -91,6 +92,17 @@ DESCRIPTION_LIMIT = 250
 _TEST_STEP = re.compile(r"^\s*(after (the )?(republish|reload|type change)\w*,?\s*)?(re-?)?(test|check|verify|confirm)\b", re.I)
 RELATIONSHIP_TYPES = ("one_to_many", "many_to_many", "one_to_one")
 RELATIONSHIP_HINTS = "specs/relationships.json"   # written into the bundle by plan; scripts run from the repo root
+# The apply bundle (scripts, specs, lookup CSVs) lives under ignore/, which git never commits: specs carry the
+# model's object id and CSVs carry model data. Paths in commands are relative to the repo root.
+BUNDLE_ROOT = "ignore/apply"
+
+
+def default_bundle_dir(model: str) -> str:
+    return f"{BUNDLE_ROOT}/{_slug(model or 'model').replace('_', '-')}"
+
+
+def bundle_path(bundle: str, rel: str) -> str:
+    return f"{bundle.rstrip('/')}/{rel}" if bundle else rel
 VERIFIED_FORMULA_FUNCTIONS = {"addmonths", "year", "monthsbetween", "case"}   # create-formula-attribute, accepted live
 MISSING_FORMULA_FUNCTIONS = {"sign"}      # refused on a tenant ("Searching for '<name>' resulted in no matches")
 _DISPLAY_COLUMN = re.compile(r"\b(description|desc|name|label|title|text)$", re.I)
@@ -1691,6 +1703,94 @@ def apply_reference_changes(bank: dict, changes: list[dict], *, round_no: int | 
                     continue
             rewritten.append(entry)
     return {"rewritten": rewritten, "unresolved": unresolved, "applied": apply}
+
+
+_YYYYMM = r"(?:19|20)\d{2}(?:0[1-9]|1[0-2])"
+
+
+def date_filter_changes(old_scope: dict, new_scope: dict) -> list[dict[str, Any]]:
+    """Attributes whose filters in saved SQL must change form: one that became a date (an integer yyyyMM
+    compared with 202201 now errors, "date = integer"), and a date that gained a month time attribute (filters
+    move to "<date> (month)__id", which keeps the yyyyMM number and groups correctly)."""
+    old = {a["name"].casefold(): a for a in old_scope.get("attributes") or []}
+    new = {a["name"].casefold(): a for a in new_scope.get("attributes") or []}
+    out = []
+    for k, a in new.items():
+        if not str(a.get("type") or "").lower().startswith("date"):
+            continue
+        month = f"{a['name']} (month)__id"
+        has_month = month.casefold() in new
+        was = old.get(k)
+        if was and not str(was.get("type") or "").lower().startswith("date"):
+            out.append({"attribute": a["name"], "change": "became_date", "month_id": month if has_month else None})
+        elif was and has_month and month.casefold() not in old:
+            out.append({"attribute": a["name"], "change": "gained_month", "month_id": month})
+    return out
+
+
+def rewrite_date_filters(sql: str, change: dict) -> tuple[str, int]:
+    """Rewrite comparisons of one attribute with yyyyMM numbers (or, once its month attribute exists, with
+    first-of-month dates): `"a" = 202201`, `<`, `>=`, `BETWEEN 202101 AND 202112`, `IN (202111, 202112)`."""
+    name = change["attribute"]
+    col = '"' + re.escape(name) + '"'
+    n = 0
+    parts = _SQL_LITERAL.split(sql)
+
+    def num_lit(v: str) -> str:
+        return v if change["month_id"] else f"DATE '{v[:4]}-{v[4:6]}-01'"
+    target = quote_ident(change["month_id"]) if change["month_id"] else quote_ident(name)
+    for i in range(0, len(parts), 2):
+        seg = parts[i]
+        if change["change"] == "gained_month":
+            continue   # dates live in the literal parts; handled below
+        seg, k1 = re.subn(col + r"(\s*(?:=|<>|!=|<=|>=|<|>)\s*)(" + _YYYYMM + r")\b",
+                          lambda m: target + m.group(1) + num_lit(m.group(2)), seg, flags=re.I)
+        seg, k2 = re.subn(col + r"(\s+BETWEEN\s+)(" + _YYYYMM + r")(\s+AND\s+)(" + _YYYYMM + r")\b",
+                          lambda m: target + m.group(1) + num_lit(m.group(2)) + m.group(3) + num_lit(m.group(4)),
+                          seg, flags=re.I)
+        seg, k3 = re.subn(col + r"(\s+IN\s*\()([^)]*)\)",
+                          lambda m: target + m.group(1) + re.sub(_YYYYMM, lambda x: num_lit(x.group(0)), m.group(2)) + ")"
+                          if re.search(_YYYYMM, m.group(2)) else m.group(0), seg, flags=re.I)
+        parts[i] = seg
+        n += k1 + k2 + k3
+    out = "".join(parts)
+    if change["change"] == "gained_month":
+        # "a" op DATE 'yyyy-MM-01' -> "a (month)__id" op yyyyMM
+        out, k = re.subn(col + r"(\s*(?:=|<>|!=|<=|>=|<|>)\s*)DATE\s*'(\d{4})-(\d{2})-01'",
+                         lambda m: quote_ident(change["month_id"]) + m.group(1) + m.group(2) + m.group(3), out,
+                         flags=re.I)
+        n += k
+    return out, n
+
+
+def apply_date_filter_changes(bank: dict, changes: list[dict], *, round_no: int | None = None,
+                              apply: bool = False) -> list[dict[str, Any]]:
+    """Saved SQL (question, best answer, expected) rewritten for date_filter_changes: reason kind type_change
+    for question SQL, model_change for best answers (the model changed the column's type)."""
+    done = []
+    for q in bank.get("questions") or []:
+        for where, text in _saved_sql(q):
+            new, n = text, 0
+            for c in changes:
+                new, k = rewrite_date_filters(new, c)
+                n += k
+            if not n:
+                continue
+            done.append({"question": q.get("id"), "where": where, "rewrites": n, "sql": new})
+            if not apply:
+                continue
+            reason = "date filter rewritten: " + ", ".join(f"{c['attribute']} {c['change'].replace('_', ' ')}"
+                                                           for c in changes)
+            if where == "question":
+                set_question_sql(bank, q["id"], sql=new, reason_kind="type_change", reason=reason, round_no=round_no)
+            elif where == "best_answer":
+                set_best_answer(bank, q["id"], sql=new, reason_kind="model_change", reason=reason, round_no=round_no)
+            else:
+                exp = q["expected"]
+                exp.setdefault("sql_history", []).append({"sql": exp.get("sql"), "until_round": round_no,
+                                                          "reason_kind": "type_change", "reason": reason})
+                exp["sql"] = new
+    return done
 
 
 def integrity_finding(fid: str, title: str, category: str, observed: str, recommendation: str, *,
@@ -3735,7 +3835,7 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         need("csv", "key_attribute")
         if a.get("extends_table"):   # replacing an existing table's data: it must keep every column read from it
             keep = [str(c) for c in a.get("keep_columns") or []]
-            cols = [str(c) for c in a.get("columns") or []] or _csv_header(str(a.get("csv") or ""), a.get("load_format"))
+            cols = [str(c) for c in a.get("columns") or []] or _csv_header(str(a.get("csv_source") or a.get("csv") or ""), a.get("load_format"))
             if not keep:
                 problems.append(f"{kind}: extends_table needs keep_columns (the columns its attributes read)")
             elif cols:
@@ -3743,7 +3843,7 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
                 if lost:
                     problems.append(f"{kind}: the CSV for '{a['extends_table']}' drops {lost}, which attributes still "
                                     f"read; add them back or the attributes lose their source")
-        cols = [str(c) for c in a.get("columns") or []] or _csv_header(str(a.get("csv") or ""), a.get("load_format"))
+        cols = [str(c) for c in a.get("columns") or []] or _csv_header(str(a.get("csv_source") or a.get("csv") or ""), a.get("load_format"))
         if any(c.strip().lower() == "source" for c in cols):
             problems.append(f"{kind}: {a.get('csv')} has a source column the table doesn't have; move sources to the "
                             f"sources file, then run check-lookup")
@@ -3834,8 +3934,18 @@ def form_base_name(name: str) -> str:
 
 def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, ...] = PLANNED_STATUSES,
                python: str = "python3", quoting: str = "posix", project: str = "",
-               bank: str = "question_bank.json") -> dict[str, Any]:
+               bank: str = "question_bank.json", bundle_dir: str | None = None) -> dict[str, Any]:
     findings_doc = copy.deepcopy(findings_doc)    # inline specs become file paths below; leave the input alone
+    bundle = default_bundle_dir(str(findings_doc.get("model") or "")) if bundle_dir is None else bundle_dir.rstrip("/")
+    copies: dict[str, str] = {}                   # bundle path -> source: lookup CSVs the scripts load
+    for f in findings_doc.get("findings") or []:
+        for a in f.get("actions") or []:
+            ar = a.get("args") or {}
+            if a.get("kind") == "add_lookup_table" and ar.get("csv") and bundle and \
+                    not str(ar["csv"]).replace("\\", "/").startswith(bundle + "/"):
+                dest = bundle_path(bundle, "lookups/" + os.path.basename(str(ar["csv"])))
+                copies[dest] = str(ar["csv"])
+                ar["csv_source"], ar["csv"] = str(ar["csv"]), dest
     problems: list[str] = list(check_findings(findings_doc)["problems"])
     warnings: list[str] = []
     every = findings_doc.get("findings") or []
@@ -3910,12 +4020,32 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
              # seen live: a type change made Strategy re-choose attributes' lookup tables; stop if it did, or if a
              # relationship was lost
              **_reload_guards(python, mid, cmd, f"types_{_slug(table or 'main')}", lookup_changes=True)})
-    rels = [dict(r) for c in merged["wire_relationships"] for r in c.get("relationships") or []
-            if isinstance(r, dict)]
+    rels, seen = [], {}
+    for c in merged["wire_relationships"]:
+        for r in c.get("relationships") or []:
+            if not isinstance(r, dict):
+                continue
+            p_, c_ = str(r.get("parent_attribute") or "").casefold(), str(r.get("child_attribute") or "").casefold()
+            tbl = str(r.get("relationship_table") or "").casefold()
+            typ = str(r.get("type") or "one_to_many").casefold()
+            # two findings naming the same relationship write it once: a second copy reads to wire-relationships
+            # as a role-playing secondary (seen live)
+            if (p_, c_, tbl) in seen:
+                if seen[(p_, c_, tbl)] != typ:
+                    problems.append(f"wire_relationships: {r.get('parent_attribute')} -> {r.get('child_attribute')} "
+                                    f"is planned as {seen[(p_, c_, tbl)]} and as {typ}; keep one")
+                continue
+            if any(k[0] == c_ and k[1] == p_ for k in seen):
+                problems.append(f"wire_relationships: {r.get('parent_attribute')} -> {r.get('child_attribute')} and "
+                                f"its reverse are both planned; keep one direction")
+                continue
+            seen[(p_, c_, tbl)] = typ
+            rels.append(dict(r))
     files: dict[str, Any] = {}
     if merged["wire_relationships"]:
-        files[RELATIONSHIP_HINTS] = {"relationships": rels}
-        argv = [python, BUILD_SCRIPT, "wire-relationships", "--model-id", mid, "--hints", RELATIONSHIP_HINTS]
+        files[bundle_path(bundle, RELATIONSHIP_HINTS)] = {"relationships": rels}
+        argv = [python, BUILD_SCRIPT, "wire-relationships", "--model-id", mid, "--hints",
+                bundle_path(bundle, RELATIONSHIP_HINTS)]
         merged_steps.setdefault(MERGED_KINDS["wire_relationships"], []).append(
             {"finding": ", ".join(dict.fromkeys(c["finding"] for c in merged["wire_relationships"])),
              "title": "Declare attribute relationships", "kind": "wire_relationships",
@@ -3950,8 +4080,10 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                 problems.append(f"rename_describe: attribute '{key}' gets {len(texts)} different descriptions "
                                 f"({', '.join(str(it.get('current_name')) for it in group)}); forms share the "
                                 f"attribute's description, so give it one item")
-        files[RENAME_DESCRIBE_SPEC] = {"items": [{k: v for k, v in it.items() if k != "finding"} for it in items]}
-        argv = [python, BUILD_SCRIPT, "rename-describe", "--model-id", mid, "--spec", RENAME_DESCRIBE_SPEC]
+        files[bundle_path(bundle, RENAME_DESCRIBE_SPEC)] = {"items": [{k: v for k, v in it.items() if k != "finding"}
+                                                                for it in items]}
+        argv = [python, BUILD_SCRIPT, "rename-describe", "--model-id", mid, "--spec",
+                bundle_path(bundle, RENAME_DESCRIBE_SPEC)]
         merged_steps.setdefault(MERGED_KINDS["rename_describe"], []).append(
             {"finding": ", ".join(dict.fromkeys(c["finding"] for c in merged["rename_describe"])),
              "title": "Set names and descriptions", "kind": "rename_describe",
@@ -3960,9 +4092,10 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                        "they refer to objects by id."]})
     if merged["add_time_attributes"]:
         tas = merged["add_time_attributes"]
-        files[TIME_ATTRIBUTES_SPEC] = {"items": [{"attribute": c.get("attribute"), "intervals": c.get("intervals")}
+        files[bundle_path(bundle, TIME_ATTRIBUTES_SPEC)] = {"items": [{"attribute": c.get("attribute"), "intervals": c.get("intervals")}
                                                  for c in tas]}
-        argv = [python, BUILD_SCRIPT, "add-time-attributes", "--model-id", mid, "--spec", TIME_ATTRIBUTES_SPEC]
+        argv = [python, BUILD_SCRIPT, "add-time-attributes", "--model-id", mid, "--spec",
+                bundle_path(bundle, TIME_ATTRIBUTES_SPEC)]
         merged_steps.setdefault(MERGED_KINDS["add_time_attributes"], []).append(
             {"finding": ", ".join(dict.fromkeys(c["finding"] for c in tas)),
              "title": "Add time attributes", "kind": "add_time_attributes",
@@ -4039,7 +4172,7 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         for i, a in enumerate(f.get("actions") or []):
             args = a.get("args") or {}
             if a.get("kind") == "patch_fact_metrics" and isinstance(args.get("metrics"), list) and not args.get("spec"):
-                path = f"specs/{f['id']}_fact_metrics{'_' + str(i + 1) if i else ''}.json"
+                path = bundle_path(bundle, f"specs/{f['id']}_fact_metrics{'_' + str(i + 1) if i else ''}.json")
                 files[path] = {k: args[k] for k in ("presets", "metrics") if k in args}
                 a["args"] = {**args, "spec": path}
 
@@ -4070,6 +4203,8 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         lookups: list[tuple[dict, bool]] = []
         lookup_at, lookup_findings, retypes = None, [], []
         for f in items:
+            if f.get("covered_by") and not f.get("actions"):
+                continue   # another finding's action fixes it; its own check verifies it (verify-changes)
             for action in f.get("actions") or [{"kind": "manual", "steps": f.get("recommendation")}]:
                 kind = action.get("kind")
                 if kind in MERGED_KINDS:
@@ -4187,6 +4322,7 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                                        sort_keys=True, default=str).encode()).hexdigest()[:12]
     return {"version": 1, "model": findings_doc.get("model"), "model_id": model_id or None,
             "generated": time.strftime("%Y-%m-%d"), "statuses_planned": list(statuses), "plan_id": digest,
+            "bundle_dir": bundle, "copies": copies,
             "phases": phases, "files": files, "not_planned": skipped, "problems": problems,
             "warnings": warnings, "unanswered": {str(k): v for k, v in sorted(unanswered.items())}}
 
@@ -4363,6 +4499,15 @@ def check_findings(doc: dict) -> dict[str, Any]:
         if not f.get("tests"):
             if not f.get("checks"):
                 warnings.append(f"{fid}: no tests named")
+        cov = f.get("covered_by")
+        if cov:
+            other = next((g for g in doc.get("findings") or [] if g.get("id") == cov), None)
+            if other is None:
+                problems.append(f"{fid}: covered_by names '{cov}', which isn't a finding")
+            elif f.get("actions"):
+                warnings.append(f"{fid}: covered_by {cov} but it has actions of its own: they still run")
+            elif other.get("status") == "declined" and f.get("status") in PLANNED_STATUSES:
+                warnings.append(f"{fid}: covered_by {cov}, which is declined: nothing will fix it")
         for st in consult_steps(f) if f.get("status") != "declined" else []:
             warnings.append(f"{fid}: a manual step is a question for someone, not a model edit ('{st}'): make it "
                             f"its own finding with needs_answer and no action, so this one holds only steps that run")
@@ -4647,6 +4792,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--python", default="python3", help="interpreter in the generated commands")
     sp.add_argument("--quoting", choices=["posix", "powershell"], default="posix",
                     help="quoting for the display form of each command")
+    sp.add_argument("--bundle-dir", default=None,
+                    help=f"where the plan's specs and lookup CSVs go, relative to the repo root (default "
+                         f"{BUNDLE_ROOT}/<model-slug>; git ignores ignore/)")
 
     sp = sub.add_parser("check", help="validate question bank, findings and domain notes files; with --bank "
                         "and --domain, also check that every use case has questions")
@@ -4894,9 +5042,12 @@ def _offline(args: argparse.Namespace) -> int:
         changes = reference_changes(old, new, export=_load_json(args.model_export) if args.model_export else None,
                                     old_export=_load_json(args.old_model_export) if args.old_model_export else None)
         usage = apply_reference_changes(bank, changes, round_no=args.round, apply=args.apply)
-        if args.apply and usage["rewritten"]:
+        dchanges = date_filter_changes(old, new)
+        dates = apply_date_filter_changes(bank, dchanges, round_no=args.round, apply=args.apply)
+        if args.apply and (usage["rewritten"] or dates):
             _write_json(args.bank, bank)
         out = {"version": 1, "model": new.get("model"), "removed": changes, "usage": usage,
+               "date_filters": {"changes": dchanges, "rewritten": dates},
                "findings": reference_findings(changes, usage, args.round)}
         if getattr(args, "findings", None):
             done = resolved_findings(_load_json(args.findings), out["findings"])
@@ -4904,7 +5055,8 @@ def _offline(args: argparse.Namespace) -> int:
             out["earlier_findings"] = done
         _write_json(args.out, out)
         print(json.dumps({"out": args.out, "names_gone": [c["name"] for c in changes],
-                          "rewritten": len(usage["rewritten"]), "applied": args.apply,
+                          "rewritten": len(usage["rewritten"]), "date_filters_rewritten": len(dates),
+                          "applied": args.apply,
                           "unresolved": usage["unresolved"], "findings": [f["id"] for f in out["findings"]]},
                          indent=2))
         return 0
@@ -4982,15 +5134,21 @@ def _offline(args: argparse.Namespace) -> int:
             print(json.dumps({"ok": False, "problems": [f"unknown status {bad}"]}, indent=2))
             return 2
         out = build_plan(_load_json(args.findings), model_id=args.model_id, statuses=statuses,
-                         python=args.python, quoting=args.quoting, project=args.project, bank=args.bank)
+                         python=args.python, quoting=args.quoting, project=args.project, bank=args.bank,
+                         bundle_dir=args.bundle_dir)
         _write_json(args.out, out)
-        base = os.path.dirname(os.path.abspath(args.out))
+        base = os.path.dirname(os.path.abspath(args.out))   # stands for the repo root: paths are relative to it
         for rel, content in (out.get("files") or {}).items():   # spec files the commands read (relative paths)
             dest = os.path.normpath(os.path.join(base, rel))
             if not dest.startswith(base + os.sep):
                 continue
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             _write_json(dest, content)
+        for rel, src in (out.get("copies") or {}).items():       # lookup CSVs the scripts load, into the bundle
+            dest = os.path.normpath(os.path.join(base, rel))
+            if dest.startswith(base + os.sep) and os.path.exists(src):
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copyfile(src, dest)
         print(json.dumps({"ok": not out["problems"], "out": args.out, "phases": [p["phase"] for p in out["phases"]],
                           "steps": sum(len(p["steps"]) for p in out["phases"]), "files": sorted(out.get("files") or {}),
                           "problems": out["problems"], "warnings": out["warnings"]}, indent=2))

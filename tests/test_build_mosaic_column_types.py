@@ -15,6 +15,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "skills", "build-mosaic-model", "scripts"))
@@ -265,13 +266,14 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(out["aligned"], ["attribute 'Status'"])
         self.assertIn("republish", out["next"])
 
-    def test_a_date_form_gets_the_date_role(self):
+    def test_a_date_form_gets_the_role_of_its_grain(self):
         routes = _routes()
-        routes[("GET", f"{MP}/attributes/A1")]._body["forms"][0]["semanticRole"] = "month"   # an integer yyyyMM
+        routes[("GET", f"{MP}/attributes/A1")]._body["forms"][0]["semanticRole"] = "none"
         fake = _Fake(routes)
         _run(fake, _args(set=[["STATUS CODE", "date", "yyyyMM"]]))
         form = next(kw["json"] for m, p, kw, _ in fake.calls if (m, p) == ("PATCH", f"{MP}/attributes/A1"))["forms"][0]
-        self.assertEqual((form["dataType"]["type"], form["displayFormat"], form["semanticRole"]), ("date", "date", "date"))
+        # Studio gives a yyyyMM date the "month" role (seen after a Studio edit), a full date "date"
+        self.assertEqual((form["dataType"]["type"], form["displayFormat"], form["semanticRole"]), ("date", "date", "month"))
         table = next(kw["json"] for m, p, kw, _ in fake.calls if (m, p) == ("PATCH", f"{MP}/tables/T1"))
         col = next(c for c in table["physicalTable"]["columns"] if c["columnName"] == "STATUS CODE")
         self.assertEqual((col["dataType"]["type"], col["format"]), ("date", "yyyyMM"))   # as Studio stores it
@@ -375,3 +377,86 @@ class RemoveRelationshipTests(unittest.TestCase):
         plan, problems = bm.remove_relationship_plan(model, bm._pairs(["Reporting Period -> Loan", "X -> Loan"]))
         self.assertEqual(plan, {"L": ["P"]})
         self.assertIn("'X -> Loan'", problems[0])
+
+
+class DateRoleTests(unittest.TestCase):
+    def test_grain_and_no_downgrade(self):
+        self.assertEqual(bm.date_role("date", "yyyyMM", None), "month")
+        self.assertEqual(bm.date_role("date", "yyyy-MM-dd", "none"), "date")
+        self.assertEqual(bm.date_role("date", "yyyy-MM-dd", "month"), "month")     # finer role kept
+        self.assertEqual(bm.date_role("date", "yyyy", None), "year")
+        self.assertEqual(bm.date_role("timestamp", "", None), "date")
+        self.assertEqual(bm.date_role("utf8_char", "", "geo"), "geo")
+
+
+class OfflineExportTests(unittest.TestCase):
+    """--from-export: a dry run answered from a model export; no sign-in, and any write is refused."""
+
+    def _export(self, d):
+        model = _model()
+        model["attributes"][0]["forms"][0].update(name="ID", dataType=dict(INT), displayFormat="number")
+        model["attributes"][0]["forms"][0]["expressions"][0]["tables"] = [{"objectId": "T1"}]
+        p = os.path.join(d, "export.json")
+        with open(p, "w") as f:
+            json.dump({"model": [model]}, f)
+        return p
+
+    def test_set_column_types_dry_runs_from_the_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = bm.ExportClient(self._export(d))
+            out = _run(m, _args(dry_run=True))
+        self.assertTrue(out["dry_run"])
+        self.assertEqual([c["column"] for c in out["changed"]], ["STATUS CODE"])
+        self.assertEqual(out["aligned"], ["attribute 'Status'"])
+        self.assertTrue(all(verb in ("GET", "POST") for verb, _ in m.calls))
+
+    def test_lists_page_once_and_unknown_objects_are_404(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = bm.ExportClient(self._export(d))
+            items, failed = bm._list_all(m, f"{MP}/attributes", "attributes")
+            self.assertIsNone(failed)
+            self.assertEqual([a["information"]["objectId"] for a in items], ["A1", "A2"])
+            self.assertEqual(m.get(f"{MP}/attributes/NOPE").status_code, 404)
+            self.assertEqual(m.s.get(f"{m.base}{MP}/attributes/A1").json()["information"]["name"], "Status")
+
+    def test_writes_are_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = bm.ExportClient(self._export(d))
+            for call in (lambda: m.patch(f"{MP}/tables/T1", json={}), lambda: m.put(f"{MP}/attributes/A1"),
+                         lambda: m.post("/api/model/changesets"), lambda: m.delete("/api/model/changesets/X")):
+                _dies(call)
+
+    def test_main_forces_a_dry_run_without_sign_in(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._export(d)
+            argv = ["build_mosaic.py", "set-column-types", "--model-id", "M1", "--set", "STATUS CODE", "text",
+                    "--from-export", p]
+            out = io.StringIO()
+            with unittest.mock.patch.object(sys, "argv", argv), unittest.mock.patch.object(
+                    bm, "MSTR", side_effect=AssertionError("signed in")), contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    bm.main()
+                except SystemExit as e:
+                    self.assertIn(e.code, (0, None))
+        self.assertTrue(json.loads(out.getvalue())["dry_run"])
+
+
+class WireHintDedupeTests(unittest.TestCase):
+    def test_the_same_relationship_twice_is_one_not_a_role_play(self):
+        h = {"parent_attribute": "Flag", "child_attribute": "Period", "relationship_table": "facts",
+             "type": "one_to_many"}
+        kept, dupes = bm.dedupe_wire_hints([h, dict(h, parent_attribute="flag"),
+                                            dict(h, child_attribute="Month")])
+        self.assertEqual([k["child_attribute"] for k in kept], ["Period", "Month"])
+        self.assertEqual(len(dupes), 1)
+
+
+class KeptWrangleNoteTests(unittest.TestCase):
+    def test_a_kept_wrangle_type_is_listed_with_the_checks(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "export.json")
+            with open(p, "w") as f:
+                json.dump({"model": [{"tables": [_wrangled_table(op_on="ZB CODE")], "attributes": []}]}, f)
+            out = _run(bm.ExportClient(p), _args(set=[["ZB CODE", "text"]], dry_run=True))
+        self.assertTrue(any(n.startswith("sales.ZB CODE: ") and "check by hand" in n for n in out["check_by_hand"]))

@@ -214,11 +214,31 @@ Always tell the helper how to sign in per tenant: `MSTR_AUTH_METHOD` (`sso` for 
 - Strategy can also mark relationships `relationshipStatus: invalid` (seen: a time-varying attribute such
   as a period or a status declared as a parent of the entity); `join-paths` with the export reports them
   as one finding that proposes `remove_relationships` (`build_mosaic.py remove-relationships`: each child's
-  list PUT back without them). Not yet run live.
+  list PUT back without them). Not yet run live by the command. Removing one by hand (period → entity,
+  2026-11-15) did **not** fix the "Metric Data Redundancy Reduction" publish failure: an invalid
+  relationship is a modelling defect, but the publish failure was the source/wrangle type mismatch above.
+- **A Studio data source edit discards wrangle-only types (seen 2026-11-15).** Proceeding through a table's
+  data source definition in Studio rebuilds the wrangle node from the source node: every type written only
+  on the wrangle node is lost, with no warning, and the column's pipeline id changes. One edit wiped 15
+  type changes (decimals and dates). After any Studio edit of a table, re-read its types from an export
+  before trusting an earlier phase, and never match a column by a pipeline id saved before the edit.
+- **Studio's unlink and re-link of an attribute drops its relationships (seen 2026-11-15).** Relinking an
+  attribute dropped two relationships it took part in (a latest-period flag → period, period → month).
+  Nothing errors: a `WHERE` filter on the orphaned attribute is then ignored (the query returned every
+  fact row instead of the filtered count), and a metric scoped to the latest period, grouped by another
+  attribute, over-counts. `join-paths` (filter test) and `relationship-diff` catch it; check both after
+  any Studio relink.
+- **Strategy moves lookup tables on its own (seen 2026-11-14/15).** Attributes with
+  `autoDetectLookupTable: true` get a new lookup table when the columns they read change type (11
+  attributes at once, e.g. a period moved to a month mapping file). `relationship-diff
+  --stop-on-lookup-change` stops the plan when it happens.
 - "Already set" means the table's column and every pipeline node down to the source have the type: a
   find-and-replace can make the table's column text while the source stays a number.
 - Studio gave a converted yyyyMM date attribute the form role `month` in one case and `date` in another
-  (2026-11-12 export); `set-column-types` writes `date`. Not known to matter for the connector.
+  (2026-11-12 export); after a Studio edit it set `month` on a yyyyMM column (2026-11-15).
+  `set-column-types` now takes the role from the date format (`yyyyMM` → month, `yyyy` → year, a `Q`
+  format → quarter, a day format → date) and keeps a role that is already finer than `date`. Not known to
+  matter for the connector; `yyyy` and `yyyyQ` are not yet checked against Studio.
 
 
 ## File tables: the import settings decide how a reload splits (verified live, 2026-11-13)

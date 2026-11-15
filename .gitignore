@@ -20,6 +20,16 @@ __pycache__/
 # Operator-local credential notes (never commit)
 ignore/
 
+# Model-review deliverables belong under ignore/apply/<model>/ (they name the model and carry its data);
+# a backstop in case one lands in the repo root
+/apply/
+/apply_phase_*.ps1
+/plan_id.txt
+/specs/
+/lookups/
+/export*.json
+/*_suggested_changes_*.xlsx
+
 # captures/ READMEs (dated transcripts) are tracked institutional memory;
 # raw tenant payloads and run scripts dumped next to them stay local
 # (scripts embed tenant object IDs; generalized versions belong under skills/)
