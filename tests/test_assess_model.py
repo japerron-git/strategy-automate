@@ -305,6 +305,27 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(any("later phase" in p for p in plan["problems"]))
         self.assertTrue(any("F3 depends on F4, which is proposed" in w for w in plan["warnings"]))
 
+    def test_replace_reaches_the_conditional_metric_command(self):
+        cond = am.action_commands({"kind": "create_conditional_metric", "args": {
+            "name": "Closed Count", "source_metric": "Rows", "function": "Count", "attribute": "Status",
+            "elements": ["C"], "replace": True}}, "MID")
+        self.assertEqual(cond["problems"], [])
+        self.assertEqual(cond["apply"][-1], "--replace")
+        self.assertEqual(cond["dry_run"][-2:], ["--replace", "--dry-run"])
+
+    def test_mode_args_on_a_kind_that_cannot_take_them_are_problems(self):
+        level = am.action_commands({"kind": "create_level_metric", "args": {
+            "name": "Balance Once", "source_metric": "Balance", "entity_attribute": "Account", "replace": True}}, "MID")
+        self.assertTrue(any("args.replace is not supported" in p for p in level["problems"]))
+        self.assertNotIn("--replace", level["apply"])
+        cond = am.action_commands({"kind": "create_conditional_metric", "args": {
+            "name": "East", "source_metric": "Sales", "attribute": "Region", "elements": ["E"], "update": True}},
+            "MID")
+        self.assertTrue(any("args.update is not supported" in p for p in cond["problems"]))
+        attr = am.action_commands({"kind": "create_formula_attribute", "args": {
+            "name": "Band", "formula": "x", "requested_by_user": True, "update": True}}, "MID")
+        self.assertEqual(attr["problems"], [])
+
     def test_commands_for_each_action_kind(self):
         mid = "MID"
         cond = am.action_commands({"kind": "create_conditional_metric", "args": {
@@ -2963,6 +2984,24 @@ class DevOpenItems8To12Tests(unittest.TestCase):
         self.assertEqual(kept, ["Exit Date (year)", "Band"])
         self.assertIn("continuous", skipped["Score"])
         self.assertIn("(year)", skipped["Exit Date (month)"])
+
+    def test_a_patch_to_an_attribute_or_table_asks_for_a_studio_publish(self):
+        def after_for(object_kind):
+            plan = am.build_plan({"findings": [_finding("P1", "metric_defect", republish=True, actions=[
+                {"kind": "patch_model_object", "args": {"kind": object_kind, "object_id": "OID",
+                                                        "json_file": "patch.json"}}])]}, model_id="M")
+            (ph,) = [p for p in plan["phases"] if any(st["kind"] == "patch_model_object" for st in p["steps"])]
+            (step,) = [st for st in ph["steps"] if st["kind"] == "patch_model_object"]
+            self.assertEqual(step["object_kind"], object_kind)
+            return [a["what"] for a in ph["after"]]
+
+        for object_kind in ("attribute", "table"):
+            whats = after_for(object_kind)
+            self.assertTrue(whats[0].startswith("Republish"), object_kind)
+            self.assertTrue(whats[1].startswith("Publish the model from Studio"), object_kind)
+        for object_kind in ("metric", "fact_metric"):
+            self.assertFalse(any(w.startswith("Publish the model from Studio") for w in after_for(object_kind)),
+                             object_kind)
 
     def test_a_phase_that_adds_attributes_asks_for_a_studio_publish(self):
         rel = {"parent_attribute": "A", "child_attribute": "B", "relationship_table": "t", "type": "one_to_many"}

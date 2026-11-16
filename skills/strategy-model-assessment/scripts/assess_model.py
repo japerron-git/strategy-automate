@@ -75,6 +75,9 @@ ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_d
                 "add_lookup_table", "change_column_type", "source_change", "wire_relationships",
                 "create_formula_attribute", "add_column_attribute", "add_time_attributes", "rename_describe",
                 "show_forms", "remove_relationships", "publish", "certify", "manual")
+# args that switch a step from create to rewrite, and the kinds whose build_mosaic.py command takes them
+MODE_ARGS = {"replace": ("create_conditional_metric", "create_compound_metric"),
+             "update": ("create_formula_attribute",)}
 COLUMN_TYPES = ("text", "integer", "bigint", "double", "date", "timestamp")   # build_mosaic.py set-column-types
 # Changes made once for the whole plan, at the start of one phase; other phases get a note.
 MERGED_KINDS = {"source_change": 1, "change_column_type": 2, "wire_relationships": 3, "add_time_attributes": 3,
@@ -3858,6 +3861,10 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
     for key in ("name", "column", "source_metric", "entity_attribute", "attribute"):   # templates from roles.json
         if re.fullmatch(r"<[^<>]*>", str(a.get(key) or "").strip()):
             problems.append(f"{kind}: args.{key} is still a placeholder ({a[key]}); fill it in")
+    for key, kinds in MODE_ARGS.items():   # a dropped mode flag turns a rewrite into a plain create
+        if a.get(key) and kind not in kinds:
+            problems.append(f"{kind}: args.{key} is not supported for this kind ({', '.join(kinds)} only), so the "
+                            f"step would run as a plain create; drop it, or delete the object first")
 
     if kind == "create_conditional_metric":
         need("name", "attribute", "elements")
@@ -3876,6 +3883,8 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
                           ("--level-attribute", "level_attribute"), ("--format", "format"),
                           ("--description", "description")):
             opt(argv, flag, key)
+        if a.get("replace"):
+            argv.append("--replace")
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "create_compound_metric":
         need("name", "formula")
@@ -4113,6 +4122,16 @@ def form_base_name(name: str) -> str:
 # step kinds whose result reached the connector only after a publish from Studio (see build_plan)
 STUDIO_PUBLISH_KINDS = ("wire_relationships", "remove_relationships", "add_time_attributes", "add_column_attribute",
                         "create_formula_attribute")
+# patch_model_object targets that are model structure, like the kinds above (an attribute's outer-join setting, a
+# table). Derived and fact metrics are left out: their changes have reached the connector after the REST publish.
+STUDIO_PUBLISH_OBJECT_KINDS = ("attribute", "table")
+
+
+def needs_studio_publish(step: dict) -> bool:
+    """True for a plan step whose change reaches the connector only after a publish from Studio."""
+    kind = step.get("kind")
+    return kind in STUDIO_PUBLISH_KINDS or (
+        kind == "patch_model_object" and str(step.get("object_kind") or "").lower() in STUDIO_PUBLISH_OBJECT_KINDS)
 
 
 def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, ...] = PLANNED_STATUSES,
@@ -4440,6 +4459,8 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                 steps.append({"finding": f["id"], "title": f.get("title"), "kind": action.get("kind"),
                               "dry_run": cmd(c["dry_run"]), "apply": cmd(c["apply"]), "manual": c["manual"],
                               "risks": (f.get("risks") or []) if first else []})
+                if kind == "patch_model_object":
+                    steps[-1]["object_kind"] = str((action.get("args") or {}).get("kind") or "")
                 if retype:
                     steps.append(retype)
         if lookups:
@@ -4466,13 +4487,13 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         if republish:
             after.append({"what": "Republish the model (tables, attributes or fact metrics changed).",
                           "command": cmd([python, BUILD_SCRIPT, "publish", "--model-id", mid] + PUBLISH_WAIT)})
-            if any(st.get("kind") in STUDIO_PUBLISH_KINDS for st in steps):
+            if any(needs_studio_publish(st) for st in steps):
                 # seen live (2026-11-15): after new attributes, time attributes and relationships the REST publish
                 # reported every table loaded, yet the connector read the new attributes blank and ignored the
                 # relationships until the model was published from Studio
                 after.append({"what": "Publish the model from Studio as well: the REST publish reloads the tables "
-                                      "but has not rebuilt new attributes or relationships (they read blank and "
-                                      "filters are ignored until a Studio publish).",
+                                      "but has not rebuilt new or changed attributes or relationships (they read "
+                                      "blank and filters are ignored until a Studio publish).",
                               "confirm": "Published from Studio and finished?"})
         after.append({"what": "Re-certify the model (edits drop certification; MCP cannot see an uncertified model).",
                       "command": cmd([python, BUILD_SCRIPT, "certify", "--object-id", mid])})

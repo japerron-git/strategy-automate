@@ -608,6 +608,9 @@ label column is listed as an attribute that no metric filters on.
 `wire_relationships`: `relationships`; for `create_formula_attribute`: see above; for `rename_describe`: `items`; for `patch_fact_metrics`: `spec` or inline `metrics` / `presets`; for `create_level_metric`: `name`, `source_metric`, `entity_attribute`, `inner`, `outer`;
 for `create_weighted_average`: `name`, exactly one of `value_attribute` / `value_metric`, `weight_metric`,
 `entity_attribute`, `numerator_name`, `denominator_name`).
+`replace: true` rewrites the derived metric of the same name in place, keeping its objectId. Only
+`create_conditional_metric` and `create_compound_metric` take it (`plan` reports it as a problem on any other
+kind); without it an existing name stops the step, dry run included.
 
 **change_plan.json** (written by `plan`): phases in order, each with its steps (finding id, action,
 dry-run command, apply command), `before`, `unit_tests`, `regression` and `after` lists.

@@ -140,10 +140,21 @@ class _FakeMSTR:
         return self._call("DELETE", path, **kw)
 
 
-def _routes(bind_status=200):
+EXISTING_ID = "E" * 32
+OLD_FILTER_ID = "F" * 32
+
+
+def _routes(bind_status=200, derived=()):
     return {
         ("GET", f"{MP}/factMetrics"): _Resp(200, {"factMetrics": [
             {"information": {"objectId": SOURCE["objectId"], "name": "Revenue"}}]}),
+        ("GET", f"{MP}/metrics"): _Resp(200, {"metrics": [{"information": dict(d)} for d in derived]}),
+        ("GET", f"{MP}/metrics/{EXISTING_ID}"): _Resp(200, {
+            "information": {"objectId": EXISTING_ID, "name": "Revenue East", "description": "Kept description"},
+            "format": {"header": [], "values": [{"type": "number_category", "value": "0"}]},
+            "conditionality": {"filter": {"objectId": OLD_FILTER_ID, "subType": "filter", "isEmbedded": True}}}),
+        ("POST", f"{MP}/metrics/{EXISTING_ID}/embeddedObjects"): _Resp(201, {"id": FILTER_ID}),
+        ("PUT", f"{MP}/metrics/{EXISTING_ID}"): _Resp(bind_status, {}),
         ("GET", f"{MP}/attributes"): _Resp(200, {"attributes": [
             {"information": {"objectId": ATTR["objectId"], "name": "Region"}}]}),
         ("GET", f"{MP}/factMetrics/{SOURCE['objectId']}"): _Resp(200, {
@@ -213,6 +224,101 @@ class CreateConditionalMetricFlowTests(unittest.TestCase):
             bm.cmd_create_conditional_metric(fake, _args(source_metric="Margin"))
 
         self.assertEqual([method for method, _, _, _ in fake.calls], ["GET"])
+
+
+EXISTING = {"objectId": EXISTING_ID, "name": "Revenue East"}
+
+
+def _writes(fake):
+    return [(method, path) for method, path, _, _ in fake.calls if method != "GET"]
+
+
+class ExistingNameTests(unittest.TestCase):
+    def test_existing_name_stops_before_any_write_without_replace(self):
+        for dry_run in (False, True):
+            fake = _FakeMSTR(_routes(derived=[EXISTING]))
+            err = io.StringIO()
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(err), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                bm.cmd_create_conditional_metric(fake, _args(dry_run=dry_run))
+            self.assertEqual(_writes(fake), [])
+            self.assertIn("--replace", err.getvalue())
+
+    def test_name_match_is_case_insensitive(self):
+        fake = _FakeMSTR(_routes(derived=[{"objectId": EXISTING_ID, "name": "REVENUE EAST"}]))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            bm.cmd_create_conditional_metric(fake, _args())
+        self.assertEqual(_writes(fake), [])
+
+    def test_fact_metric_name_stops_even_with_replace(self):
+        fake = _FakeMSTR(_routes())
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            bm.cmd_create_conditional_metric(fake, _args(name="Revenue", replace=True))
+        self.assertEqual(_writes(fake), [])
+        self.assertIn("fact metric", err.getvalue())
+
+    def test_replace_without_existing_metric_stops(self):
+        fake = _FakeMSTR(_routes())
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            bm.cmd_create_conditional_metric(fake, _args(replace=True))
+        self.assertEqual(_writes(fake), [])
+
+    def test_replace_embeds_and_puts_on_the_existing_id_in_one_changeset(self):
+        fake = _FakeMSTR(_routes(derived=[EXISTING]))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            bm.cmd_create_conditional_metric(fake, _args(replace=True))
+
+        self.assertEqual(_writes(fake), [
+            ("POST", "/api/model/changesets"),
+            ("POST", f"{MP}/metrics/{EXISTING_ID}/embeddedObjects"),
+            ("PUT", f"{MP}/metrics/{EXISTING_ID}"),
+            ("POST", "/api/model/changesets/CS1/commit"),
+        ])
+        for method, path, _, changeset in fake.calls:
+            if method != "GET" and path.startswith(MP):
+                self.assertEqual(changeset, "CS1")
+        put = next(kw for method, _, kw, _ in fake.calls if method == "PUT")["json"]
+        self.assertEqual(put["conditionality"]["filter"]["objectId"], FILTER_ID)
+        self.assertEqual(put["information"]["description"], "Kept description")
+        self.assertEqual(put["format"]["values"], [{"type": "number_category", "value": "0"}])
+        self.assertEqual(json.loads(out.getvalue()), {
+            "ok": True, "metric_id": EXISTING_ID, "embedded_filter_id": FILTER_ID, "action": "replaced",
+            "previous_embedded_filter_id": OLD_FILTER_ID})
+
+    def test_replace_takes_a_new_description_and_format_when_given(self):
+        fake = _FakeMSTR(_routes(derived=[EXISTING]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            bm.cmd_create_conditional_metric(fake, _args(replace=True, description="New text", format="integer"))
+        put = next(kw for method, _, kw, _ in fake.calls if method == "PUT")["json"]
+        self.assertEqual(put["information"]["description"], "New text")
+        self.assertEqual(put["format"]["values"], bm._resolve_metric_format("integer"))
+
+    def test_failed_replace_discards_the_changeset(self):
+        fake = _FakeMSTR(_routes(bind_status=400, derived=[EXISTING]))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            bm.cmd_create_conditional_metric(fake, _args(replace=True))
+        self.assertIn(("DELETE", "/api/model/changesets/CS1"), _writes(fake))
+        self.assertNotIn(("POST", "/api/model/changesets/CS1/commit"), _writes(fake))
+
+    def test_replace_dry_run_names_the_existing_id_and_writes_nothing(self):
+        fake = _FakeMSTR(_routes(derived=[EXISTING]))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            bm.cmd_create_conditional_metric(fake, _args(replace=True, dry_run=True))
+        self.assertEqual(_writes(fake), [])
+        plan = json.loads(out.getvalue())
+        self.assertEqual(plan["action"], "replace")
+        self.assertEqual(plan["previous_embedded_filter_id"], OLD_FILTER_ID)
+        self.assertEqual([(s["method"], s["path"]) for s in plan["plan"]], [
+            ("POST", f"{MP}/metrics/{EXISTING_ID}/embeddedObjects"), ("PUT", f"{MP}/metrics/{EXISTING_ID}")])
+
+    def test_cli_accepts_replace(self):
+        args = bm.build_parser().parse_args(["create-conditional-metric", "--model-id", "M1", "--name", "X",
+                                             "--source-metric", "Revenue", "--attribute", "Region",
+                                             "--elements", "East", "--replace"])
+        self.assertTrue(args.replace)
 
 
 if __name__ == "__main__":

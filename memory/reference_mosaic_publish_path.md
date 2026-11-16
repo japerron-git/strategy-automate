@@ -226,8 +226,9 @@ connector then listed the new objects but returned every new attribute blank (ti
 and still ignored filters that the new relationships should have fixed. A publish from the Studio UI (no re-certify)
 fixed all of it. Together with the 2026-09-22 observation below (REST trigger a no-op when no table or column
 changed), the rule: **after model-level changes (attributes, time attributes, relationships), publish from Studio.**
-`plan` adds that as a confirmed manual step after the REST republish; `publish` warns when every table says
-completed at the first poll. What Studio sends today is not captured: capture its request (browser network panel)
+`plan` adds that as a confirmed manual step after the REST republish, also after a `patch_model_object` on an
+attribute or a table (assumed to behave like the other attribute changes, not yet verified; 2026-11-16); `publish`
+warns when every table says completed at the first poll. What Studio sends today is not captured: capture its request (browser network panel)
 the next time it is needed, to replace the manual step.
 
 ## Republish completion proof (observed 2026-09-17)

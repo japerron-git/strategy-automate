@@ -81,6 +81,7 @@ def _cond_routes():
     routes = dict(CS_ROUTES)
     routes.update({
         ("GET", f"{MP}/factMetrics"): _Resp(200, {"factMetrics": [_info("A", "Net Sales")]}),
+        ("GET", f"{MP}/metrics"): _Resp(200, {"metrics": []}),   # no derived metric holds the name yet
         ("GET", f"{MP}/attributes"): _Resp(200, {"attributes": [
             _info("E", "Customer"), _info("F", "Account Status"), _info("1", "Channel"),
             _info("2", "Snapshot Month")]}),

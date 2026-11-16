@@ -5510,8 +5510,9 @@ def resolve_model_object_ref(m: MSTR, model_id: str, collection: str, sub_type: 
 
 
 def cmd_create_conditional_metric(m: MSTR, args):
-    """Create a conditional (filtered) derived metric scoped by a filter embedded in the
-    metric: one `<attribute> IN (<elements>)` condition, plus any --and conditions (ANDed).
+    """Create (or, with --replace, rewrite in place) a conditional (filtered) derived metric
+    scoped by a filter embedded in the metric: one `<attribute> IN (<elements>)` condition,
+    plus any --and conditions (ANDed).
 
     What it aggregates (exactly one):
       --source-metric F [--function Sum|Avg|Count]   Fn(<fact metric>); Count counts fact rows
@@ -5527,6 +5528,14 @@ def cmd_create_conditional_metric(m: MSTR, args):
     /metrics/{id}/embeddedObjects (the filter) → PUT /metrics/{id} (filter-bound tokens +
     conditionality) → commit. Any failure discards the changeset. The number format is
     --format, else the source fact metric's (Sum/Avg), else `integer` (counts).
+
+    A derived metric with the same name stops the command before any write, --dry-run
+    included (the service refuses a duplicate name with 8004e409), unless --replace is given.
+    A fact metric with the same name always stops it. --replace keeps the metric's objectId,
+    so metrics built on it keep working: in ONE changeset it embeds a new filter in the
+    existing metric and PUTs the full filter-bound body (no unfiltered POST). The description
+    and number format are kept unless given again. Not yet verified live: what the service
+    does with the old embedded filter; its id is reported as previous_embedded_filter_id.
     """
     source_name = getattr(args, "source_metric", None)
     count_attr = getattr(args, "count_attribute", None)
@@ -5567,8 +5576,33 @@ def cmd_create_conditional_metric(m: MSTR, args):
     if level_rule:
         level = (resolve_model_object_ref(m, args.model_id, "attributes", "attribute", level_attr_name),
                  level_rule)
+    q = {"showAdvancedProperties": "true"}
+    facts, derived = _list_model_metrics(m, args.model_id)
+    lowered = args.name.lower()
+    if any((i.get("name") or "").lower() == lowered for i in _named(facts, args.name)):
+        die(f"'{args.name}' is a fact metric; pick another name (a conditional metric is a derived metric)")
+    existing = [i for i in _named(derived, args.name) if (i.get("name") or "").lower() == lowered]
+    if len(existing) > 1:
+        die(f"'{args.name}' names {len(existing)} derived metrics: {[e.get('objectId') for e in existing]}")
+    replace = bool(getattr(args, "replace", False))
+    if existing and not replace:
+        die(f"a derived metric named '{args.name}' already exists ({existing[0].get('objectId')}); "
+            f"pass --replace to rewrite it in place")
+    if replace and not existing:
+        die(f"--replace: no derived metric named '{args.name}' on this model")
+    target_id = existing[0]["objectId"] if existing else None
+    previous_filter = None
+    cur: dict = {}
+    if target_id:
+        r = m.get(f"{mp}/metrics/{target_id}", params=q)
+        if not r.ok: die(f"read '{args.name}': {format_mstr_error(r)}")
+        cur = _json_or(r, {})
+        description = description or (cur.get("information") or {}).get("description") or ""
+        previous_filter = ((cur.get("conditionality") or {}).get("filter") or {}).get("objectId")
     if fmt_preset:
         fmt_values = _resolve_metric_format(fmt_preset)
+    elif target_id and (cur.get("format") or {}).get("values"):
+        fmt_values = cur["format"]["values"]
     elif function == "Count":
         fmt_values = _resolve_metric_format("integer")
     else:
@@ -5581,22 +5615,36 @@ def cmd_create_conditional_metric(m: MSTR, args):
         return conditional_metric_body(args.name, function, source, fmt_values, description,
                                        filter_id=filter_id, distinct=distinct, level=level)
 
-    q = {"showAdvancedProperties": "true"}
     filter_body = embedded_filter_body(conditions)
     if getattr(args, "dry_run", False):
-        print(json.dumps({"ok": True, "dry_run": True, "plan": [
-            {"step": "create", "method": "POST", "path": f"{mp}/metrics", "params": q, "body": body()},
-            {"step": "embed filter", "method": "POST", "path": f"{mp}/metrics/<new metric id>/embeddedObjects",
-             "params": {"showExpressionAs": "tree"}, "body": filter_body},
-            {"step": "bind filter", "method": "PUT", "path": f"{mp}/metrics/<new metric id>", "params": q,
-             "body": body("<embedded filter id>")},
-        ]}, indent=2))
+        if target_id:
+            plan = [
+                {"step": "embed filter", "method": "POST", "path": f"{mp}/metrics/{target_id}/embeddedObjects",
+                 "params": {"showExpressionAs": "tree"}, "body": filter_body},
+                {"step": "replace", "method": "PUT", "path": f"{mp}/metrics/{target_id}", "params": q,
+                 "body": body("<embedded filter id>")},
+            ]
+        else:
+            plan = [
+                {"step": "create", "method": "POST", "path": f"{mp}/metrics", "params": q, "body": body()},
+                {"step": "embed filter", "method": "POST", "path": f"{mp}/metrics/<new metric id>/embeddedObjects",
+                 "params": {"showExpressionAs": "tree"}, "body": filter_body},
+                {"step": "bind filter", "method": "PUT", "path": f"{mp}/metrics/<new metric id>", "params": q,
+                 "body": body("<embedded filter id>")},
+            ]
+        out = {"ok": True, "dry_run": True, "action": "replace" if target_id else "create", "plan": plan}
+        if target_id:
+            out["previous_embedded_filter_id"] = previous_filter
+        print(json.dumps(out, indent=2))
         return
     cs = open_cs(m)
     try:
-        r = m.post(f"{mp}/metrics", params=q, json=body())
-        if not r.ok: die(f"create metric: {format_mstr_error(r)}")
-        metric_id = r.json()["information"]["objectId"]
+        if target_id:
+            metric_id = target_id
+        else:
+            r = m.post(f"{mp}/metrics", params=q, json=body())
+            if not r.ok: die(f"create metric: {format_mstr_error(r)}")
+            metric_id = r.json()["information"]["objectId"]
         r = m.post(f"{mp}/metrics/{metric_id}/embeddedObjects", params={"showExpressionAs": "tree"},
                    json=filter_body)
         if not r.ok: die(f"embed filter: {format_mstr_error(r)}")
@@ -5604,12 +5652,15 @@ def cmd_create_conditional_metric(m: MSTR, args):
         filter_id = emb.get("id") or (emb.get("information") or {}).get("objectId")
         if not filter_id: die(f"embed filter: no id in response {str(emb)[:200]}")
         r = m.put(f"{mp}/metrics/{metric_id}", params=q, json=body(filter_id))
-        if not r.ok: die(f"bind filter: {format_mstr_error(r)}")
+        if not r.ok: die(f"{'replace metric' if target_id else 'bind filter'}: {format_mstr_error(r)}")
         commit_cs(m, cs)
     except BaseException:  # die() raises SystemExit; discard on every failure path
         discard_cs(m, cs)
         raise
-    print(json.dumps({"ok": True, "metric_id": metric_id, "embedded_filter_id": filter_id}, indent=2))
+    result = {"ok": True, "metric_id": metric_id, "embedded_filter_id": filter_id}
+    if target_id:
+        result.update(action="replaced", previous_embedded_filter_id=previous_filter)
+    print(json.dumps(result, indent=2))
 
 
 def _metric_references(definition: dict, target: dict) -> bool:
@@ -7755,7 +7806,11 @@ def build_parser():
     sp.add_argument("--format", help=f"number format preset: {', '.join(sorted(METRIC_FORMAT_PRESETS))} "
                                      f"(default: the source metric's format; integer for counts)")
     sp.add_argument("--description", default="", help=f"business description (max {DESCRIPTION_MAX} characters)")
-    sp.add_argument("--dry-run", action="store_true", help="print the three requests; open no changeset")
+    sp.add_argument("--replace", action="store_true",
+                    help="rewrite the derived metric of this name in place (keeps its objectId, description and "
+                         "format unless given again); without it an existing name stops the command")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="check the name and print the requests; open no changeset")
 
     sp = sub.add_parser("delete-derived-metric",
         help="Delete one derived metric (never a fact metric or attribute) in a changeset, after "
