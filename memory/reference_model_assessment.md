@@ -224,6 +224,17 @@ Resolved:
   phases), whatever its status.
 - *Type-change probes:* an attribute whose only change is its type and whose profile kept every value
   (same count, same range read as digits) is listed under `type_checks`, not probed value by value.
+- *Script output on Windows PowerShell 5.1:* `[Console]::OutputEncoding` and `PYTHONIOENCODING` in the
+  script did not stop stderr showing as a red NativeCommandError, nor "\u2713" and "à" in the log (UTF-16).
+  The scripts now set `MOSAIC_PLAIN_OUTPUT=1`: the python commands merge stderr into stdout and write ASCII
+  (`skills/strategy-platform/scripts/plain_output.py`).
+- *Date tests inside CASE:* Mosaic refuses the month time attribute in a CASE that also reads another
+  attribute ("Derived Attribute defined on multiple attributes including ... Smart attribute is not
+  supported"); the DATE test works there, so `references` keeps it.
+- *Blank dates:* time attributes read a blank date as 1899 (year 1899, month 1899-12); probe warns when a
+  time attribute starts far before its date.
+- *Probe list after new attributes:* forms of a probed attribute, time attributes other than (year), and
+  numeric attributes with more than 50 values are listed under `not_probed` (`--probe-all-changed`).
 - *Previewing a phase without the tenant:* `set-column-types`, `wire-relationships` and `rename-describe`
   take `--from-export <export.json>`: a dry run answered from the file, any write refused.
 

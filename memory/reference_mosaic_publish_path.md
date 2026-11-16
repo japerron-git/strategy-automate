@@ -218,6 +218,18 @@ The fastest way to fix an already-built dirty-typed model is to clone a known-go
 
 (Raw reproduction, including model IDs and query text, lives under `captures/` on the run date. Link the capture from the follow-up ticket rather than re-embedding IDs here. The 2026-04-22 tenant-level QueryEngineServer stall narrative lives in `captures/2026-04-22-queryengine-publish-incident/README.md`.)
 
+## REST republish does not rebuild new attributes or relationships (observed 2026-11-15)
+
+After a phase that added relationships (wire-relationships), time attributes and column attributes, the documented
+3-step publish (16 tables, replace) reported every table `completed` at the first poll, and certify succeeded. The
+connector then listed the new objects but returned every new attribute blank (time attributes and column attributes)
+and still ignored filters that the new relationships should have fixed. A publish from the Studio UI (no re-certify)
+fixed all of it. Together with the 2026-09-22 observation below (REST trigger a no-op when no table or column
+changed), the rule: **after model-level changes (attributes, time attributes, relationships), publish from Studio.**
+`plan` adds that as a confirmed manual step after the REST republish; `publish` warns when every table says
+completed at the first poll. What Studio sends today is not captured: capture its request (browser network panel)
+the next time it is needed, to replace the manual step.
+
 ## Republish completion proof (observed 2026-09-17)
 
 On a **republish** of an already-published in_memory model, the cube-execute probe (`POST /api/v2/cubes/{id}/instances`) keeps succeeding against the OLD cube, so a 2xx probe proves nothing about the new definition. Prove the republish landed by probing a metric whose definition you just changed (e.g., a `sum`→`avg` function fix: values drop from thousands to single digits) or a table you just added; poll that until the new shape appears. One trigger per run still applies.

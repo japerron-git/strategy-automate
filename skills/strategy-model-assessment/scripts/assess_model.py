@@ -995,6 +995,57 @@ def type_only_changes(old_scope: dict | None, new_scope: dict) -> dict[str, dict
     return out
 
 
+_TIME_FORM = re.compile(r"^(.*) \((day|week|month|quarter|year)\)(?:__\w+)?$", re.I)
+CONTINUOUS_VALUES = 50
+
+
+def trim_probe_list(names: list[str], scope: dict) -> tuple[list[str], dict[str, str]]:
+    """The changed attributes worth probing value by value, and why the rest are not: a form of an attribute
+    (`<a>__desc`, `<a>__id`) when the attribute itself is in the scope or the list; a new date's time attributes other
+    than (year), which share its join; a numeric attribute with more than CONTINUOUS_VALUES values (its
+    profile shows whether the values are right; join-paths tests its filter)."""
+    attrs = {a["name"].casefold(): a for a in scope.get("attributes") or []}
+    kept, skipped = [], {}
+    listed = {x.casefold() for x in names}
+    for n in names:
+        bare = n.split("__", 1)[0]
+        t = _TIME_FORM.match(n)
+        a = attrs.get(n.casefold()) or {}
+        if "__" in n and (bare.casefold() in attrs or bare.casefold() in listed):
+            skipped[n] = f"a form of '{bare}'"
+        elif t and str((attrs.get(t.group(1).casefold()) or {}).get("type") or "").lower().startswith("date") \
+                and t.group(2).lower() != "year":
+            skipped[n] = f"time attribute of '{t.group(1)}': its (year) is probed"
+        elif str(a.get("type") or "").lower().split("(")[0].strip() in _NUMERIC and \
+                (_num((a.get("profile") or {}).get("distinct_values")) or 0) > CONTINUOUS_VALUES:
+            p = a.get("profile") or {}
+            skipped[n] = (f"continuous ({_num(p.get('distinct_values')):.0f} values, {p.get('min')} to "
+                          f"{p.get('max')}): profile only")
+        else:
+            kept.append(n)
+    return kept, skipped
+
+
+def time_attribute_floor(scope: dict) -> list[str]:
+    """A time attribute whose earliest year is far before its date's: blank dates read as 1899-12-30 in time
+    attributes, so a filter or group on the (year) or (month) form shows a year 1899 group of blank dates."""
+    attrs = {a["name"].casefold(): a for a in scope.get("attributes") or []}
+    out, seen = [], set()
+    for a in scope.get("attributes") or []:
+        t = _TIME_FORM.match(a["name"])
+        base = attrs.get(t.group(1).casefold()) if t else None
+        if not base or t.group(1).casefold() in seen:
+            continue
+        y_form = re.sub(r"\D", "", str((a.get("profile") or {}).get("min") or ""))[:4]
+        y_base = re.sub(r"\D", "", str((base.get("profile") or {}).get("min") or ""))[:4]
+        if len(y_form) == 4 and len(y_base) == 4 and int(y_form) < int(y_base) - 1:
+            seen.add(t.group(1).casefold())
+            out.append(f"attribute '{a['name']}': its earliest value is in {y_form}, its date '{base['name']}' "
+                       f"starts in {y_base}: blank dates read as {y_form} in the time attributes (filter them "
+                       f"out, or count the blank dates on the date itself)")
+    return out
+
+
 _LATEST_FLAG = re.compile(r"\b(latest|current|most recent|last)\b", re.I)
 _TRUE_VALUES = ("y", "yes", "1", "true", "t")
 _TABLE_OF = re.compile(r"\(\s*([^(){}]*?)\.\{")
@@ -1771,38 +1822,75 @@ def date_filter_changes(old_scope: dict, new_scope: dict) -> list[dict[str, Any]
     return out
 
 
+def _case_spans(sql: str) -> list[tuple[int, int]]:
+    spans, stack = [], []
+    for m in re.finditer(r"\b(CASE|END)\b", sql, re.I):
+        if m.group(1).upper() == "CASE":
+            stack.append(m.start())
+        elif stack:
+            spans.append((stack.pop(), m.end()))
+    return spans
+
+
+def _in_mixed_case(sql: str, pos: int, spans: list[tuple[int, int]], own: set[str]) -> bool:
+    """Inside a CASE that also reads another attribute: there Mosaic refuses the month time attribute
+    ("Derived Attribute defined on multiple attributes including ... Smart attribute"), the date works."""
+    return any(s <= pos < e and {x.casefold() for x in re.findall(r'"([^"]+)"', sql[s:e])} - own
+               for s, e in spans)
+
+
 def rewrite_date_filters(sql: str, change: dict) -> tuple[str, int]:
     """Rewrite comparisons of one attribute with yyyyMM numbers (or, once its month attribute exists, with
-    first-of-month dates): `"a" = 202201`, `<`, `>=`, `BETWEEN 202101 AND 202112`, `IN (202111, 202112)`."""
-    name = change["attribute"]
+    first-of-month dates): `"a" = 202201`, `<`, `>=`, `BETWEEN 202101 AND 202112`, `IN (202111, 202112)`.
+    Inside a CASE that also reads another attribute the test stays on the date (`DATE 'yyyy-MM-01'`)."""
+    name, month = change["attribute"], change.get("month_id")
     col = '"' + re.escape(name) + '"'
+    own = {name.casefold()} | ({month.casefold()} if month else set())
     n = 0
-    parts = _SQL_LITERAL.split(sql)
 
-    def num_lit(v: str) -> str:
-        return v if change["month_id"] else f"DATE '{v[:4]}-{v[4:6]}-01'"
-    target = quote_ident(change["month_id"]) if change["month_id"] else quote_ident(name)
-    for i in range(0, len(parts), 2):
-        seg = parts[i]
-        if change["change"] == "gained_month":
-            continue   # dates live in the literal parts; handled below
-        seg, k1 = re.subn(col + r"(\s*(?:=|<>|!=|<=|>=|<|>)\s*)(" + _YYYYMM + r")\b",
-                          lambda m: target + m.group(1) + num_lit(m.group(2)), seg, flags=re.I)
-        seg, k2 = re.subn(col + r"(\s+BETWEEN\s+)(" + _YYYYMM + r")(\s+AND\s+)(" + _YYYYMM + r")\b",
-                          lambda m: target + m.group(1) + num_lit(m.group(2)) + m.group(3) + num_lit(m.group(4)),
-                          seg, flags=re.I)
-        seg, k3 = re.subn(col + r"(\s+IN\s*\()([^)]*)\)",
-                          lambda m: target + m.group(1) + re.sub(_YYYYMM, lambda x: num_lit(x.group(0)), m.group(2)) + ")"
-                          if re.search(_YYYYMM, m.group(2)) else m.group(0), seg, flags=re.I)
-        parts[i] = seg
-        n += k1 + k2 + k3
-    out = "".join(parts)
-    if change["change"] == "gained_month":
-        # "a" op DATE 'yyyy-MM-01' -> "a (month)__id" op yyyyMM
-        out, k = re.subn(col + r"(\s*(?:=|<>|!=|<=|>=|<|>)\s*)DATE\s*'(\d{4})-(\d{2})-01'",
-                         lambda m: quote_ident(change["month_id"]) + m.group(1) + m.group(2) + m.group(3), out,
-                         flags=re.I)
-        n += k
+    def date_lit(v: str) -> str:
+        return f"DATE '{v[:4]}-{v[4:6]}-01'"
+
+    def form(text: str, pos: int, spans: list[tuple[int, int]]) -> tuple[str, Callable[[str], str]]:
+        if month and not _in_mixed_case(text, pos, spans, own):
+            return quote_ident(month), lambda v: v
+        return quote_ident(name), date_lit
+
+    out = sql
+    if change["change"] != "gained_month":
+        def sub(pattern: str, build: Callable[[re.Match, str, Callable[[str], str]], str]) -> int:
+            nonlocal out
+            spans, literals = _case_spans(out), [m.span() for m in _SQL_LITERAL.finditer(out)]
+            changed = [0]
+
+            def one(m: re.Match) -> str:
+                if any(s <= m.start() < e for s, e in literals):
+                    return m.group(0)
+                target, lit = form(out, m.start(), spans)
+                text = build(m, target, lit)
+                changed[0] += text != m.group(0)
+                return text
+            out = re.sub(pattern, one, out, flags=re.I)
+            return changed[0]
+        n += sub(col + r"(\s*(?:=|<>|!=|<=|>=|<|>)\s*)(" + _YYYYMM + r")\b",
+                 lambda m, t, lit: t + m.group(1) + lit(m.group(2)))
+        n += sub(col + r"(\s+BETWEEN\s+)(" + _YYYYMM + r")(\s+AND\s+)(" + _YYYYMM + r")\b",
+                 lambda m, t, lit: t + m.group(1) + lit(m.group(2)) + m.group(3) + lit(m.group(4)))
+        n += sub(col + r"(\s+IN\s*\()([^)]*)\)",
+                 lambda m, t, lit: t + m.group(1) + re.sub(_YYYYMM, lambda x: lit(x.group(0)), m.group(2)) + ")"
+                 if re.search(_YYYYMM, m.group(2)) else m.group(0))
+    else:
+        # "a" op DATE 'yyyy-MM-01' -> "a (month)__id" op yyyyMM, except inside a CASE that reads another attribute
+        spans, done = _case_spans(out), [0]
+
+        def to_month(m: re.Match) -> str:
+            if _in_mixed_case(out, m.start(), spans, own):
+                return m.group(0)
+            done[0] += 1
+            return quote_ident(month) + m.group(1) + m.group(2) + m.group(3)
+        out = re.sub(col + r"(\s*(?:=|<>|!=|<=|>=|<|>)\s*)DATE\s*'(\d{4})-(\d{2})-01'", to_month, out,
+                     flags=re.I)
+        n += done[0]
     return out, n
 
 
@@ -2091,12 +2179,19 @@ def _relationship_action(spec: dict[str, str]) -> dict[str, Any]:
     return {"kind": "wire_relationships", "args": {"relationships": [rel]}}
 
 
-def _relationship_check(f: dict) -> tuple[str, str] | None:
-    for c in f.get("checks") or []:
-        r = c.get("relationship")
-        if isinstance(r, (list, tuple)) and len(r) == 2 and c.get("expect") == "present":
-            return str(r[0]), str(r[1])
-    return None
+def _relationship_check(f: dict) -> list[tuple[str, str]] | None:
+    """The relationships a lost-relationship finding (one whose check expects a relationship present) expects:
+    those its wire_relationships actions write when it has any (a Modify can reverse the pair or change its
+    table), else the pair its check names. None for any other finding."""
+    named = [c.get("relationship") for c in f.get("checks") or [] if c.get("expect") == "present"
+             and isinstance(c.get("relationship"), (list, tuple)) and len(c.get("relationship")) == 2]
+    if not named:
+        return None
+    wired = [(str(r.get("parent_attribute") or ""), str(r.get("child_attribute") or ""))
+             for a in f.get("actions") or [] if a.get("kind") == "wire_relationships"
+             for r in (a.get("args") or {}).get("relationships") or [] if isinstance(r, dict)]
+    wired = [p for p in wired if all(p)]
+    return wired or [(str(named[0][0]), str(named[0][1]))]
 
 
 def resolved_findings(findings_doc: dict, current: list[dict],
@@ -2120,8 +2215,8 @@ def resolved_findings(findings_doc: dict, current: list[dict],
         elif relationships is None:
             out["not_checked"].append(f["id"])
         else:
-            key = (rel[0].casefold(), rel[1].casefold())
-            out["resolved" if key in have else "still_present"].append(f["id"])
+            back = all((p.casefold(), c.casefold()) in have for p, c in rel)
+            out["resolved" if back else "still_present"].append(f["id"])
     if not out["not_checked"]:
         del out["not_checked"]
     return out
@@ -4015,6 +4110,11 @@ def form_base_name(name: str) -> str:
     return hit.group(1) if hit else ""
 
 
+# step kinds whose result reached the connector only after a publish from Studio (see build_plan)
+STUDIO_PUBLISH_KINDS = ("wire_relationships", "remove_relationships", "add_time_attributes", "add_column_attribute",
+                        "create_formula_attribute")
+
+
 def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, ...] = PLANNED_STATUSES,
                python: str = "python3", quoting: str = "posix", project: str = "",
                bank: str = "question_bank.json", bundle_dir: str | None = None) -> dict[str, Any]:
@@ -4366,6 +4466,14 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         if republish:
             after.append({"what": "Republish the model (tables, attributes or fact metrics changed).",
                           "command": cmd([python, BUILD_SCRIPT, "publish", "--model-id", mid] + PUBLISH_WAIT)})
+            if any(st.get("kind") in STUDIO_PUBLISH_KINDS for st in steps):
+                # seen live (2026-11-15): after new attributes, time attributes and relationships the REST publish
+                # reported every table loaded, yet the connector read the new attributes blank and ignored the
+                # relationships until the model was published from Studio
+                after.append({"what": "Publish the model from Studio as well: the REST publish reloads the tables "
+                                      "but has not rebuilt new attributes or relationships (they read blank and "
+                                      "filters are ignored until a Studio publish).",
+                              "confirm": "Published from Studio and finished?"})
         after.append({"what": "Re-certify the model (edits drop certification; MCP cannot see an uncertified model).",
                       "command": cmd([python, BUILD_SCRIPT, "certify", "--object-id", mid])})
         tests = sorted({t for f in items for t in f.get("tests") or []})
@@ -4747,6 +4855,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--changed-since", help="previous scope.json: probe only what changed since (verify-changes)")
     sp.add_argument("--findings", help="findings.json: also probe objects named by actions of --phases")
     sp.add_argument("--phases", default="", help="comma-separated phases applied this round")
+    sp.add_argument("--probe-all-changed", action="store_true",
+                    help="probe every changed attribute (default: forms of a probed attribute, a new date's time "
+                         "attributes other than (year), and numeric attributes with more than 50 values are "
+                         "listed under not_probed)")
     sp.add_argument("--probe-type-changes", action="store_true",
                     help="probe value by value an attribute whose type changed even when its profile shows every "
                          "value kept (default: listed under type_checks, not probed)")
@@ -4892,6 +5004,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None, runner_factory: Callable[[argparse.Namespace], Runner] | None = None) -> int:
+    if os.environ.get("MOSAIC_PLAIN_OUTPUT") == "1":   # run from a generated PowerShell script
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir,
+                                        "strategy-platform", "scripts"))
+        import plain_output
+        plain_output.enable()
     args = build_parser().parse_args(argv)
 
     def log(msg: str) -> None:
@@ -4986,11 +5103,17 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
         type_checks = type_only_changes(_load_json(args.changed_since), scope) if args.changed_since else {}
         if type_checks and not args.probe_type_changes and attrs is not None and not args.attributes:
             attrs = [n for n in attrs if (type_checks.get(n) or {}).get("verdict") != "values kept"]
+        not_probed: dict[str, str] = {}
+        if attrs is not None and not args.attributes and not args.probe_all_changed:
+            attrs, not_probed = trim_probe_list(attrs, scope)
         out = probe_objects(runner(), args.project, scope, attributes=attrs, metrics=mets, period=args.period,
                             split=args.split, filter_spec=args.filter, where=args.where, max_values=args.max_values,
                             batch=args.batch, log=log)
         if type_checks:
             out["type_checks"] = type_checks
+        if not_probed:
+            out["not_probed"] = not_probed
+        out["warnings"] = list(out.get("warnings") or []) + time_attribute_floor(scope)
         out["sources"] = source_info(scope=args.scope)
         _write_json(args.out, out)
         if _pending(runner):

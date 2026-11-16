@@ -2913,3 +2913,64 @@ class DevOpenItemTests(unittest.TestCase):
         self.assertEqual(set(out), {"Month", "Code"})
         self.assertEqual(out["Month"]["verdict"], "values kept")
         self.assertNotEqual(out["Code"]["verdict"], "values kept")
+
+
+class DevOpenItems8To12Tests(unittest.TestCase):
+    NEW = DateFilterRewriteTests.NEW
+    MID = DateFilterRewriteTests.MID
+
+    def test_a_date_test_in_a_case_with_another_attribute_stays_a_date(self):
+        (c,) = am.date_filter_changes(self.MID, self.NEW)
+        sql = ('SELECT SUM(CASE WHEN "reporting period" = DATE \'2021-12-01\' AND "region" = \'N\' THEN 1 ELSE 0 END), '
+               'SUM(CASE WHEN "reporting period" = DATE \'2021-11-01\' THEN 1 END) FROM m '
+               'WHERE "reporting period" = DATE \'2021-12-01\'')
+        out, n = am.rewrite_date_filters(sql, c)
+        self.assertEqual(n, 2)
+        self.assertIn('WHEN "reporting period" = DATE \'2021-12-01\' AND "region"', out)
+        self.assertIn('WHEN "reporting period (month)__id" = 202111 THEN', out)
+        self.assertTrue(out.endswith('WHERE "reporting period (month)__id" = 202112'))
+        (c0,) = am.date_filter_changes(DateFilterRewriteTests.OLD, self.NEW)     # both at once
+        out, _ = am.rewrite_date_filters('SUM(CASE WHEN "reporting period" = 202112 AND "region" = \'N\' THEN 1 END)',
+                                         c0)
+        self.assertIn('"reporting period" = DATE \'2021-12-01\'', out)
+
+    def test_a_modified_lost_relationship_is_checked_as_wired(self):
+        f = {"id": "L-a-b", "source": "join-paths",
+             "checks": [{"command": "join-paths", "relationship": ["A", "B"], "expect": "present"}],
+             "actions": [{"kind": "wire_relationships", "args": {"relationships": [
+                 {"parent_attribute": "B", "child_attribute": "A", "type": "one_to_one"}]}}]}
+        doc = {"findings": [f]}
+        self.assertEqual(am.resolved_findings(doc, [], [{"parent": "b", "child": "a"}])["resolved"], ["L-a-b"])
+        self.assertEqual(am.resolved_findings(doc, [], [{"parent": "a", "child": "b"}])["still_present"], ["L-a-b"])
+
+    def test_blank_dates_in_time_attributes_are_reported(self):
+        scope = {"attributes": [{"name": "Exit Date", "type": "date", "profile": {"min": "2018-03-01"}},
+                                {"name": "Exit Date (year)", "type": "integer", "profile": {"min": "1899"}},
+                                {"name": "Exit Date (month)__id", "type": "integer", "profile": {"min": "189912"}},
+                                {"name": "Start Date", "type": "date", "profile": {"min": "2018-01-01"}},
+                                {"name": "Start Date (year)", "type": "integer", "profile": {"min": "2018"}}]}
+        (w,) = am.time_attribute_floor(scope)
+        self.assertIn("Exit Date (year)", w)
+        self.assertIn("1899", w)
+
+    def test_the_changed_list_is_trimmed_before_probing(self):
+        scope = {"attributes": [{"name": "Exit Date", "type": "date"},
+                                {"name": "Score", "type": "integer", "profile": {"distinct_values": 420}},
+                                {"name": "Band", "type": "integer", "profile": {"distinct_values": 6}}]}
+        names = ["Exit Date (year)", "Exit Date (year)__desc", "Exit Date (month)", "Exit Date (month)__id",
+                 "Score", "Band", "Band__desc"]
+        kept, skipped = am.trim_probe_list(names, scope)
+        self.assertEqual(kept, ["Exit Date (year)", "Band"])
+        self.assertIn("continuous", skipped["Score"])
+        self.assertIn("(year)", skipped["Exit Date (month)"])
+
+    def test_a_phase_that_adds_attributes_asks_for_a_studio_publish(self):
+        rel = {"parent_attribute": "A", "child_attribute": "B", "relationship_table": "t", "type": "one_to_many"}
+        plan = am.build_plan({"findings": [_finding("J1", "relationship", actions=[
+            {"kind": "wire_relationships", "args": {"relationships": [rel]}}])]}, model_id="M")
+        (ph,) = [p for p in plan["phases"] if any(st["kind"] == "wire_relationships" for st in p["steps"])]
+        whats = [a["what"] for a in ph["after"]]
+        self.assertTrue(whats[0].startswith("Republish"))
+        self.assertTrue(whats[1].startswith("Publish the model from Studio"))
+        self.assertTrue(whats[2].startswith("Re-certify"))
+        self.assertTrue(ph["after"][1]["confirm"])

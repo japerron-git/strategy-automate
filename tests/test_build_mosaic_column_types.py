@@ -488,3 +488,17 @@ class ExportShapeTests(unittest.TestCase):
         a, b = bm.column_type_table_patch(t, targets), bm.column_type_table_patch(as_object, targets)
         self.assertEqual(a[0], b[0])
         self.assertIsInstance(b[0]["pipeline"], str)
+
+
+class PlainOutputTests(unittest.TestCase):
+    def test_one_ascii_stream_only_when_asked(self):
+        import plain_output
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(sys, "stdout", out), unittest.mock.patch.object(sys, "stderr", err):
+            self.assertFalse(plain_output.enable({}))
+            self.assertTrue(plain_output.enable({"MOSAIC_PLAIN_OUTPUT": "1"}))
+            print("  ✓ would PUT A→B …")
+            print("[auth] waiting…", file=sys.stderr)
+            print("café")
+        self.assertEqual(out.getvalue(), "  OK would PUT A->B ...\n[auth] waiting...\ncaf\\xe9\n")
+        self.assertEqual(err.getvalue(), "")

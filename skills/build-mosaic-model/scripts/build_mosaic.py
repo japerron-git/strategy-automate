@@ -77,6 +77,7 @@ sys.path.insert(0, _PLATFORM)   # shared core: sign-in, API client, MCP
 import schema_object_translator as sot  # noqa: E402
 import mosaic_safety as ms  # noqa: E402
 import strategy_auth  # noqa: E402
+import plain_output  # noqa: E402
 
 # ── Configuration: all tenant values come from env vars or CLI flags ──────────
 # No hardcoded tenant defaults. Required: MSTR_BASE, MSTR_USER, MSTR_PASSWORD.
@@ -3574,7 +3575,9 @@ def _mosaic_publish_verified(m: MSTR, model_id: str, *, poll_seconds: int = 180,
         tables_loaded = False
         loaded_at = 0.0
         retriggered = False
+        polls = 0
         while time.time() < deadline:
+            polls += 1
             if probe_decides and tables_loaded and not retriggered and time.time() - loaded_at >= LOADED_BUT_SILENT_S:
                 # seen live (2026-10-28): every table said completed, the model never loaded (size 0) and kept refusing
                 # queries; a second publish on a fresh instance loaded it in seconds. The first instance is idle by now.
@@ -3618,6 +3621,12 @@ def _mosaic_publish_verified(m: MSTR, model_id: str, *, poll_seconds: int = 180,
             if tbl and all(str(t.get("status") or "").lower() in ("loaded", "completed") for t in tbl):
                 if not probe_decides:
                     print(f"  ✓ mosaic publish COMPLETE: {len(tbl)} tables loaded.", file=sys.stderr)
+                    if polls == 1:
+                        # seen live (2026-11-15): on a republish every table said completed at the first poll, and new
+                        # attributes and relationships reached the connector only after a publish from Studio
+                        print("  ↳ every table said completed at the first poll: on a republish this can be the "
+                              "previous job's status. New attributes or relationships may need a publish from "
+                              "Studio; check one in the connector.", file=sys.stderr)
                     return
                 # seen live (2026-10-28, a cross-store model): every table said completed within seconds while the model
                 # went on loading for minutes and did not answer; a first publish is complete only when the model answers
@@ -7980,6 +7989,7 @@ class ExportClient:
 
 
 def main():
+    plain_output.enable()   # run from a generated PowerShell script: one ASCII stream (see plain_output.py)
     args = build_parser().parse_args()
     if any(a.split("=", 1)[0] in _SECRET_FLAGS for a in sys.argv[1:]):
         print("[auth] WARN: secrets passed as command-line flags are visible to other processes (ps) and "
