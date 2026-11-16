@@ -82,6 +82,7 @@ COLUMN_TYPES = ("text", "integer", "bigint", "double", "date", "timestamp")   # 
 # Changes made once for the whole plan, at the start of one phase; other phases get a note.
 MERGED_KINDS = {"source_change": 1, "change_column_type": 2, "wire_relationships": 3, "add_time_attributes": 3,
                 "rename_describe": 6}
+NO_REPUBLISH_MERGED = ("rename_describe",)   # merged steps whose change shows without a republish
 MERGED_NOTES = {"source_change": "Source change done in the phase {phase} rebuild",
                 "change_column_type": "Column type change done in phase {phase} (set-column-types)",
                 "wire_relationships": "Relationships declared in phase {phase} (wire-relationships)",
@@ -3841,6 +3842,20 @@ def _arg_list(value: Any) -> list[str]:
     return [str(v) for v in (value if isinstance(value, list) else [value])]
 
 
+def compound_formula_problem(formula: str) -> str | None:
+    """Why build_mosaic.py create-compound-metric would refuse this formula (syntax only), or None."""
+    import build_mosaic   # the command's own parser; imported here to keep assess_model's start-up light
+    return build_mosaic.compound_formula_problem(formula)
+
+
+def compound_join_warning(fid: str, args: dict) -> str | None:
+    """A tree compound without join: outer drops rows whose operand is blank (derived-metrics note §0d rule 7)."""
+    if args.get("join"):
+        return None
+    return (f"{fid}: compound '{args.get('name')}' has no join, so a row whose operand has no data drops from the "
+            f"result; set join: outer, or join: inner when dropping those rows is intended")
+
+
 def action_commands(action: dict, model_id: str, python: str = "python3") -> dict[str, Any]:
     """One finding action → {"dry_run": argv | None, "apply": argv | None, "manual": text | None,
     "problems": [...]}."""
@@ -3887,7 +3902,7 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
             argv.append("--replace")
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "create_compound_metric":
-        need("name", "formula")
+        need("name", "formula")   # formula syntax and join are checked by check_findings, which plan runs first
         argv = base + ["create-compound-metric", "--model-id", model_id, "--name", str(a.get("name", "")),
                        "--formula", str(a.get("formula", ""))]
         for flag, key in (("--join", "join"), ("--format", "format"), ("--description", "description")):
@@ -4353,6 +4368,10 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                                     f"({formula_attrs[str(u).lower()]}); replacing that attribute later deletes "
                                     f"this metric. Prefer a lookup table for it")
         for a in f.get("actions") or []:
+            if a.get("kind") == "create_compound_metric":
+                warn = compound_join_warning(f["id"], a.get("args") or {})
+                if warn:
+                    warnings.append(warn)
             formula = str((a.get("args") or {}).get("formula") or "") if a.get("kind") == "create_formula_attribute" else ""
             new_fns = sorted({fn for fn in re.findall(r"([A-Za-z_]\w*)\s*\(", formula)
                               if fn.lower() not in VERIFIED_FORMULA_FUNCTIONS})
@@ -4478,7 +4497,10 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         if n == 3:
             before.append("For every attribute removed or replaced: list the derived metrics that filter on "
                           "it (they are deleted with it) and plan to recreate them.")
-        republish = n in REPUBLISH_PHASES or any(f.get("republish") for f in items) or bool(merged_steps.get(n))
+        # names and descriptions take effect on commit (memory/reference_mosaic_rest_gotchas.md; seen again live
+        # 2026-11-16: 19 descriptions and the model description showed after a re-certify alone)
+        republish = (n in REPUBLISH_PHASES or any(f.get("republish") for f in items)
+                     or any(st.get("kind") not in NO_REPUBLISH_MERGED for st in merged_steps.get(n, [])))
         own = [a for f in items for a in f.get("actions") or [{"kind": "manual"}]]
         if not merged_steps.get(n) and own and all(a.get("kind") in MERGED_KINDS and MERGED_KINDS[a["kind"]] != n
                                                    for a in own) and not any(f.get("republish") for f in items):
@@ -4707,6 +4729,15 @@ def check_findings(doc: dict) -> dict[str, Any]:
         for action in f.get("actions") or []:
             if action.get("kind") not in ACTION_KINDS:
                 problems.append(f"{fid}: unknown action kind '{action.get('kind')}'")
+            elif action.get("kind") == "create_compound_metric":
+                cargs = action.get("args") or {}
+                bad = compound_formula_problem(str(cargs["formula"])) if cargs.get("formula") else None
+                if bad:
+                    problems.append(f"{fid}: compound '{cargs.get('name')}': {bad}")
+                if cargs.get("join") not in (None, "", "outer", "inner"):
+                    problems.append(f"{fid}: compound '{cargs.get('name')}': join must be outer or inner")
+                elif warn := compound_join_warning(fid, cargs):
+                    warnings.append(warn)
         if f.get("status") in ("modified", "declined") and not (f.get("decision_note") or "").strip():
             warnings.append(f"{fid}: {f.get('status')} without a decision_note")
         if not f.get("tests"):

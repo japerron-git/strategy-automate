@@ -67,7 +67,7 @@ rejects a path with 404, use `discover` to find the current variant on this
 tenant's API and update ENDPOINT_CANDIDATES below.
 """
 from __future__ import annotations
-import argparse, copy, csv, json, os, shutil, subprocess, sys, time, urllib.parse, uuid
+import argparse, contextlib, copy, csv, io, json, os, shutil, subprocess, sys, time, urllib.parse, uuid
 from typing import Any
 import requests
 
@@ -5233,6 +5233,21 @@ def compound_metric_tree(formula: str, resolve) -> dict:
     if not any(t.group("ref") or t.group("id") for t in toks):
         die("formula references no metric")
     return tree
+
+
+def compound_formula_problem(formula: str) -> str | None:
+    """Why `compound_metric_tree` would refuse `formula`, or None. Offline: operands are not resolved,
+    only the syntax is read, by the same parser the command uses."""
+    if "{" in formula or "}" in formula:
+        return ("formula writes an operand as {name}, the form Mosaic displays; write it as [name] "
+                "(for example [Revenue] - [Cost])")
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            compound_metric_tree(formula, lambda raw: {"objectId": raw, "subType": "metric", "name": raw})
+    except SystemExit:
+        return err.getvalue().strip().removeprefix("FATAL: ") or "formula cannot be read"
+    return None
 
 
 def compound_metric_body(name: str, tree: dict, *, description: str = "", join: str = "",

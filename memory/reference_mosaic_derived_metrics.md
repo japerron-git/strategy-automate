@@ -189,13 +189,13 @@ Then **commit**. On any failure, discard the changeset — the half-built metric
 filter go with it. The conditional metric composes like any derived metric: a tree `divide` of it
 over its unfiltered source (a filtered share of the total) evaluated correctly in the same run.
 
-**Rewriting a conditional metric in place (not yet verified live, 2026-11-16).** A POST with an existing
-derived metric's name fails with `8004e409` ("object name ... is duplicated"), so a corrected definition
-must rewrite the metric. `create-conditional-metric --replace` does it in ONE changeset: `POST
+**Rewriting a conditional metric in place (verified live, 2026-11-16).** A POST with an existing derived
+metric's name fails with `8004e409` ("object name ... is duplicated"), so a corrected definition must rewrite
+the metric. `create-conditional-metric --replace` does it in ONE changeset: `POST
 .../metrics/{id}/embeddedObjects` (a new filter in the existing metric) → `PUT .../metrics/{id}` with the full
-filter-bound body → commit. The objectId stays, so metrics built on it keep their reference. Unverified: what
-the service does with the previous embedded filter (the helper reports its id as
-`previous_embedded_filter_id`), and whether the PUT accepts a change of function or level rule.
+filter-bound body → commit. Live on 9 metrics: each kept its objectId and, after certification, returned the expected
+values; 8 of them had no embedded filter before (`previous_embedded_filter_id` null) and took one. Still unverified: whether the previous embedded filter object stays in
+the model (the connector can't show it; a read-only REST read of the model would).
 
 ## 0d. Periodic-snapshot facts — once-per-entity, filtered and point-in-time metrics (verified 2026-10-30/31)
 

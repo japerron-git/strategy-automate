@@ -42,6 +42,9 @@ so a second pass to align them found nothing to write. `build_mosaic.py set-colu
 ## Renames and descriptions (verified 2026-10-30/31)
 `PATCH /api/model/dataModels/{mid}/attributes/{id}` or `.../factMetrics/{id}` with `{"information": {"name",
 "description"}}` inside a changeset renames and/or describes; it takes effect on commit, with no republish.
+Seen again live (2026-11-16): 19 attribute and metric descriptions and the model description showed in the
+connector after a re-certify alone, so `plan` adds no republish for a phase whose only extra step is
+`rename_describe` (re-certify stays).
 Descriptions over 250 characters are refused. Derived metrics need a full-body PUT instead: read the
 metric with `?showExpressionAs=tokens` (otherwise the expression comes back as read-only text), change
 `information.description`, PUT the whole body back. Verified live (2026-11-14): only the description

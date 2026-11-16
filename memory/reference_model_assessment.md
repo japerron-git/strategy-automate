@@ -565,7 +565,8 @@ label column is listed as an attribute that no metric filters on.
 - **`rename_describe`** (`items`: `{object_type: attribute | fact_metric, current_name, new_name,
   description}`, descriptions at most 250 characters): `plan` merges every item into one
   `build_mosaic.py rename-describe` command in phase 6 and ships its spec as `specs/rename_describe.json`.
-  Takes effect at once, no republish; derived metrics take their description when they are created.
+  Takes effect at once, no republish (`plan` adds none for it; re-certify stays); derived metrics take their
+  description when they are created.
   Use it for every rename and description change instead of a manual step. Name the attribute, not a
   connector form name (`<attribute>__<form>`): forms share the attribute's description, so write one
   description that covers them. `plan` warns on form names and refuses a form rename or two different
@@ -611,6 +612,10 @@ for `create_weighted_average`: `name`, exactly one of `value_attribute` / `value
 `replace: true` rewrites the derived metric of the same name in place, keeping its objectId. Only
 `create_conditional_metric` and `create_compound_metric` take it (`plan` reports it as a problem on any other
 kind); without it an existing name stops the step, dry run included.
+A `create_compound_metric` `formula` writes operands as `[metric name]` (or an objectId), never `{name}`, the
+form Mosaic displays and `get_semantics` prints: `[Revenue] - [Cost]`. Set `join: outer` unless dropping a row
+whose operand is blank is intended (then `join: inner`); derived-metrics note §0d rule 7. `check --findings` and
+`plan` read the formula with the command's own parser and report one it would refuse; both warn on a missing join.
 
 **change_plan.json** (written by `plan`): phases in order, each with its steps (finding id, action,
 dry-run command, apply command), `before`, `unit_tests`, `regression` and `after` lists.

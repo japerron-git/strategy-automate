@@ -305,6 +305,24 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(any("later phase" in p for p in plan["problems"]))
         self.assertTrue(any("F3 depends on F4, which is proposed" in w for w in plan["warnings"]))
 
+    def test_compound_formula_and_join_are_checked_before_a_script_is_made(self):
+        def compound(**args):
+            return {"kind": "create_compound_metric", "args": dict({"name": "Margin"}, **args)}
+        bad_join = am.check_findings({"findings": [_finding("C0", "metric_defect",
+                                                            actions=[compound(formula="[A] - [B]", join="left")])]})
+        self.assertTrue(any("join must be outer or inner" in p for p in bad_join["problems"]))
+
+        doc = {"findings": [_finding("C1", "metric_defect", actions=[compound(formula="{Revenue} - {Cost}")]),
+                            _finding("C2", "metric_defect", actions=[compound(formula="[Revenue] - [Cost]")]),
+                            _finding("C3", "metric_defect", actions=[compound(formula="[A] - [B]", join="inner")])]}
+        report = am.check_findings(doc)
+        self.assertEqual([p.split(":")[0] for p in report["problems"]], ["C1"])
+        joins = [w.split(":")[0] for w in report["warnings"] if "has no join" in w]
+        self.assertEqual(joins, ["C1", "C2"])
+        plan = am.build_plan(doc, model_id="M")
+        self.assertEqual([p.split(":")[0] for p in plan["problems"] if "[name]" in p], ["C1"])   # reported once
+        self.assertEqual([w.split(":")[0] for w in plan["warnings"] if "has no join" in w], ["C1", "C2"])
+
     def test_replace_reaches_the_conditional_metric_command(self):
         cond = am.action_commands({"kind": "create_conditional_metric", "args": {
             "name": "Closed Count", "source_metric": "Rows", "function": "Count", "attribute": "Status",
@@ -2984,6 +3002,19 @@ class DevOpenItems8To12Tests(unittest.TestCase):
         self.assertEqual(kept, ["Exit Date (year)", "Band"])
         self.assertIn("continuous", skipped["Score"])
         self.assertIn("(year)", skipped["Exit Date (month)"])
+
+    def test_a_phase_of_names_and_descriptions_asks_for_no_republish(self):
+        rd = {"kind": "rename_describe", "args": {"items": [
+            {"object_type": "attribute", "current_name": "region", "new_name": "Region", "description": "Sales area"},
+            {"object_type": "model", "description": "Orders and customers"}]}}
+        plan = am.build_plan({"findings": [_finding("D1", "description", actions=[rd])]}, model_id="M")
+        (ph,) = [p for p in plan["phases"] if p["phase"] == 6]
+        self.assertEqual([a["what"].split(" ")[0] for a in ph["after"]], ["Re-certify"])
+        # still republished when the phase has its own reason to
+        plan = am.build_plan({"findings": [_finding("D1", "description", republish=True, actions=[rd])]},
+                             model_id="M")
+        (ph,) = [p for p in plan["phases"] if p["phase"] == 6]
+        self.assertEqual([a["what"].split(" ")[0] for a in ph["after"]], ["Republish", "Re-certify"])
 
     def test_a_patch_to_an_attribute_or_table_asks_for_a_studio_publish(self):
         def after_for(object_kind):

@@ -314,6 +314,18 @@ class CompoundTreeTests(unittest.TestCase):
         self.assertEqual(outer["format"]["values"], bm._resolve_metric_format("currency"))
 
 
+class CompoundFormulaProblemTests(unittest.TestCase):
+    def test_reads_like_the_command_without_printing(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIsNone(bm.compound_formula_problem("([Revenue] - [Cost]) / [Revenue] * 100"))
+            self.assertIn("[name]", bm.compound_formula_problem("{Revenue} - {Cost}"))
+            self.assertIn("ends after an operator", bm.compound_formula_problem("[Revenue] -"))
+            self.assertIn("missing )", bm.compound_formula_problem("([Revenue] - [Cost]"))
+            self.assertIn("references no metric", bm.compound_formula_problem("1 + 2"))
+        self.assertEqual(err.getvalue(), "")
+
+
 class CompoundFlowTests(unittest.TestCase):
     def test_create_posts_the_tree_in_one_changeset(self):
         fake = _FakeMSTR(_metrics_routes())
