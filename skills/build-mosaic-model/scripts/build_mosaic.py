@@ -5504,6 +5504,193 @@ def attribute_name_candidates(name: str) -> list[str]:
     return list(dict.fromkeys(x for x in out if x))
 
 
+# ── Time-shift metrics (Mosaic time transformations) ───────────────────────────────────────────
+# A derived metric `Agg(PreviousMonth({Date} (ID), 1, Metric))`. Body copied from a Studio-built PreviousMonth
+# metric (captured 2026-11-17, memory/reference_mosaic_derived_metrics.md §0e). Only PreviousMonth has been seen;
+# the other functions follow the same pattern and need --unverified-ok until one is captured.
+TIME_SHIFT_FUNCTIONS = ("PreviousDay", "PreviousWeek", "PreviousMonth", "PreviousQuarter", "PreviousYear",
+                        "MonthToDate", "QuarterToDate", "YearToDate")
+TIME_SHIFT_VERIFIED = ("PreviousMonth",)
+TIME_SHIFT_FUNCTION_IDS = {"PreviousMonth": "B73B646EAF134F989008DFBC7272EDB4"}   # seen in the captured metric
+TIME_SHIFT_AGGREGATIONS = ("Sum", "Min", "Max", "Count", "Avg")
+ID_FORM = "45C11FA478E745FEA08D781CEA190FE5"
+
+
+def time_shift_period(function: str) -> str:
+    """'PreviousMonth' / 'MonthToDate' -> 'month'."""
+    return _re.sub(r"^Previous|ToDate$", "", function).lower()
+
+
+def time_shift_text(function: str, attribute: dict, periods: int | None, source: dict, aggregation: str) -> str:
+    """The formula as the service shows it: Sum(PreviousMonth({Activity Month Key} (ID),1,Dummy))."""
+    args = [f"{{{attribute['name']}}} (ID)"] + ([str(periods)] if function.startswith("Previous") else [])
+    return f"{aggregation}({function}({','.join(args + [source['name']])}))"
+
+
+def time_shift_tokens(function: str, attribute: dict, periods: int | None, source: dict,
+                      aggregation: str = "Sum") -> list[dict]:
+    """Tokens for `Agg<UseLookupForAttributes=False>(Fn([Date]@ID, n, Metric){~+}){~+}`, as Studio stores them."""
+    def fn_token(name: str, ids: dict) -> dict:
+        tok: dict = {"type": "function", "value": name}
+        if name in ids:
+            tok["target"] = {"objectId": ids[name], "subType": "function", "name": name}
+        return tok
+
+    def ch(v: str) -> dict:
+        return {"type": "character", "value": v}
+
+    report_level = [ch("{"), ch("~"), ch("+"), ch("}")]
+    tokens = [fn_token(aggregation, AGG_FUNCTION_IDS), ch("<"), {"type": "identifier", "value": "UseLookupForAttributes"},
+              {"type": "function", "value": "="}, {"type": "boolean", "value": "False"}, ch(">"), ch("("),
+              fn_token(function, TIME_SHIFT_FUNCTION_IDS), ch("("),
+              {"type": "object_at_form", "value": f"[{attribute['name']}]@ID",
+               "target": {"objectId": attribute["objectId"], "subType": "attribute", "name": attribute["name"]},
+               "attributeForm": {"objectId": ID_FORM}}, ch(",")]
+    if function.startswith("Previous"):
+        tokens += [{"type": "integer", "value": str(periods)}, ch(",")]
+    tokens += [{"type": "object_reference", "value": source["name"],
+                "target": {"objectId": source["objectId"], "subType": source["subType"], "name": source["name"]}},
+               ch(")")] + report_level + [ch(")")] + report_level + [{"type": "end_of_text", "value": ""}]
+    return tokens
+
+
+def time_shift_metric_body(name: str, function: str, attribute: dict, periods: int | None, source: dict,
+                           aggregation: str = "Sum", fmt_values: list | None = None, description: str = "") -> dict:
+    info = {"name": name, "subType": "metric"}
+    if description:
+        info["description"] = description
+    return {"information": info,
+            "expression": {"text": time_shift_text(function, attribute, periods, source, aggregation),
+                           "tokens": time_shift_tokens(function, attribute, periods, source, aggregation)},
+            "dimty": {"dimtyUnits": [{"dimtyUnitType": "report_base_level", "aggregation": "normal",
+                                      "filtering": "apply", "groupBy": True}],
+                      "excludeAttribute": False, "allowAddingUnit": True},
+            "format": {"header": [], "values": list(fmt_values or [])}}
+
+
+def _smart_types(attribute_body: dict) -> set[str]:
+    out = set()
+    for sa in attribute_body.get("smartAttributes") or []:
+        t = (sa.get("definition") or {}).get("smartAttributeType") or sa.get("smartAttributeType")
+        if t:
+            out.add(str(t))
+    return out
+
+
+def _norm_formula(text: str) -> str:
+    return _re.sub(r"\s+", "", str(text or "")).lower()
+
+
+def cmd_create_time_shift_metric(m: MSTR, args):
+    """Create (or, with --replace, rewrite in place) a time-shift metric: `Agg(Fn({Date} (ID), n, Metric))` with
+    Fn one of TIME_SHIFT_FUNCTIONS (PreviousMonth verified; the rest need --unverified-ok).
+
+    The date attribute must have time attributes for the function's period and a Day interval (Studio adds Day
+    and Week, hidden, when the model is published from Studio). A derived metric of the same name stops the
+    command unless --replace (full-body PUT on the same objectId); a fact metric of the same name always does.
+    After commit the formula is read back and compared with the expected text.
+
+    It reads right only grouped by the date's period attribute (memory §0e): no grouping returns the unshifted
+    total; a coarser period, an ungrouped one-period filter or a latest-period flag reads blank.
+    """
+    function = args.function
+    if function not in TIME_SHIFT_FUNCTIONS:
+        die(f"--function must be one of {list(TIME_SHIFT_FUNCTIONS)}")
+    if function not in TIME_SHIFT_VERIFIED:
+        _require_unverified_ok(args, f"create-time-shift-metric --function {function}",
+                               f"only {', '.join(TIME_SHIFT_VERIFIED)} has been seen in a Studio-built metric.")
+    periods = getattr(args, "periods", None)
+    if function.endswith("ToDate"):
+        if periods is not None:
+            die(f"--periods applies to Previous* functions only, not {function}")
+    else:
+        periods = 1 if periods is None else periods
+        if periods < 1:
+            die("--periods must be 1 or more")
+    aggregation = getattr(args, "aggregation", None) or "Sum"
+    if aggregation not in TIME_SHIFT_AGGREGATIONS:
+        die(f"--aggregation must be one of {list(TIME_SHIFT_AGGREGATIONS)}")
+    description = _check_description(getattr(args, "description", "") or "")
+    fmt_preset = getattr(args, "format", None)
+
+    m.login(identity=True)
+    mp = f"/api/model/dataModels/{args.model_id}"
+    q = {"showAdvancedProperties": "true"}
+    attribute = resolve_model_object_ref(m, args.model_id, "attributes", "attribute", args.time_attribute)
+    r = m.get(f"{mp}/attributes/{attribute['objectId']}")
+    if not r.ok: die(f"read '{attribute['name']}': {format_mstr_error(r)}")
+    types = _smart_types(_json_or(r, {}))
+    period = time_shift_period(function)
+    missing = [t for t in ("day_interval", f"{period}_interval") if t not in types]
+    if missing:
+        die(f"'{attribute['name']}' has no {' / '.join(missing)} time attribute (has: {sorted(types) or 'none'}). "
+            f"Add time attributes (add-time-attributes) and publish the model from Studio once: Studio adds the "
+            f"hidden Day and Week attributes the function needs.")
+    facts, derived = _list_model_metrics(m, args.model_id)
+    source = _resolve_metric_operand(_metric_operand_index(facts, derived), args.source_metric)
+
+    lowered = args.name.lower()
+    if any((i.get("name") or "").lower() == lowered for i in _named(facts, args.name)):
+        die(f"'{args.name}' is a fact metric; pick another name (a time-shift metric is a derived metric)")
+    existing = [i for i in _named(derived, args.name) if (i.get("name") or "").lower() == lowered]
+    if len(existing) > 1:
+        die(f"'{args.name}' names {len(existing)} derived metrics: {[e.get('objectId') for e in existing]}")
+    replace = bool(getattr(args, "replace", False))
+    if existing and not replace:
+        die(f"a derived metric named '{args.name}' already exists ({existing[0].get('objectId')}); "
+            f"pass --replace to rewrite it in place")
+    if replace and not existing:
+        die(f"--replace: no derived metric named '{args.name}' on this model")
+    target_id = existing[0]["objectId"] if existing else None
+    cur: dict = {}
+    if target_id:
+        r = m.get(f"{mp}/metrics/{target_id}", params=q)
+        if not r.ok: die(f"read '{args.name}': {format_mstr_error(r)}")
+        cur = _json_or(r, {})
+        description = description or (cur.get("information") or {}).get("description") or ""
+    if fmt_preset:
+        fmt_values = _resolve_metric_format(fmt_preset)
+    elif target_id and (cur.get("format") or {}).get("values"):
+        fmt_values = cur["format"]["values"]
+    elif source["subType"] == "fact_metric":
+        r = m.get(f"{mp}/factMetrics/{source['objectId']}")
+        fmt_values = ((_json_or(r, {}) or {}).get("format") or {}).get("values") if r.ok else None
+    else:
+        fmt_values = None
+    body = time_shift_metric_body(args.name, function, attribute, periods, source, aggregation, fmt_values,
+                                  description)
+    expected = body["expression"]["text"]
+    if getattr(args, "dry_run", False):
+        step = ({"step": "replace", "method": "PUT", "path": f"{mp}/metrics/{target_id}"} if target_id
+                else {"step": "create", "method": "POST", "path": f"{mp}/metrics"})
+        print(json.dumps({"ok": True, "dry_run": True, "action": "replace" if target_id else "create",
+                          "formula": expected, "time_attributes": sorted(types),
+                          "plan": [dict(step, params=q, body=body)]}, indent=2))
+        return
+    cs = open_cs(m)
+    try:
+        if target_id:
+            r = m.put(f"{mp}/metrics/{target_id}", params=q, json=body)
+            if not r.ok: die(f"replace metric: {format_mstr_error(r)}")
+            metric_id = target_id
+        else:
+            r = m.post(f"{mp}/metrics", params=q, json=body)
+            if not r.ok: die(f"create metric: {format_mstr_error(r)}")
+            metric_id = (_json_or(r, {}).get("information") or {}).get("objectId")
+            if not metric_id: die("create metric: no objectId in the reply")
+        commit_cs(m, cs)
+    except BaseException:  # die() raises SystemExit; discard on every failure path
+        discard_cs(m, cs)
+        raise
+    r = m.get(f"{mp}/metrics/{metric_id}")
+    got = ((_json_or(r, {}) or {}).get("expression") or {}).get("text") if r.ok else None
+    result = {"ok": _norm_formula(got) == _norm_formula(expected), "metric_id": metric_id,
+              "action": "replaced" if target_id else "created", "formula": got, "expected": expected}
+    print(json.dumps(result, indent=2))
+    if not result["ok"]:
+        die(f"'{args.name}' was saved but reads back as {got!r}, not {expected!r}: check it in Studio")
+
+
 def resolve_model_object_ref(m: MSTR, model_id: str, collection: str, sub_type: str,
                              name_or_id: str) -> dict:
     """Name (case-insensitive) or objectId → {"objectId", "subType", "name"} from a
@@ -7790,6 +7977,26 @@ def build_parser():
     sp.add_argument("--unverified-ok", action="store_true",
                     help="no longer needed (the tree path is verified); accepted so old scripts still run")
 
+    sp = sub.add_parser("create-time-shift-metric",
+                        help="derived metric Agg(PreviousMonth({Date} (ID), n, Metric)) and other Mosaic time "
+                             "transformation functions (PreviousMonth verified; others need --unverified-ok)")
+    sp.add_argument("--model-id", required=True)
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--function", required=True, choices=list(TIME_SHIFT_FUNCTIONS))
+    sp.add_argument("--time-attribute", required=True,
+                    help="the base date attribute (name or objectId), not one of its (month) attributes")
+    sp.add_argument("--periods", type=int, help="periods back for Previous* functions (default 1)")
+    sp.add_argument("--source-metric", required=True,
+                    help="the metric to shift: a fact or derived metric name, objectId, or fact_metric:<name>")
+    sp.add_argument("--aggregation", choices=list(TIME_SHIFT_AGGREGATIONS), help="outer function (default Sum)")
+    sp.add_argument("--format", help="number format preset (default: the source fact metric's)")
+    sp.add_argument("--description", default="", help=f"business description (max {DESCRIPTION_MAX} characters)")
+    sp.add_argument("--replace", action="store_true",
+                    help="rewrite the derived metric of this name in place (keeps its objectId)")
+    sp.add_argument("--unverified-ok", action="store_true",
+                    help="allow a function no Studio-built metric has confirmed yet")
+    sp.add_argument("--dry-run", action="store_true", help="check names and print the request; open no changeset")
+
     sp = sub.add_parser("create-conditional-metric",
         help="Derived metric scoped by a filter embedded in the metric (<attribute> IN (<elements>), "
              "optionally ANDed with more), with an optional latest/first-period level rule, in one "
@@ -8110,6 +8317,7 @@ def main():
             "create-transformation": cmd_create_transformation,
             "create-compound-metric": cmd_create_compound_metric,
             "create-conditional-metric": cmd_create_conditional_metric,
+            "create-time-shift-metric": cmd_create_time_shift_metric,
             "delete-derived-metric": cmd_delete_derived_metric,
             "create-level-metric": cmd_create_level_metric,
             "create-weighted-average": cmd_create_weighted_average,

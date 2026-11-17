@@ -323,6 +323,43 @@ class PlanTests(unittest.TestCase):
         self.assertEqual([p.split(":")[0] for p in plan["problems"] if "[name]" in p], ["C1"])   # reported once
         self.assertEqual([w.split(":")[0] for w in plan["warnings"] if "has no join" in w], ["C1", "C2"])
 
+    def test_time_shift_metric_is_planned_with_its_reading_rule(self):
+        args = {"name": "Revenue (previous month)", "function": "PreviousMonth", "time_attribute": "order date",
+                "periods": 1, "source_metric": "Revenue", "description": "Group by order date (month)."}
+        c = am.action_commands({"kind": "create_time_shift_metric", "args": dict(args, replace=True)}, "MID")
+        self.assertEqual(c["problems"], [])
+        self.assertEqual(c["apply"][c["apply"].index("create-time-shift-metric"):], [
+            "create-time-shift-metric", "--model-id", "MID", "--name", "Revenue (previous month)",
+            "--function", "PreviousMonth", "--time-attribute", "order date", "--source-metric", "Revenue",
+            "--periods", "1", "--description", "Group by order date (month).", "--replace"])
+        self.assertEqual(c["dry_run"][-1], "--dry-run")
+        missing = am.action_commands({"kind": "create_time_shift_metric", "args": {"name": "X"}}, "MID")
+        self.assertEqual(sorted(p.split("args.")[1] for p in missing["problems"]),
+                         ["function", "source_metric", "time_attribute"])
+
+        plan = am.build_plan({"findings": [_finding("T1", "missing_metric", actions=[
+            {"kind": "create_time_shift_metric", "args": args}])]}, model_id="M")
+        self.assertEqual(plan["problems"], [])
+        (step,) = plan["phases"][0]["steps"]
+        self.assertTrue(any("grouped by the month of 'order date'" in r for r in step["risks"]))
+
+    def test_time_shift_args_are_checked(self):
+        def report(**args):
+            base = {"name": "S", "function": "PreviousMonth", "time_attribute": "d", "source_metric": "m",
+                    "description": "read by month"}
+            return am.check_findings({"findings": [_finding("T1", "missing_metric", actions=[
+                {"kind": "create_time_shift_metric", "args": {**base, **args}}])]})
+        self.assertEqual(report()["problems"], [])
+        self.assertEqual(report(periods=2)["problems"], [])
+        self.assertIn("function must be one of", report(function="LastMonth")["problems"][0])
+        self.assertIn("Previous* functions only", report(function="MonthToDate", periods=1)["problems"][0])
+        for bad in (0, -1, "1", True, 1.5):
+            self.assertIn("whole number", report(periods=bad)["problems"][0], bad)
+        self.assertIn("aggregation must be", report(aggregation="Median")["problems"][0])
+        self.assertTrue(any("no description" in w for w in report(description="")["warnings"]))
+        self.assertEqual(am.time_shift_period("QuarterToDate"), "quarter")
+        self.assertEqual(am.time_shift_period("PreviousYear"), "year")
+
     def test_replace_reaches_the_conditional_metric_command(self):
         cond = am.action_commands({"kind": "create_conditional_metric", "args": {
             "name": "Closed Count", "source_metric": "Rows", "function": "Count", "attribute": "Status",

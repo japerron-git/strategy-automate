@@ -83,6 +83,9 @@ Control aggregation level independent of the report template via `dimty` (spec `
 - "Share of parent" / "index vs peers": pin the parent attribute with `groupBy:true` and `filtering:"ignore"` (keeps the whole parent but honors filters in other hierarchies — §0b); `"apply"` shrinks the parent to the filtered children, `"absolute"` also drops filters in other hierarchies.
 
 ## Transformations (time-shift / YoY / prior period)
+**In a Mosaic model, use a time-shift derived metric instead** (`PreviousMonth(...)` and friends;
+`reference_mosaic_derived_metrics.md` §0e). What follows is the classic project-level object.
+
 Standalone **project-level** object — create first, then attach to metrics. There is no `/api/model/dataModels/{id}/transformations` (corrected 2026-10-05); the body below is an older sketch, not checked against the spec.
 
 Create:

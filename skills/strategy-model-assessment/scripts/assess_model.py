@@ -74,9 +74,13 @@ ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_d
                 "create_level_metric", "create_weighted_average", "patch_model_object", "patch_fact_metrics",
                 "add_lookup_table", "change_column_type", "source_change", "wire_relationships",
                 "create_formula_attribute", "add_column_attribute", "add_time_attributes", "rename_describe",
-                "show_forms", "remove_relationships", "publish", "certify", "manual")
+                "show_forms", "remove_relationships", "publish", "certify", "manual", "create_time_shift_metric")
+# Mosaic time transformation functions (Strategy One, Dec 2025 - Mar 2026): a derived metric over a date attribute
+TIME_SHIFT_FUNCTIONS = ("PreviousDay", "PreviousWeek", "PreviousMonth", "PreviousQuarter", "PreviousYear",
+                        "MonthToDate", "QuarterToDate", "YearToDate")
+TIME_SHIFT_AGGREGATIONS = ("Sum", "Min", "Max", "Count", "Avg")
 # args that switch a step from create to rewrite, and the kinds whose build_mosaic.py command takes them
-MODE_ARGS = {"replace": ("create_conditional_metric", "create_compound_metric"),
+MODE_ARGS = {"replace": ("create_conditional_metric", "create_compound_metric", "create_time_shift_metric"),
              "update": ("create_formula_attribute",)}
 COLUMN_TYPES = ("text", "integer", "bigint", "double", "date", "timestamp")   # build_mosaic.py set-column-types
 # Changes made once for the whole plan, at the start of one phase; other phases get a note.
@@ -3848,6 +3852,39 @@ def compound_formula_problem(formula: str) -> str | None:
     return build_mosaic.compound_formula_problem(formula)
 
 
+def time_shift_period(function: str) -> str:
+    """'PreviousMonth' / 'MonthToDate' -> 'month'."""
+    return re.sub(r"^Previous|ToDate$", "", function).lower()
+
+
+def time_shift_problems(args: dict) -> list[str]:
+    """Why create-time-shift-metric would refuse these args (offline)."""
+    out = []
+    fn = str(args.get("function") or "")
+    if fn and fn not in TIME_SHIFT_FUNCTIONS:
+        out.append(f"function must be one of {', '.join(TIME_SHIFT_FUNCTIONS)} (got '{fn}')")
+    periods = args.get("periods")
+    if periods not in (None, ""):
+        if fn.endswith("ToDate"):
+            out.append(f"periods applies to Previous* functions only, not {fn}")
+        elif isinstance(periods, bool) or not isinstance(periods, int) or periods < 1:
+            out.append(f"periods must be a whole number of 1 or more (got {periods!r})")
+    agg = args.get("aggregation")
+    if agg not in (None, "") and agg not in TIME_SHIFT_AGGREGATIONS:
+        out.append(f"aggregation must be one of {', '.join(TIME_SHIFT_AGGREGATIONS)} (got '{agg}')")
+    return out
+
+
+def time_shift_risk(args: dict) -> str:
+    """How a time-shift metric reads through the connector (seen live 2026-11-17 for PreviousMonth)."""
+    period = time_shift_period(str(args.get("function") or "")) or "period"
+    attr = args.get("time_attribute") or "its time attribute"
+    return (f"Reads right only grouped by the {period} of '{attr}' (its ({period}) attribute). With no grouping it "
+            f"returns the unshifted total; grouped by a coarser period, filtered to one {period} without grouping by "
+            f"it, filtered on a latest-period flag, or grouped with an attribute that changes between {period}s it "
+            f"reads blank (seen live for PreviousMonth, 17 Nov). Say so in its description.")
+
+
 def compound_join_warning(fid: str, args: dict) -> str | None:
     """A tree compound without join: outer drops rows whose operand is blank (derived-metrics note §0d rule 7)."""
     if args.get("join"):
@@ -3918,6 +3955,17 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         for flag, key in (("--inner", "inner"), ("--outer", "outer"), ("--format", "format"),
                           ("--description", "description")):
             opt(argv, flag, key)
+        return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
+    if kind == "create_time_shift_metric":   # function, periods and aggregation are checked by check_findings
+        need("name", "function", "time_attribute", "source_metric")
+        argv = base + ["create-time-shift-metric", "--model-id", model_id, "--name", str(a.get("name", "")),
+                       "--function", str(a.get("function", "")), "--time-attribute", str(a.get("time_attribute", "")),
+                       "--source-metric", str(a.get("source_metric", ""))]
+        for flag, key in (("--periods", "periods"), ("--aggregation", "aggregation"), ("--format", "format"),
+                          ("--description", "description")):
+            opt(argv, flag, key)
+        if a.get("replace"):
+            argv.append("--replace")
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "create_weighted_average":
         need("name", "weight_metric", "entity_attribute")
@@ -4485,6 +4533,8 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                               "risks": (f.get("risks") or []) if first else []})
                 if kind == "patch_model_object":
                     steps[-1]["object_kind"] = str((action.get("args") or {}).get("kind") or "")
+                if kind == "create_time_shift_metric":
+                    steps[-1]["risks"] = list(steps[-1]["risks"]) + [time_shift_risk(action.get("args") or {})]
                 if retype:
                     steps.append(retype)
         if lookups:
@@ -4734,6 +4784,12 @@ def check_findings(doc: dict) -> dict[str, Any]:
         for action in f.get("actions") or []:
             if action.get("kind") not in ACTION_KINDS:
                 problems.append(f"{fid}: unknown action kind '{action.get('kind')}'")
+            elif action.get("kind") == "create_time_shift_metric":
+                targs = action.get("args") or {}
+                problems.extend(f"{fid}: time shift '{targs.get('name')}': {p}" for p in time_shift_problems(targs))
+                if not str(targs.get("description") or "").strip():
+                    warnings.append(f"{fid}: time shift '{targs.get('name')}' has no description; say how to read "
+                                    f"it (group by its period; no latest-period filter)")
             elif action.get("kind") == "create_compound_metric":
                 cargs = action.get("args") or {}
                 bad = compound_formula_problem(str(cargs["formula"])) if cargs.get("formula") else None

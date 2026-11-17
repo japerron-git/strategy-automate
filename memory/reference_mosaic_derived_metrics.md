@@ -275,6 +275,41 @@ defaults to the fact metric's); `create-weighted-average --value-attribute <A> |
 their ratio with an outer join, one changeset each, and names any helpers already created if a later step
 fails). Each takes `--dry-run`.
 
+## 0e. Time-shift metrics (Mosaic time transformations): how they read (verified live 2026-11-17)
+Mosaic's "previous period" and "period to date" metrics are DERIVED metrics whose formula calls a time
+transformation function over a date attribute that has time attributes: `PreviousDay | PreviousWeek |
+PreviousMonth | PreviousQuarter | PreviousYear (<date attribute>, <periods>, <metric>)` and `MonthToDate |
+QuarterToDate | YearToDate (<date attribute>, <metric>)` (Strategy One Dec 2025 - Mar 2026). They are NOT the
+classic project-level transformation object (`/api/model/transformations`) that `create-transformation` /
+`attach-transformation` build; those stay classic-only and unverified. Studio writes, for example,
+`Sum(PreviousMonth({Activity Month Key} (ID),1,Dummy))`: the base date attribute's ID form (not the interval
+attribute), the period count, the base metric, wrapped in an outer Sum.
+
+Read live through the connector on a scratch model (in-memory) whose date attribute had only REST-added
+month/quarter/year time attributes (no day or 15-minute interval), with a Studio-built PreviousMonth metric:
+- Grouped by the date's `(month)__id`: each month returns the previous month's value, across year ends, also
+  for a month range (the first month reads the month before the range) and for one month filtered AND grouped.
+- **Silently wrong:** with no grouping it returns the UNSHIFTED total; grouped by the base date attribute it
+  repeats one wrong constant on every row.
+- **Blank:** grouped by year; one month filtered but not grouped; any filter on another attribute that only the
+  current month satisfies (a latest-period flag = Y); grouped with another attribute whose value changes from
+  month to month (the shifted month keeps that attribute's value, so finds no rows).
+- Ratios in SQL over it (`SUM(x) / SUM(prev)`) work row by row.
+So a time-shift metric's description must say: group by the date's month (or the function's period); no
+latest-period filter; read it per period, never as a total. `plan` attaches this as the step's risk.
+**How Studio stores it (captured 2026-11-17).** Tokens: `Sum` `<UseLookupForAttributes=False>` `(`
+`PreviousMonth` (function objectId `B73B646EAF134F989008DFBC7272EDB4`) `(` the date as an `object_at_form` token
+(`[Date]@ID`, target the base attribute, `attributeForm` the system ID form `45C11FA4...`) `,` `1` (integer)
+`,` the metric (`object_reference`) `)` `{~+}` `)` `{~+}` end_of_text; dimty `report_base_level`. The tree
+nests three embedded objects (Sum agg_metric → report-level metric → `previous_month` operator with a
+`form_shortcut`, an int32 constant and the metric). When the metric was created, the date attribute gained
+hidden Day and Week time attributes (Test C's dates have them too, from a Studio publish; `add-time-attributes`
+never adds them). `build_mosaic.py create-time-shift-metric` posts exactly these tokens (checked token for token
+against the capture) and requires the date's Day interval and the function's own interval.
+
+Not yet verified: the REST create (POST with these tokens) and its read-back, other functions (gated behind
+`--unverified-ok`), live (not in-memory) models, and a governed compound over a time-shift metric.
+
 ## 1. Compound metric — ratio of two metrics
 
 User example: `Avg({Competitor Lowest Price USD}) / Avg({Market Average Price USD})`.
