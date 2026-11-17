@@ -74,7 +74,8 @@ ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_d
                 "create_level_metric", "create_weighted_average", "patch_model_object", "patch_fact_metrics",
                 "add_lookup_table", "change_column_type", "source_change", "wire_relationships",
                 "create_formula_attribute", "add_column_attribute", "add_time_attributes", "rename_describe",
-                "show_forms", "remove_relationships", "publish", "certify", "manual", "create_time_shift_metric")
+                "show_forms", "remove_relationships", "publish", "certify", "manual", "create_time_shift_metric",
+                "add_column_fact_metric")
 # Mosaic time transformation functions (Strategy One, Dec 2025 - Mar 2026): a derived metric over a date attribute
 TIME_SHIFT_FUNCTIONS = ("PreviousDay", "PreviousWeek", "PreviousMonth", "PreviousQuarter", "PreviousYear",
                         "MonthToDate", "QuarterToDate", "YearToDate")
@@ -88,12 +89,22 @@ COLUMN_TYPES = ("text", "integer", "bigint", "double", "date", "timestamp")   # 
 # Changes made once for the whole plan, at the start of one phase; other phases get a note.
 MERGED_KINDS = {"source_change": 1, "change_column_type": 2, "wire_relationships": 3, "add_time_attributes": 3,
                 "rename_describe": 6}
+# Kinds that always run in one phase, one step per action (not merged): a new fact metric goes in phase 3, so the
+# republish after it comes before the derived metrics of phases 4-5 that are built on it.
+FIXED_PHASE_KINDS = {"add_column_fact_metric": 3}
+PHASED_KINDS = {**MERGED_KINDS, **FIXED_PHASE_KINDS}   # every kind that runs outside its finding's phase
+FACT_METRIC_FUNCTIONS = ("sum", "avg", "max", "min", "count")   # build_mosaic.py add-column-fact-metric
+FACT_METRIC_RISK = ("Republish after this phase for the metric to hold data. A column on a lookup table (the dry run "
+                    "names the table) is aggregated once per lookup row, not once per fact row. Not yet run live on an "
+                    "existing model: record what the dry run and the step report.")
 NO_REPUBLISH_MERGED = ("rename_describe",)   # merged steps whose change shows without a republish
 MERGED_NOTES = {"source_change": "Source change done in the phase {phase} rebuild",
                 "change_column_type": "Column type change done in phase {phase} (set-column-types)",
                 "wire_relationships": "Relationships declared in phase {phase} (wire-relationships)",
                 "add_time_attributes": "Time attributes added in phase {phase} (add-time-attributes)",
-                "rename_describe": "Names and descriptions set in phase {phase} (rename-describe)"}
+                "rename_describe": "Names and descriptions set in phase {phase} (rename-describe)",
+                "add_column_fact_metric": "Fact metric added in phase {phase} (add-column-fact-metric), before the "
+                                          "derived metrics built on it"}
 TIME_ATTRIBUTES_SPEC = "specs/time_attributes.json"     # under the plan's bundle dir (see bundle_path)
 RENAME_DESCRIBE_SPEC = "specs/rename_describe.json"
 # A republish of a large model runs well past publish's 180 s default; the wait ends as soon as every table is done.
@@ -858,9 +869,9 @@ def classify_roles(scope: dict, profiles: dict[str, dict], variation: dict[str, 
                                   "them up or average them",
                         "evidence": {"type": typ, "distinct_values": distinct, "min": prof.get("min"),
                                      "max": prof.get("max")},
-                        "suggested_actions": [{"kind": "manual", "steps": [
-                            f"Add a fact metric on the column behind '{name}' (or a derived metric over the "
-                            f"attribute), with the aggregation its meaning calls for"]}]})
+                        "suggested_actions": [{"kind": "add_column_fact_metric", "args": {
+                            "column": name, "name": f"<{name} as a measure: a business name, not the attribute's>",
+                            "function": "<sum | avg | max | min: the aggregation its meaning calls for>"}}]})
     return out
 
 
@@ -912,7 +923,8 @@ def review_roles(runner: Runner, project: str, scope: dict, *, entity: str = "",
                       "roles (an attribute to group by and a measure to add up).",
                       "add_column_attribute keeps the fact metric and adds an attribute on the same column; give the "
                       "attribute a name that differs from every metric, or the connector shows two columns with "
-                      "one name.",
+                      "one name. add_column_fact_metric is the reverse (a measure held only as an attribute); "
+                      "its name must differ from every attribute's.",
                       "Fix roles before building metrics on these columns: a metric built on the wrong role is "
                       "rebuilt later."]}
 
@@ -3924,6 +3936,18 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
 
 # ── plan ─────────────────────────────────────────────────────────────────────────────────────
 
+def no_change(f: dict) -> bool:
+    """A finding decided as "no change": an explicit empty action list (`actions: []`), not covered by another
+    finding. A finding with no `actions` key at all still becomes a manual step from its recommendation."""
+    return isinstance(f.get("actions"), list) and not f["actions"] and not f.get("covered_by")
+
+
+def _one_line(text: Any) -> str:
+    if isinstance(text, (list, tuple)):
+        text = " ".join(str(x) for x in text)
+    return " ".join(str(text or "").split())
+
+
 def _phase_of(f: dict) -> int | None:
     if f.get("phase") in PHASES:
         return int(f["phase"])
@@ -3931,8 +3955,8 @@ def _phase_of(f: dict) -> int | None:
 
 
 def action_phase(f: dict, action: dict) -> int | None:
-    """The phase an action runs in: merged kinds have a fixed phase, the rest run in the finding's."""
-    return MERGED_KINDS.get(str(action.get("kind") or "")) or _phase_of(f)
+    """The phase an action runs in: merged and fixed-phase kinds have a set phase, the rest run in the finding's."""
+    return PHASED_KINDS.get(str(action.get("kind") or "")) or _phase_of(f)
 
 
 def _dependency_in_model(d: dict) -> bool:
@@ -4189,6 +4213,17 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
                           ("--data-type", "data_type"), ("--table", "table")):
             opt(argv, flag, key)
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
+    if kind == "add_column_fact_metric":   # the reverse: a number held only as an attribute, made addable
+        need("name", "column", "function")
+        fn = str(a.get("function") or "").lower()
+        if a.get("function") and fn not in FACT_METRIC_FUNCTIONS:
+            problems.append(f"{kind}: function must be one of {', '.join(FACT_METRIC_FUNCTIONS)} (got "
+                            f"'{a.get('function')}'): the aggregation the column's meaning calls for")
+        argv = base + ["add-column-fact-metric", "--model-id", model_id, "--name", str(a.get("name", "")),
+                       "--column", str(a.get("column", "")), "--function", fn]
+        for flag, key in (("--format", "format"), ("--description", "description"), ("--table", "table")):
+            opt(argv, flag, key)
+        return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "create_formula_attribute":
         need("name", "formula")
         if a.get("requested_by_user") is not True:
@@ -4321,7 +4356,8 @@ def form_base_name(name: str) -> str:
 
 # step kinds whose result reached the connector only after a publish from Studio (see build_plan)
 STUDIO_PUBLISH_KINDS = ("wire_relationships", "remove_relationships", "add_time_attributes", "add_column_attribute",
-                        "create_formula_attribute")
+                        "create_formula_attribute",
+                        "add_column_fact_metric")   # not yet seen live: kept until a REST publish alone shows its data
 # patch_model_object targets that are model structure, like the kinds above (an attribute's outer-join setting, a
 # table). Derived and fact metrics are left out: their changes have reached the connector after the REST publish.
 STUDIO_PUBLISH_OBJECT_KINDS = ("attribute", "table")
@@ -4392,10 +4428,10 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
 
     # Merged kinds run once for the whole plan, at the start of their phase: every source_change becomes one
     # rebuild in phase 1; every change_column_type becomes one set-column-types command per table in phase 2.
-    merged: dict[str, list[dict]] = {k: [] for k in MERGED_KINDS}
+    merged: dict[str, list[dict]] = {k: [] for k in PHASED_KINDS}
     for f in ordered:
         for a in f.get("actions") or []:
-            if a.get("kind") in MERGED_KINDS:
+            if a.get("kind") in PHASED_KINDS:
                 merged[a["kind"]].append({**(a.get("args") or {}), "finding": f["id"]})
     merged_steps: dict[int, list[dict]] = {}
     if merged["source_change"]:
@@ -4511,6 +4547,13 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
              "risks": ["Runs after the phase 2 type change and republish: a number stored as a date takes time "
                        "attributes only once it is a date. Analysts' filters on the number become filters on "
                        "'<date> (month)__id' (same yyyyMM values)."]})
+    for c in merged["add_column_fact_metric"]:   # one step each, in plan order, after phase 3's merged steps
+        cc = action_commands({"kind": "add_column_fact_metric",
+                              "args": {k: v for k, v in c.items() if k != "finding"}}, mid, python)
+        merged_steps.setdefault(FIXED_PHASE_KINDS["add_column_fact_metric"], []).append(
+            {"finding": c["finding"], "title": f"Add fact metric '{c.get('name')}'", "kind": "add_column_fact_metric",
+             "dry_run": cmd(cc["dry_run"]), "apply": cmd(cc["apply"]), "manual": None,
+             "risks": [FACT_METRIC_RISK]})
     merged_findings = {k: {c["finding"] for c in v} for k, v in merged.items()}
     retyped_to = {str(c.get("column") or "").casefold(): (str(c.get("type") or "").lower(), c.get("date_format") or "")
                   for c in merged["change_column_type"]}
@@ -4617,12 +4660,18 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         for f in items:
             if f.get("covered_by") and not f.get("actions"):
                 continue   # another finding's action fixes it; its own check verifies it (verify-changes)
+            if no_change(f):   # decided: nothing to change in the model (keep as is, ignore, assume correct)
+                steps.append({"finding": f["id"], "title": f.get("title"), "kind": "note", "dry_run": None,
+                              "apply": None, "manual": None, "risks": [],
+                              "note": "No model change: " + _one_line(f.get("recommendation") or f.get("title") or
+                                                                       "decided to leave the model as it is")})
+                continue
             for action in f.get("actions") or [{"kind": "manual", "steps": f.get("recommendation")}]:
                 kind = action.get("kind")
-                if kind in MERGED_KINDS:
+                if kind in PHASED_KINDS:
                     c = action_commands(action, mid, python)
                     problems += [f"{f['id']}: {p}" for p in c["problems"]]
-                    target = MERGED_KINDS[kind]
+                    target = PHASED_KINDS[kind]
                     if n != target and (f["id"], kind) not in noted:
                         noted.add((f["id"], kind))
                         what = MERGED_NOTES[kind].format(phase=target)
@@ -4693,10 +4742,15 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         # 2026-11-16: 19 descriptions and the model description showed after a re-certify alone)
         republish = (n in REPUBLISH_PHASES or any(f.get("republish") for f in items)
                      or any(st.get("kind") not in NO_REPUBLISH_MERGED for st in merged_steps.get(n, [])))
-        own = [a for f in items for a in f.get("actions") or [{"kind": "manual"}]]
-        if not merged_steps.get(n) and own and all(a.get("kind") in MERGED_KINDS and MERGED_KINDS[a["kind"]] != n
+        own = [a for f in items if not no_change(f) for a in f.get("actions") or [{"kind": "manual"}]]
+        if not merged_steps.get(n) and own and all(a.get("kind") in PHASED_KINDS and PHASED_KINDS[a["kind"]] != n
                                                    for a in own) and not any(f.get("republish") for f in items):
             republish = False   # its only work moved into another phase
+        # nothing runs here (no-change findings, work done in another phase): no republish, no re-certify, and
+        # the phase script only says so
+        nothing = not any(st.get("apply") or st.get("manual") for st in steps)
+        if nothing:
+            republish = False
         after = []
         if republish:
             after.append({"what": "Republish the model (tables, attributes or fact metrics changed).",
@@ -4709,21 +4763,24 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                                       "but has not rebuilt new or changed attributes or relationships (they read "
                                       "blank and filters are ignored until a Studio publish).",
                               "confirm": "Published from Studio and finished?"})
-        after.append({"what": "Re-certify the model (edits drop certification; MCP cannot see an uncertified model).",
-                      "command": cmd([python, BUILD_SCRIPT, "certify", "--object-id", mid])})
+        if not nothing:
+            after.append({"what": "Re-certify the model (edits drop certification; MCP cannot see an uncertified "
+                                  "model).", "command": cmd([python, BUILD_SCRIPT, "certify", "--object-id", mid])})
         tests = sorted({t for f in items for t in f.get("tests") or []})
-        for kind, target in MERGED_KINDS.items():
+        for kind, target in PHASED_KINDS.items():
             if n == target and merged[kind]:
                 tests = sorted(set(tests) | {t for f in ordered if f["id"] in merged_findings[kind]
                                              for t in f.get("tests") or []})
-        if not tests:
+        if not tests and not nothing:
             warnings.append(f"phase {n}: no unit tests named in its findings")
         names = [f["id"] for f in items]
-        for kind, target in MERGED_KINDS.items():
+        for kind, target in PHASED_KINDS.items():
             if n == target and merged[kind]:
                 first = list(dict.fromkeys(c["finding"] for c in merged[kind]))
                 names = first + [x for x in names if x not in first]
-        phases.append({"phase": n, "name": PHASES[n], "findings": names,
+        if nothing:
+            before = []
+        phases.append({"phase": n, "name": PHASES[n], "findings": names, **({"nothing_to_apply": True} if nothing else {}),
                        "before": before, "steps": steps, "unit_tests": tests,
                        "regression": [cmd([a.replace("{n}", str(n)) for a in run_cmd]),
                                       cmd([a.replace("{n}", str(n)) for a in grade_cmd])],

@@ -558,6 +558,21 @@ label column is listed as an attribute that no metric filters on.
   The name must differ from every metric's (the command refuses a clash: the connector would show two
   columns with one name). `plan` refuses placeholders left from `roles.json` (`<...>`). Not yet run
   live: the body is the formula attribute's, verified, with a single column token.
+- **`add_column_fact_metric`** (`name`, `column`: the column or the attribute or fact metric that reads it,
+  `function` sum | avg | max | min | count, `format`, `description`, `table`): the reverse, a fact metric
+  that reads one existing column as-is, so a number held only as an attribute (a duration, a price) can be
+  added up, averaged or maxed. The attribute stays. **Always phase 3**, one step per action, whatever the
+  finding's phase (a note in the finding's own phase): the republish after phase 3 comes before the
+  derived metrics of phases 4-5 built on it. The name must differ from every attribute's and derived
+  metric's; the command treats a fact metric of that name reading the same column with the same function as
+  done (a rerun is harmless). Without `table`, the largest table that has the column is used; a column only
+  on a lookup table is aggregated once per lookup row, and the dry run says so. Not yet run live on an
+  existing model (the body is the fact-metric shape verified with a column token carrying the column's id),
+  so phase 3 keeps the "publish from Studio" step for it until a REST publish alone is seen to show its data.
+- **No change** (`actions: []`): a finding decided as "leave the model as it is" (ignore, assume correct).
+  `plan` writes a note for it, not a manual step; a phase with nothing else to run gets no republish or
+  re-certify, and its script only shows the notes and exits 0. A finding with no `actions` key at all still
+  becomes a manual step built from its recommendation.
 - **`create_formula_attribute`** (`name`, `formula` in Strategy syntax with `[COLUMNS]`, `description`,
   `display_format` text | number | date, `data_type`, `table`, `update`, `requested_by_user`,
   `unverified_ok`): verified live for functions, columns and integers (`AddMonths([PERIOD], -1)`,

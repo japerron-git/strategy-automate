@@ -1797,6 +1797,82 @@ class RoleTests(unittest.TestCase):
             model_id="MID")
         self.assertTrue(any("placeholder" in p for p in bad["problems"]))
 
+    def test_a_measure_held_as_an_attribute_suggests_a_fact_metric(self):
+        out = {c["name"]: c for c in am.classify_roles(self.SCOPE, self._profiles(), None)}
+        (act,) = out["unit price"]["suggested_actions"]
+        self.assertEqual((act["kind"], act["args"]["column"]), ("add_column_fact_metric", "unit price"))
+        plan = am.build_plan({"findings": [_finding("F1", "metric_defect", actions=[act])]}, model_id="MID")
+        self.assertTrue(any("placeholder" in p for p in plan["problems"]))           # name to fill in
+        self.assertTrue(any("function must be one of" in p for p in plan["problems"]))   # and the aggregation
+
+    def test_fact_metric_runs_in_phase_3_before_the_metrics_built_on_it(self):
+        fm = {"kind": "add_column_fact_metric", "args": {"column": "promotion duration", "name": "duration days",
+                                                         "function": "max", "format": "integer"}}
+        lvl = {"kind": "create_level_metric", "args": {"name": "longest promotion", "source_metric": "duration days",
+                                                       "entity_attribute": "promo offer"}}
+        plan = am.build_plan({"findings": [_finding("F6", "metric_defect", actions=[fm, lvl], tests=["t"])]},
+                             model_id="MID")
+        self.assertEqual(plan["problems"], [])
+        by = {ph["phase"]: ph for ph in plan["phases"]}
+        self.assertEqual(sorted(by), [3, 4])
+        (step,) = by[3]["steps"]
+        self.assertEqual(step["kind"], "add_column_fact_metric")
+        self.assertEqual(step["apply"]["argv"][2:], ["add-column-fact-metric", "--model-id", "MID", "--name",
+                                                     "duration days", "--column", "promotion duration",
+                                                     "--function", "max", "--format", "integer"])
+        self.assertEqual(step["dry_run"]["argv"][-1], "--dry-run")
+        self.assertIn("lookup table", step["risks"][0])
+        self.assertTrue(by[3]["after"][0]["what"].startswith("Republish"))
+        self.assertTrue(any("Studio" in a["what"] for a in by[3]["after"]))      # until a REST publish is seen to do
+        self.assertEqual(by[3]["unit_tests"], ["t"])
+        self.assertEqual([s["kind"] for s in by[4]["steps"]], ["note", "create_level_metric"])
+        self.assertIn("phase 3", by[4]["steps"][0]["note"])
+        self.assertEqual(am.action_phase(_finding("F6", "metric_defect"), fm), 3)
+
+    def test_no_change_findings_are_notes_and_their_phase_runs_nothing(self):
+        doc = {"findings": [
+            _finding("F9", "source_data", actions=[], recommendation="Ignore metrics where source data is not available."),
+            _finding("F12", "table", status="modified", actions=[], recommendation="Assume data is correct as stored."),
+            _finding("F3", "attribute")]}                                       # a manual step, in phase 3
+        plan = am.build_plan(doc, model_id="MID")
+        self.assertEqual(plan["problems"], [])
+        by = {ph["phase"]: ph for ph in plan["phases"]}
+        p1 = by[1]
+        self.assertTrue(p1["nothing_to_apply"])
+        self.assertEqual(sorted((s["kind"], s["finding"]) for s in p1["steps"]), [("note", "F12"), ("note", "F9")])
+        self.assertEqual(next(s for s in p1["steps"] if s["finding"] == "F9")["note"],
+                         "No model change: Ignore metrics where source data is not available.")
+        self.assertEqual((p1["after"], p1["before"], p1["manual_steps"]), ([], [], 0))
+        self.assertFalse(any(w.startswith("phase 1:") for w in plan["warnings"]))
+        self.assertNotIn("nothing_to_apply", by[3])                          # a real step: republish, re-certify
+        self.assertEqual(len(by[3]["after"]), 2)
+        # no actions key at all: still a manual step from the recommendation (unchanged)
+        legacy = _finding("F1", "source_data", recommendation="Reload the table.")
+        del legacy["actions"]
+        (ph,) = am.build_plan({"findings": [legacy]}, model_id="MID")["phases"]
+        self.assertEqual(ph["steps"][0]["manual"], "Reload the table.")
+        self.assertNotIn("nothing_to_apply", ph)
+        # a no-change finding next to a real one: the phase still runs
+        (ph,) = am.build_plan({"findings": [_finding("F9", "source_data", actions=[]),
+                                            _finding("F2", "source_data")]}, model_id="MID")["phases"]
+        self.assertNotIn("nothing_to_apply", ph)
+        self.assertEqual(sorted(s["kind"] for s in ph["steps"]), ["manual", "note"])
+        # still unanswered: it blocks its phase as before
+        blocked = am.build_plan({"findings": [_finding("F9", "source_data", status="proposed", actions=[])]},
+                                model_id="MID", statuses=("approved", "modified", "proposed"))
+        self.assertEqual(blocked["unanswered"], {"1": ["F9"]})
+
+    def test_fact_metric_args_are_checked(self):
+        bad = {"kind": "add_column_fact_metric", "args": {"column": "price", "name": "avg price", "function": "median"}}
+        plan = am.build_plan({"findings": [_finding("F1", "metric_defect", actions=[bad])]}, model_id="MID")
+        self.assertTrue(any("function must be one of" in p for p in plan["problems"]))
+        miss = {"kind": "add_column_fact_metric", "args": {"column": "price", "name": "avg price"}}
+        self.assertTrue(any("missing args.function" in p for p in am.build_plan(
+            {"findings": [_finding("F1", "metric_defect", actions=[miss])]}, model_id="MID")["problems"]))
+        self.assertEqual(am.check_findings({"findings": [_finding("F1", "metric_defect", actions=[
+            {"kind": "add_column_fact_metric", "args": {"column": "p", "name": "n", "function": "avg"}}])]})["problems"],
+            [])
+
 
 class CommandRoutingTests(unittest.TestCase):
     """Every command that takes --project queries the model, so it must go through the live path (the roles

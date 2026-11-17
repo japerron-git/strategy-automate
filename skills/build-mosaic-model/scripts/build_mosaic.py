@@ -6218,13 +6218,10 @@ def _column_on_table(exprs: list[dict], cols: dict[str, tuple[str, str]], table_
     return found.pop() if len(found) == 1 else None
 
 
-def resolve_column_targets(model: dict, cols: dict[str, tuple[str, str]],
-                           targets: dict[str, tuple[str, str, str]],
-                           table_id: str | None = None) -> tuple[dict[str, tuple[str, str, str]], list[str]]:
-    """Let --set name an attribute or a fact metric as well as a column: the connector shows attribute names,
-    not the columns behind them. An attribute resolves through its ID form, a fact metric through its fact,
-    to the column it reads on the table being changed (a form read on several tables included). -> (targets
-    keyed by column, notes on what was resolved)."""
+def columns_read_by_name(model: dict, cols: dict[str, tuple[str, str]],
+                         table_id: str | None = None) -> dict[str, list[str]]:
+    """{attribute or fact metric name (casefolded): [the column it reads on this table]}: an attribute through its
+    ID form, a fact metric through its fact."""
     via: dict[str, list[str]] = {}
     for a in model.get("attributes") or []:
         name = (a.get("information") or {}).get("name") or ""
@@ -6239,6 +6236,17 @@ def resolve_column_targets(model: dict, cols: dict[str, tuple[str, str]],
         col = _column_on_table((fm.get("fact") or {}).get("expressions") or [], cols, table_id)
         if col:
             via.setdefault(name.casefold(), []).append(cols[col.casefold()][1])
+    return via
+
+
+def resolve_column_targets(model: dict, cols: dict[str, tuple[str, str]],
+                           targets: dict[str, tuple[str, str, str]],
+                           table_id: str | None = None) -> tuple[dict[str, tuple[str, str, str]], list[str]]:
+    """Let --set name an attribute or a fact metric as well as a column: the connector shows attribute names,
+    not the columns behind them. An attribute resolves through its ID form, a fact metric through its fact,
+    to the column it reads on the table being changed (a form read on several tables included). -> (targets
+    keyed by column, notes on what was resolved)."""
+    via = columns_read_by_name(model, cols, table_id)
     out, notes, unknown = {}, [], []
     for key, (name, t, fmt) in targets.items():
         if key in cols:
@@ -6721,6 +6729,148 @@ def cmd_create_formula_attribute(m: MSTR, args):
         raise
     print(json.dumps({"ok": True, "attribute": args.name, "updated": bool(args.update),
                       "next": "republish the model for the attribute to hold data"}, indent=2))
+
+
+# ── add-column-fact-metric: a fact metric over a column the model already has ──────────────────
+# The reverse of add-column-attribute: a number held only as an attribute (a duration, a price) can be grouped by
+# but not added up or averaged. Studio does this by duplicating the attribute and converting the copy. Here: one
+# POST /factMetrics in one changeset, the fact reading the column with a column_reference token that carries the
+# column's objectId (the shape verified for fact metrics on an existing model, memory/reference_mosaic_rest_gotchas.md
+# "Fact metrics (custom formulas)"); function, dimty and functionProperties as cmd_build creates them.
+FACT_METRIC_FUNCTIONS = ("sum", "avg", "max", "min", "count")
+
+
+def _table_columns(table: dict) -> dict[str, tuple[str, str]]:
+    return {c["columnName"].casefold(): (c["information"]["objectId"], c["columnName"])
+            for c in (table.get("physicalTable") or {}).get("columns") or []}
+
+
+def column_fact_metric_target(model: dict, column: str, table_name: str | None) -> tuple[dict, str, list[str]]:
+    """-> (table, column name, notes). `column` is a column, or the attribute or fact metric that reads one (a
+    connector form name included). Without --table the tables are tried largest first (the fact table, as
+    `_pick_table` assumes), so a column the fact table has is read there."""
+    tables = model.get("tables") or []
+    if table_name:
+        order = [_pick_table(tables, table_name)]
+    else:
+        order = sorted(tables, key=lambda t: len((t.get("physicalTable") or {}).get("columns") or []), reverse=True)
+    key, hits = column.strip().casefold(), []
+    for t in order:
+        cols = _table_columns(t)
+        if key in cols:
+            hits.append((t, cols[key][1]))
+            continue
+        via = columns_read_by_name(model, cols, (t.get("information") or {}).get("objectId"))
+        base = next((c for c in attribute_name_candidates(key) if c in via), None)
+        found = sorted(set(via.get(base) or [])) if base else []
+        if len(found) == 1:
+            hits.append((t, found[0]))
+    if not hits:
+        die(f"'{column}' is not a column, attribute or fact metric on "
+            f"{'table ' + table_name if table_name else 'any table of the model'}")
+    table, col = hits[0]
+    tname = (table.get("information") or {}).get("name")
+    notes = [] if col.casefold() == key else [f"'{column}' reads column {col} on table {tname}"]
+    if len(hits) > 1 and not table_name:
+        notes.append(f"{col} is also on {sorted({(t.get('information') or {}).get('name') for t, _ in hits[1:]})}; "
+                     f"using {tname}, the largest table. Pass --table to choose")
+    if not table_name and order and table is not order[0]:
+        notes.append(f"{col} is on table {tname}, not on the largest table "
+                     f"({(order[0].get('information') or {}).get('name')}, taken as the fact): the metric adds up "
+                     f"{tname}'s rows, once per {tname} row, not once per fact row")
+    return table, col, notes
+
+
+def column_fact_metric_body(name: str, col_id: str, col: str, table: dict, data_type: dict, function: str,
+                            fmt: list[dict], description: str = "") -> dict:
+    tinfo = table["information"]
+    return {
+        "information": {"name": name, "description": description},
+        "fact": {"dataType": data_type,
+                 "expressions": [{"expression": {"tokens": [_colref_token(col_id, col),
+                                                            {"type": "end_of_text", "value": ""}]},
+                                  "tables": [{"objectId": tinfo["objectId"], "subType": "logical_table",
+                                              "name": tinfo["name"]}]}],
+                 "extensions": [], "entryLevel": []},
+        "function": function,
+        "functionProperties": [{"name": "UseLookupForAttributes", "value": {"type": "boolean", "value": "false"}}],
+        "dimty": {"dimtyUnits": [{"dimtyUnitType": "report_base_level", "aggregation": "normal",
+                                  "filtering": "apply", "groupBy": True}],
+                  "excludeAttribute": False, "allowAddingUnit": True},
+        "format": {"header": [], "values": fmt},
+    }
+
+
+def cmd_add_column_fact_metric(m: MSTR, args):
+    """Create a fact metric that reads one existing column as-is, so a number held only as an attribute can be added
+    up, averaged or taken the max of. The attribute stays. One changeset; republish afterwards."""
+    if args.function not in FACT_METRIC_FUNCTIONS:
+        die(f"--function must be one of {', '.join(FACT_METRIC_FUNCTIONS)}")
+    m.login(identity=True)
+    mid = args.model_id
+    r = m.post(f"/api/model/dataModels/{mid}/export")
+    if not r.ok:
+        die(f"export model: {format_mstr_error(r)}")
+    model = (r.json().get("model") or [{}])[0]
+    table, col, notes = column_fact_metric_target(model, args.column, args.table)
+    col_id = _table_columns(table)[col.casefold()][0]
+    tname = table["information"]["name"]
+    for n in notes:
+        print(f"  = {n}", file=sys.stderr)
+    want = args.name.casefold()
+    for kind, label in (("attributes", "an attribute"), ("metrics", "a derived metric")):
+        if any((o.get("information") or {}).get("name", "").casefold() == want for o in model.get(kind) or []):
+            die(f"'{args.name}' is already {label}'s name; give the fact metric another name, or the connector "
+                f"shows two columns with one name")
+    same = next((fm for fm in model.get("factMetrics") or []
+                 if (fm.get("information") or {}).get("name", "").casefold() == want), None)
+    if same is not None:
+        reads = _column_on_table((same.get("fact") or {}).get("expressions") or [], _table_columns(table),
+                                 table["information"].get("objectId"))
+        if (reads or "").casefold() == col.casefold() and str(same.get("function") or "").lower() == args.function:
+            print(json.dumps({"ok": True, "skipped": True, "metric": args.name,
+                              "note": f"already there: it reads {col} with {args.function}"}, indent=2))
+            return
+        die(f"a fact metric named '{args.name}' exists (it reads {reads or 'another expression'} with "
+            f"{same.get('function')}); give another name")
+    already = sorted((fm.get("information") or {}).get("name") for fm in model.get("factMetrics") or []
+                     if (_column_on_table((fm.get("fact") or {}).get("expressions") or [], _table_columns(table),
+                                          table["information"].get("objectId")) or "").casefold() == col.casefold())
+    if already:
+        notes.append(f"{col} is already read by fact metric(s) {already}")
+        print(f"  = {notes[-1]}", file=sys.stderr)
+    physical = next(c for c in table["physicalTable"]["columns"] if c["columnName"].casefold() == col.casefold())
+    dtype = sot.normalize_datatype(dict(physical.get("dataType") or {"type": "double", "precision": 15, "scale": 4}))
+    fmt = _resolve_metric_format(args.format) if args.format else _default_metric_format(args.name, dtype, args.function)
+    body = column_fact_metric_body(args.name, col_id, col, table, dtype, args.function, fmt, args.description or "")
+    path = f"/api/model/dataModels/{mid}/factMetrics"
+    if args.dry_run:
+        print(json.dumps({"ok": True, "dry_run": True, "method": "POST", "path": path, "table": tname,
+                          "column": col, "notes": notes, "body": body}, indent=2))
+        return
+    cs = open_cs(m)
+    try:
+        w = m.post(path, json=body)
+        if not w.ok:
+            die(f"POST fact metric '{args.name}': {format_mstr_error(w)}")
+        new_id = (_json_or(w, {}).get("information") or {}).get("objectId")
+        commit_cs(m, cs)
+    except BaseException:
+        discard_cs(m, cs)
+        raise
+    readback: dict[str, Any] = {}
+    if new_id:
+        g = m.get(f"{path}/{new_id}")
+        if g.ok:
+            got = g.json() or {}
+            readback = {"function": got.get("function"),
+                        "column": _column_on_table((got.get("fact") or {}).get("expressions") or [],
+                                                   _table_columns(table), table["information"].get("objectId"))}
+            if str(readback["function"] or "").lower() != args.function:
+                print(f"  ! read-back: function is {readback['function']}, not {args.function}", file=sys.stderr)
+    print(json.dumps({"ok": True, "metric": args.name, "metric_id": new_id, "table": tname, "column": col,
+                      "function": args.function, "notes": notes, "readback": readback,
+                      "next": "republish the model for the metric to hold data, then re-certify"}, indent=2))
 
 
 # ── rename-describe: names and descriptions of attributes and fact metrics ──────────────────
@@ -8142,6 +8292,20 @@ def build_parser():
     sp.add_argument("--dry-run", action="store_true", help="resolve the column and print the request; no changeset")
     sp.set_defaults(update=False, unverified_ok=False, formula="")
 
+    sp = sub.add_parser("add-column-fact-metric",
+        help="Fact metric that reads one existing column as-is, so a number held only as an attribute (a duration, "
+             "a price) can be added up, averaged or maxed. The attribute stays. One changeset; republish afterwards.")
+    sp.add_argument("--model-id", required=True)
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--column", required=True, help="the column, or the attribute or fact metric that reads it")
+    sp.add_argument("--function", required=True, choices=FACT_METRIC_FUNCTIONS)
+    sp.add_argument("--format", help=f"number format preset: {', '.join(sorted(METRIC_FORMAT_PRESETS))} "
+                                     "(default: from the name and the column's type)")
+    sp.add_argument("--description", default="")
+    sp.add_argument("--table", help="table name (default: the largest table that has the column)")
+    sp.add_argument("--dry-run", action="store_true", help="resolve the column and print the request; no changeset")
+    sp.add_argument("--from-export", help="offline dry run against a model export file (export-model): no sign-in, nothing written")
+
     sp = sub.add_parser("create-formula-attribute",
         help="Attribute computed from the table's columns (e.g. Year([FIRST DATE])). Prefer a lookup table: "
              "faster, and replaceable without deleting the metrics built on it. Republish afterwards.")
@@ -8365,6 +8529,7 @@ def main():
             "rename-describe": cmd_rename_describe,
             "create-formula-attribute": cmd_create_formula_attribute,
             "add-column-attribute": cmd_create_formula_attribute,
+            "add-column-fact-metric": cmd_add_column_fact_metric,
             "add-time-attributes": cmd_add_time_attributes,
             "show-forms": cmd_show_forms,
             "remove-relationships": cmd_remove_relationships,

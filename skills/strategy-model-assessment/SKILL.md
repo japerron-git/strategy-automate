@@ -126,7 +126,8 @@ each numeric attribute, and names the role the evidence points to:
   add up (`add_column_attribute` keeps the fact metric and adds an attribute on the same column);
 - **entity_characteristic** — one value per entity, repeated on every row of a multi-row fact: a Sum
   across rows multiplies it, so read it once per entity (`create_level_metric`);
-- **measure** — continuous values held only as an attribute;
+- **measure** — continuous values held only as an attribute (`add_column_fact_metric` adds a fact metric on
+  the same column, in phase 3);
 - **review** — a small integer range the names don't explain: check the dictionary.
 
 Evidence, not a verdict: confirm each against the domain notes. Fix roles early (phase 3), before
