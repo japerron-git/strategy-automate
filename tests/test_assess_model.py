@@ -341,7 +341,9 @@ class PlanTests(unittest.TestCase):
             {"kind": "create_time_shift_metric", "args": args}])]}, model_id="M")
         self.assertEqual(plan["problems"], [])
         (step,) = plan["phases"][0]["steps"]
-        self.assertTrue(any("grouped by the month of 'order date'" in r for r in step["risks"]))
+        (risk,) = [r for r in step["risks"] if "order date" in r]
+        self.assertIn("grouped AND filtered by the month of 'order date'", risk)
+        self.assertIn("not by the base date", risk)
 
     def test_time_shift_args_are_checked(self):
         def report(**args):

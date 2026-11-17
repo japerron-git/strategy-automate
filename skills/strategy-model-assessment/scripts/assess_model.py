@@ -3879,11 +3879,12 @@ def time_shift_risk(args: dict) -> str:
     """How a time-shift metric reads through the connector (seen live 2026-11-17 for PreviousMonth)."""
     period = time_shift_period(str(args.get("function") or "")) or "period"
     attr = args.get("time_attribute") or "its time attribute"
-    return (f"Reads right only grouped by the {period} of '{attr}' (its ({period}) attribute). With no grouping it "
-            f"returns the unshifted total, and grouped by another date in its place (even one mapped to it) each "
-            f"row's unshifted value; grouped by a coarser period, filtered to one {period} without grouping by it, "
-            f"filtered on a latest-period flag, or grouped with an attribute that changes between {period}s it "
-            f"reads blank (seen live for PreviousMonth, 17 Nov). Say so in its description.")
+    return (f"Reads right only grouped AND filtered by the {period} of '{attr}' (its ({period}) attribute), not by "
+            f"the base date. With no grouping it returns the unshifted total, and grouped by another date in its "
+            f"place (a parent of it) each row's unshifted value; grouped by a coarser period, filtered to one "
+            f"{period} without grouping by it, filtered on a latest-period flag, or grouped with an attribute that "
+            f"changes between {period}s it reads blank; filtered on the base date, a range's first {period} reads "
+            f"blank (seen live for PreviousMonth, 17 Nov). Say so in its description.")
 
 
 def compound_join_warning(fid: str, args: dict) -> str | None:

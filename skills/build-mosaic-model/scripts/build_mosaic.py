@@ -5506,8 +5506,9 @@ def attribute_name_candidates(name: str) -> list[str]:
 
 # ── Time-shift metrics (Mosaic time transformations) ───────────────────────────────────────────
 # A derived metric `Agg(PreviousMonth({Date} (ID), 1, Metric))`. Body copied from a Studio-built PreviousMonth
-# metric (captured 2026-11-17, memory/reference_mosaic_derived_metrics.md §0e). Only PreviousMonth has been seen;
-# the other functions follow the same pattern and need --unverified-ok until one is captured.
+# metric (captured 2026-11-17, memory/reference_mosaic_derived_metrics.md §0e); the REST create was verified live
+# the same day (values identical to the Studio one). Only PreviousMonth has been seen; the other functions follow
+# the same pattern and need --unverified-ok until one is captured.
 TIME_SHIFT_FUNCTIONS = ("PreviousDay", "PreviousWeek", "PreviousMonth", "PreviousQuarter", "PreviousYear",
                         "MonthToDate", "QuarterToDate", "YearToDate")
 TIME_SHIFT_VERIFIED = ("PreviousMonth",)
@@ -5590,9 +5591,9 @@ def cmd_create_time_shift_metric(m: MSTR, args):
     command unless --replace (full-body PUT on the same objectId); a fact metric of the same name always does.
     After commit the formula is read back and compared with the expected text.
 
-    It reads right only grouped by the date's period attribute (memory §0e): no grouping returns the unshifted
-    total and another date in its place the unshifted values; a coarser period, an ungrouped one-period filter
-    or a latest-period flag reads blank.
+    It reads right only grouped and filtered by the date's period attribute (memory §0e): no grouping returns
+    the unshifted total and a parent date in its place the unshifted values; a coarser period, an ungrouped
+    one-period filter or a latest-period flag reads blank; a base-date filter blanks a range's first period.
     """
     function = args.function
     if function not in TIME_SHIFT_FUNCTIONS:

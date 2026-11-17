@@ -615,8 +615,10 @@ kind); without it an existing name stops the step, dry run included.
 `create_time_shift_metric` (`name`, `function` PreviousDay/Week/Month/Quarter/Year or Month/Quarter/
 YearToDate, `time_attribute` = the base date attribute, `source_metric`, optional `periods` (Previous* only,
 default 1), `aggregation` (default Sum), `description`, `format`, `replace`) runs `build_mosaic.py
-create-time-shift-metric`; only PreviousMonth is verified. `plan` attaches the reading rule (group by the date's
-period; no latest-period flag) as the step's risk; derived-metrics note §0e.
+create-time-shift-metric`; only PreviousMonth is verified (REST create checked live against a Studio-built one).
+`plan` attaches the reading rule (group and filter by the date's period attribute, not the base date; no
+latest-period flag) as the step's risk; derived-metrics note §0e. A compound over it (a ratio such as this
+period / previous period) reads right under the same rule.
 A `create_compound_metric` `formula` writes operands as `[metric name]` (or an objectId), never `{name}`, the
 form Mosaic displays and `get_semantics` prints: `[Revenue] - [Cost]`. Set `join: outer` unless dropping a row
 whose operand is blank is intended (then `join: inner`); derived-metrics note §0d rule 7. `check --findings` and
