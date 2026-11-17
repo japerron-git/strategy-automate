@@ -3880,8 +3880,9 @@ def time_shift_risk(args: dict) -> str:
     period = time_shift_period(str(args.get("function") or "")) or "period"
     attr = args.get("time_attribute") or "its time attribute"
     return (f"Reads right only grouped by the {period} of '{attr}' (its ({period}) attribute). With no grouping it "
-            f"returns the unshifted total; grouped by a coarser period, filtered to one {period} without grouping by "
-            f"it, filtered on a latest-period flag, or grouped with an attribute that changes between {period}s it "
+            f"returns the unshifted total, and grouped by another date in its place (even one mapped to it) each "
+            f"row's unshifted value; grouped by a coarser period, filtered to one {period} without grouping by it, "
+            f"filtered on a latest-period flag, or grouped with an attribute that changes between {period}s it "
             f"reads blank (seen live for PreviousMonth, 17 Nov). Say so in its description.")
 
 

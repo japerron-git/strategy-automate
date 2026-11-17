@@ -288,10 +288,14 @@ attribute), the period count, the base metric, wrapped in an outer Sum.
 Read live through the connector on a scratch model (in-memory) whose date attribute had only REST-added
 month/quarter/year time attributes (no day or 15-minute interval), with a Studio-built PreviousMonth metric:
 - Grouped by the date's `(month)__id`: each month returns the previous month's value, across year ends, also
-  for a month range (the first month reads the month before the range) and for one month filtered AND grouped.
-- **Silently wrong:** with no grouping it returns the UNSHIFTED total; grouped by the base date attribute it
-  repeats one wrong constant on every row.
-- **Blank:** grouped by year; one month filtered but not grouped; any filter on another attribute that only the
+  for a month range (the first month reads the month before the range), for one month filtered AND grouped,
+  and with the date's (year) added beside the month.
+- **Silently wrong:** with no grouping it returns the UNSHIFTED total. Grouped by ANOTHER date attribute
+  instead of its own (one mapped 1:1 to it by an attribute relationship) it returns each row's UNSHIFTED value.
+- The base date attribute itself: with no attribute relationships in the model it repeated one wrong constant on
+  every row; after relationships were added (re-checked the same day) it returned the right previous-month
+  values, like its (month) attribute. Group by the period attribute to be safe.
+- **Blank:** grouped by year or quarter; one month filtered but not grouped; any filter on another attribute that only the
   current month satisfies (a latest-period flag = Y); grouped with another attribute whose value changes from
   month to month (the shifted month keeps that attribute's value, so finds no rows).
 - Ratios in SQL over it (`SUM(x) / SUM(prev)`) work row by row.

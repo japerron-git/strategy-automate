@@ -5591,7 +5591,8 @@ def cmd_create_time_shift_metric(m: MSTR, args):
     After commit the formula is read back and compared with the expected text.
 
     It reads right only grouped by the date's period attribute (memory §0e): no grouping returns the unshifted
-    total; a coarser period, an ungrouped one-period filter or a latest-period flag reads blank.
+    total and another date in its place the unshifted values; a coarser period, an ungrouped one-period filter
+    or a latest-period flag reads blank.
     """
     function = args.function
     if function not in TIME_SHIFT_FUNCTIONS:
