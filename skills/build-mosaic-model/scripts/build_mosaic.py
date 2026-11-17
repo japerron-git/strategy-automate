@@ -8279,10 +8279,35 @@ class ExportClient:
         self._refuse("DELETE", path)
 
 
+def expand_argv_file(argv: list[str]) -> list[str]:
+    """`--argv-file F` (alone) -> the argument list in F, a JSON array of strings. Generated PowerShell scripts use
+    it for a step whose arguments Windows PowerShell 5.1 would split on the way to python: it passes a `"` inside
+    an argument to the native command line unescaped (seen live 2026-11-17)."""
+    if argv[:1] == ["--argv-file"] and len(argv) == 2:
+        path = argv[1]
+    elif len(argv) == 1 and argv[0].startswith("--argv-file="):
+        path = argv[0].split("=", 1)[1]
+    else:
+        if any(a == "--argv-file" or a.startswith("--argv-file=") for a in argv):
+            die("--argv-file takes the whole argument list: pass it alone")
+        return argv
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            loaded = json.load(f)
+    except (OSError, ValueError) as e:
+        die(f"--argv-file {path}: {e}")
+    if not isinstance(loaded, list) or not all(isinstance(a, str) for a in loaded):
+        die(f"--argv-file {path}: expected a JSON array of strings")
+    if any(a == "--argv-file" or a.startswith("--argv-file=") for a in loaded):
+        die(f"--argv-file {path}: the file can't name another --argv-file")
+    return loaded
+
+
 def main():
     plain_output.enable()   # run from a generated PowerShell script: one ASCII stream (see plain_output.py)
-    args = build_parser().parse_args()
-    if any(a.split("=", 1)[0] in _SECRET_FLAGS for a in sys.argv[1:]):
+    argv = expand_argv_file(sys.argv[1:])
+    args = build_parser().parse_args(argv)
+    if any(a.split("=", 1)[0] in _SECRET_FLAGS for a in argv):
         print("[auth] WARN: secrets passed as command-line flags are visible to other processes (ps) and "
               "shell history; use the MSTR_* environment variables or --auth-method sso instead.",
               file=sys.stderr)

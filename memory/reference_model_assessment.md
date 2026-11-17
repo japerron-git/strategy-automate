@@ -228,6 +228,11 @@ Resolved:
   script did not stop stderr showing as a red NativeCommandError, nor "\u2713" and "à" in the log (UTF-16).
   The scripts now set `MOSAIC_PLAIN_OUTPUT=1`: the python commands merge stderr into stdout and write ASCII
   (`skills/strategy-platform/scripts/plain_output.py`).
+- *A `"` inside an argument on Windows PowerShell 5.1 (seen live 2026-11-17):* PowerShell passed it to the
+  native command line unescaped, so python split a description at the quote (`unrecognized arguments`). Its
+  quoting also drops an empty argument and lets a trailing backslash escape the quote it adds. The plugin's
+  script writer now passes such a step's arguments in a JSON file (`build_mosaic.py --argv-file <file>`, the
+  whole argument list, nothing else on the line), so no text crosses PowerShell's quoting.
 - *Date tests inside CASE:* Mosaic refuses the month time attribute in a CASE that also reads another
   attribute ("Derived Attribute defined on multiple attributes including ... Smart attribute is not
   supported"); the DATE test works there, so `references` keeps it.
