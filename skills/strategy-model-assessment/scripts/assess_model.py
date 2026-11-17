@@ -3631,9 +3631,10 @@ def time_shift_sql_lint(sql: str, shifted: dict[str, dict] | None) -> list[str]:
         col = f'"{attr} ({period})__id"'
         label = f"time-shift metric '{ts['name']}'" + (f" (built on '{ts['via']}')" if ts.get("via") else "")
         if not grouped & ok_cols:
-            out.append(f"it reads {label} without grouping by {col}: with no grouping or grouped by another date it "
-                       f"returns unshifted values with no error, and by a coarser period or with one {period} "
-                       f"filtered but not grouped it reads blank; group (and filter) by {col}")
+            out.append(f"it reads {label} without grouping by {col}: it then returns unshifted values with no error "
+                       f"(no grouping, grouped by other attributes or another date, even with a latest-period flag), "
+                       f"or blank (a coarser period, or one {period} filtered but not grouped); group (and filter) "
+                       f"by {col}")
         if _mentions(text, attr):
             out.append(f"it filters or groups by the base date \"{attr}\" with {label}: a filter there also applies "
                        f"to the shifted {period}, so a range's first {period} reads blank; use {col} instead")
@@ -3982,11 +3983,25 @@ def time_shift_risk(args: dict) -> str:
     period = time_shift_period(str(args.get("function") or "")) or "period"
     attr = args.get("time_attribute") or "its time attribute"
     return (f"Reads right only grouped AND filtered by the {period} of '{attr}' (its ({period}) attribute), not by "
-            f"the base date. With no grouping it returns the unshifted total, and grouped by another date in its "
-            f"place (a parent of it) each row's unshifted value; grouped by a coarser period, filtered to one "
-            f"{period} without grouping by it, filtered on a latest-period flag, or grouped with an attribute that "
-            f"changes between {period}s it reads blank; filtered on the base date, a range's first {period} reads "
-            f"blank (seen live for PreviousMonth, 17 Nov). Say so in its description.")
+            f"the base date. Without that {period} in GROUP BY it returns UNSHIFTED values with no error (no grouping, "
+            f"grouped by a deal or a parent date, even with a latest-period flag), or blank (a coarser period, or "
+            f"one {period} filtered but not grouped). With it, a latest-period flag or an attribute that changes "
+            f"between {period}s reads blank, and a base-date filter blanks a range's first {period} (seen live for "
+            f"PreviousMonth, 17 Nov). Say so in its description.")
+
+
+def description_length_problems(action: dict) -> list[str]:
+    """Descriptions over DESCRIPTION_LIMIT, which every build_mosaic.py command refuses at its dry run: an
+    action's args.description and each rename_describe item's."""
+    kind = action.get("kind")
+    args = action.get("args") or {}
+    texts = [(args.get("name") or args.get("object_id") or "", args.get("description"))]
+    items = args.get("items")
+    if kind == "rename_describe" and isinstance(items, list):
+        texts += [(it.get("current_name") or it.get("object_type") or "", it.get("description"))
+                  for it in items if isinstance(it, dict)]
+    return [f"{kind}: the description of '{label}' is {len(str(text))} characters, over {DESCRIPTION_LIMIT}"
+            for label, text in texts if text is not None and len(str(text)) > DESCRIPTION_LIMIT]
 
 
 def compound_join_warning(fid: str, args: dict) -> str | None:
@@ -4143,9 +4158,6 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
                     problems.append(f"{kind}: a model item takes only a description")
             elif not it.get("current_name") or not (it.get("new_name") or it.get("description") is not None):
                 problems.append(f"{kind}: each item needs current_name and a new_name or description")
-            if len(str(it.get("description") or "")) > DESCRIPTION_LIMIT:
-                problems.append(f"{kind}: the description of '{it.get('current_name')}' is over {DESCRIPTION_LIMIT} "
-                                f"characters")
         argv = base + ["rename-describe", "--model-id", model_id, "--spec", RENAME_DESCRIBE_SPEC]
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "add_column_attribute":   # one column as-is: an attribute role for a column read as a measure
@@ -4886,6 +4898,7 @@ def check_findings(doc: dict) -> dict[str, Any]:
             if dep not in known:
                 problems.append(f"{fid}: depends_on unknown finding {dep}")
         for action in f.get("actions") or []:
+            problems.extend(f"{fid}: {p}" for p in description_length_problems(action))
             if action.get("kind") not in ACTION_KINDS:
                 problems.append(f"{fid}: unknown action kind '{action.get('kind')}'")
             elif action.get("kind") == "create_time_shift_metric":

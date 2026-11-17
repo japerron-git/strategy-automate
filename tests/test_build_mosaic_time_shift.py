@@ -228,6 +228,7 @@ class MultiWordNameTests(unittest.TestCase):
             result = _run(_FakeMSTR(self._routes(self.RATIO, read_back)), source_metric="open orders value")
         self.assertTrue(result["ok"], result)
         self.assertIn("is a derived metric", result["warnings"][0])
+        self.assertIn("A conditional (filtered) source has read right by month", result["warnings"][0])
         self.assertIn("WARNING", err.getvalue())
         with contextlib.redirect_stderr(io.StringIO()):
             dry = _run(_FakeMSTR(self._routes(self.RATIO, read_back)), source_metric="open orders value", dry_run=True)

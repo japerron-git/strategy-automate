@@ -299,14 +299,21 @@ month/quarter/year time attributes (no day or 15-minute interval), with a Studio
   month (or on the base date) then also restricts the shifted month: grouped by the base date and filtered to
   202001-202002, 202001 read blank, where grouped by (month) it read 201912's value. Group AND filter by the
   period attribute, never the base date (Strategy's docs say the same).
-- **Blank:** grouped by year or quarter; one month filtered but not grouped; any filter on another attribute that only the
-  current month satisfies (a latest-period flag = Y); grouped with another attribute whose value changes from
-  month to month (the shifted month keeps that attribute's value, so finds no rows).
+- **Without the month in GROUP BY** it is UNSHIFTED (no error) unless the query narrows the date itself: no
+  grouping, grouped only by other attributes (a deal), by a parent date, and a latest-period flag (= Y) with no
+  month grouped all return the current period's value (a ratio over it reads a plausible 1, or 0 for a
+  difference). It reads BLANK instead when grouped by a coarser period of the same date (year, quarter) or with
+  that month filtered but not grouped. (Latest flag without the month: re-checked on the scratch model and
+  reported on a test model, 2026-11-17.)
+- **With the month in GROUP BY** it is right, except BLANK with a filter only the current month satisfies (a
+  latest-period flag = Y) or grouped with another attribute whose value changes from month to month (the shifted
+  month keeps that attribute's value, so finds no rows); a base-date filter blanks a range's first month.
 - Ratios in SQL over it (`SUM(x) / SUM(prev)`) work row by row, and so does a GOVERNED compound over it
   (`[Sales] / [prev metric]`, `join: outer`, built by `create-compound-metric`): right by month, 1 (unshifted)
   with no grouping or grouped by a parent date, blank where the time-shift metric is blank.
-So a time-shift metric's description must say: group by the date's month (or the function's period); no
-latest-period filter; read it per period, never as a total. `plan` attaches this as the step's risk.
+So a time-shift metric's description must say: group (and filter) by the date's month (or the function's
+period); never read it as a total or by deal alone, which return unshifted values; no latest-period filter.
+`plan` attaches this as the step's risk, and the bank SQL check refuses a query that doesn't group by the period.
 **How Studio stores it (captured 2026-11-17).** Tokens: `Sum` `<UseLookupForAttributes=False>` `(`
 `PreviousMonth` (function objectId `B73B646EAF134F989008DFBC7272EDB4`) `(` the date as an `object_at_form` token
 (`[Date]@ID`, target the base attribute, `attributeForm` the system ID form `45C11FA4...`) `,` `1` (integer)
@@ -323,10 +330,12 @@ matched the Studio-built one in every case above (38 months, edge cases identica
 The read-back text braces a metric name that isn't one word (`...,1,{net sales (cumulative)}))`) and leaves a
 one-word name bare (`...,1,Sales))`); the command compares without braces (a test model's multi-word source first
 failed this check after a good create, 2026-11-17).
+A time shift over a CONDITIONAL (filtered) source metric read right grouped by month on a test model
+(2026-11-17, checked by the test chat: each month equal to its source's previous month).
 Not yet verified: functions other than PreviousMonth (gated behind `--unverified-ok`), live (not in-memory)
-models, `--replace` on a time-shift metric, and a time shift over a DERIVED source metric (e.g. a conditional
-one; Strategy documents simple aggregates only, and unsupported cases can return null or partial values with no
-error). The command warns when the source is derived.
+models, `--replace` on a time-shift metric, and a time shift over other derived sources (compound or level
+metrics; Strategy documents simple aggregates only, and unsupported cases can return null or partial values with
+no error). The command warns when the source is derived.
 
 ## 1. Compound metric — ratio of two metrics
 

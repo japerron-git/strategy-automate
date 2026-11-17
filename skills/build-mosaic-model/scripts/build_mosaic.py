@@ -5595,9 +5595,10 @@ def cmd_create_time_shift_metric(m: MSTR, args):
     command unless --replace (full-body PUT on the same objectId); a fact metric of the same name always does.
     After commit the formula is read back and compared with the expected text.
 
-    It reads right only grouped and filtered by the date's period attribute (memory §0e): no grouping returns
-    the unshifted total and a parent date in its place the unshifted values; a coarser period, an ungrouped
-    one-period filter or a latest-period flag reads blank; a base-date filter blanks a range's first period.
+    It reads right only grouped and filtered by the date's period attribute (memory §0e). Without the period in
+    GROUP BY it is unshifted (no grouping, other attributes, a parent date, even a latest-period flag) or blank
+    (a coarser period, an ungrouped one-period filter); with it, a latest-period flag reads blank and a
+    base-date filter blanks a range's first period.
     """
     function = args.function
     if function not in TIME_SHIFT_FUNCTIONS:
@@ -5637,8 +5638,8 @@ def cmd_create_time_shift_metric(m: MSTR, args):
     warnings = []
     if source["subType"] == "metric":
         warnings.append(f"source '{source['name']}' is a derived metric: Strategy documents time transformations "
-                        f"for simple aggregates, and a time shift over a derived (e.g. conditional) metric is not "
-                        f"verified live; check its values by period before relying on it")
+                        f"for simple aggregates. A conditional (filtered) source has read right by month (17 Nov); "
+                        f"other derived sources are not verified: check its values by period before relying on it")
         print(f"WARNING: {warnings[-1]}", file=sys.stderr)
 
     lowered = args.name.lower()

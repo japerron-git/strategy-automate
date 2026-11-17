@@ -235,7 +235,11 @@ class TimeShiftSqlTests(unittest.TestCase):
             (f'SELECT "ship month", SUM({prev}) {TS_FROM} GROUP BY 1', 1),                # parent date: unshifted
             (f'SELECT "order date (year)__id", SUM({prev}) {TS_FROM} GROUP BY 1', 1),     # coarser period: blank
             (f"SELECT SUM({prev}) {TS_FROM} WHERE {MONTH} = 202001", 1),                  # one month, ungrouped: blank
-            (f'SELECT "latest flag", SUM({prev}) {TS_FROM} GROUP BY 1', 1),               # parent flag: blank
+            (f'SELECT "latest flag", SUM({prev}) {TS_FROM} GROUP BY 1', 1),               # parent flag: unshifted
+            (f'SELECT "region", SUM({prev}) {TS_FROM} WHERE "latest flag" = \'Y\' GROUP BY 1', 1),  # unshifted
+            (f'SELECT SUM({prev}) {TS_FROM} WHERE "latest flag" = \'Y\'', 1),             # unshifted (ratio 1)
+            # month grouped + latest flag reads blank; nothing marks an attribute as the latest flag: not caught
+            (f'SELECT {MONTH}, SUM({prev}) {TS_FROM} WHERE "latest flag" = \'Y\' GROUP BY 1', 0),
             (f'SELECT {MONTH}, SUM({prev}) {TS_FROM} WHERE "order date" >= DATE \'2020-01-01\' GROUP BY 1', 1),
             (f'SELECT "order date", SUM({prev}) {TS_FROM} GROUP BY 1', 2),               # base date
             (f'SELECT SUM("sales over previous month") {TS_FROM}', 1),                   # a ratio over it
@@ -248,6 +252,8 @@ class TimeShiftSqlTests(unittest.TestCase):
         (missing,) = self.lint('SELECT SUM("sales growth pct") FROM {{MODEL}}')
         self.assertIn("built on 'sales (previous month)'", missing)
         self.assertIn('"order date (month)__id"', missing)
+        self.assertIn("unshifted values with no error", missing)
+        self.assertIn("even with a latest-period flag", missing)
         base = self.lint('SELECT "order date", SUM("sales (previous month)") FROM {{MODEL}} GROUP BY 1')
         self.assertTrue(any('base date "order date"' in p for p in base))
         self.assertEqual(self.lint("SELECT 'sales (previous month)' FROM {{MODEL}}"), [])   # a string, not a column
@@ -482,6 +488,8 @@ class PlanTests(unittest.TestCase):
         (risk,) = [r for r in step["risks"] if "order date" in r]
         self.assertIn("grouped AND filtered by the month of 'order date'", risk)
         self.assertIn("not by the base date", risk)
+        self.assertIn("UNSHIFTED values with no error", risk)
+        self.assertIn("even with a latest-period flag", risk)
 
     def test_time_shift_args_are_checked(self):
         def report(**args):
@@ -1461,7 +1469,26 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
             "items": [{"object_type": "derived", "current_name": "x", "description": "y" * 251}]}}])]}, model_id="MID")
         text = " | ".join(bad["problems"])
         self.assertIn("object_type must be attribute, fact_metric, metric (a derived metric) or model", text)
-        self.assertIn("over 250 characters", text)
+        self.assertIn("is 251 characters, over 250", text)
+
+    def test_description_length_is_checked_for_every_action(self):
+        # open item 24 (17 Nov): a 254-character description passed check; the command refused it at its dry run
+        long, ok = "d" * 254, "d" * 250
+        findings = {"findings": [
+            _finding("F1", "description", actions=[{"kind": "rename_describe", "args": {"items": [
+                {"object_type": "attribute", "current_name": "region", "description": long},
+                {"object_type": "attribute", "current_name": "city", "description": ok}]}}]),
+            _finding("F2", "metric_defect", actions=[{"kind": "create_compound_metric", "args": {
+                "name": "margin", "formula": "[a] / [b]", "join": "outer", "description": long}}]),
+            _finding("F3", "metric_defect", actions=[{"kind": "create_time_shift_metric", "args": {
+                "name": "s", "function": "PreviousMonth", "time_attribute": "d", "source_metric": "m",
+                "description": ok}}])]}
+        problems = [p for p in am.check_findings(findings)["problems"] if "characters, over" in p]
+        self.assertEqual(problems, [
+            "F1: rename_describe: the description of 'region' is 254 characters, over 250",
+            "F2: create_compound_metric: the description of 'margin' is 254 characters, over 250"])
+        plan = am.build_plan(findings, model_id="M")
+        self.assertEqual([p for p in plan["problems"] if "characters, over" in p], problems)   # reported once
 
     def test_connector_form_names_in_rename_describe(self):
         def plan_for(items):
