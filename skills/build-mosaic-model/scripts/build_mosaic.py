@@ -5523,9 +5523,12 @@ def time_shift_period(function: str) -> str:
 
 
 def time_shift_text(function: str, attribute: dict, periods: int | None, source: dict, aggregation: str) -> str:
-    """The formula as the service shows it: Sum(PreviousMonth({Order Date} (ID),1,Sales))."""
+    """The formula as the service shows it: Sum(PreviousMonth({Order Date} (ID),1,Sales)). The service writes a
+    one-word metric name bare and braces any other ({net sales}); seen live 2026-11-17."""
+    name = source["name"]
+    ref = name if _re.fullmatch(r"[A-Za-z_]\w*", name) else f"{{{name}}}"
     args = [f"{{{attribute['name']}}} (ID)"] + ([str(periods)] if function.startswith("Previous") else [])
-    return f"{aggregation}({function}({','.join(args + [source['name']])}))"
+    return f"{aggregation}({function}({','.join(args + [ref])}))"
 
 
 def time_shift_tokens(function: str, attribute: dict, periods: int | None, source: dict,
@@ -5579,7 +5582,8 @@ def _smart_types(attribute_body: dict) -> set[str]:
 
 
 def _norm_formula(text: str) -> str:
-    return _re.sub(r"\s+", "", str(text or "")).lower()
+    """Formula text compared without whitespace, case or braces (names are braced or not by the service's rule)."""
+    return _re.sub(r"[\s{}]+", "", str(text or "")).lower()
 
 
 def cmd_create_time_shift_metric(m: MSTR, args):
@@ -5630,6 +5634,12 @@ def cmd_create_time_shift_metric(m: MSTR, args):
             f"hidden Day and Week attributes the function needs.")
     facts, derived = _list_model_metrics(m, args.model_id)
     source = _resolve_metric_operand(_metric_operand_index(facts, derived), args.source_metric)
+    warnings = []
+    if source["subType"] == "metric":
+        warnings.append(f"source '{source['name']}' is a derived metric: Strategy documents time transformations "
+                        f"for simple aggregates, and a time shift over a derived (e.g. conditional) metric is not "
+                        f"verified live; check its values by period before relying on it")
+        print(f"WARNING: {warnings[-1]}", file=sys.stderr)
 
     lowered = args.name.lower()
     if any((i.get("name") or "").lower() == lowered for i in _named(facts, args.name)):
@@ -5666,7 +5676,7 @@ def cmd_create_time_shift_metric(m: MSTR, args):
         step = ({"step": "replace", "method": "PUT", "path": f"{mp}/metrics/{target_id}"} if target_id
                 else {"step": "create", "method": "POST", "path": f"{mp}/metrics"})
         print(json.dumps({"ok": True, "dry_run": True, "action": "replace" if target_id else "create",
-                          "formula": expected, "time_attributes": sorted(types),
+                          "formula": expected, "time_attributes": sorted(types), "warnings": warnings,
                           "plan": [dict(step, params=q, body=body)]}, indent=2))
         return
     cs = open_cs(m)
@@ -5688,6 +5698,8 @@ def cmd_create_time_shift_metric(m: MSTR, args):
     got = ((_json_or(r, {}) or {}).get("expression") or {}).get("text") if r.ok else None
     result = {"ok": _norm_formula(got) == _norm_formula(expected), "metric_id": metric_id,
               "action": "replaced" if target_id else "created", "formula": got, "expected": expected}
+    if warnings:
+        result["warnings"] = warnings
     print(json.dumps(result, indent=2))
     if not result["ok"]:
         die(f"'{args.name}' was saved but reads back as {got!r}, not {expected!r}: check it in Studio")

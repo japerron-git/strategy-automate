@@ -320,8 +320,13 @@ against the capture) and requires the date's Day interval and the function's own
 **REST create verified live (2026-11-17, in-memory scratch model):** `create-time-shift-metric` (one POST with these
 tokens in a changeset, then commit and re-certify) built a metric whose read-back formula and connector values
 matched the Studio-built one in every case above (38 months, edge cases identical). No republish needed.
+The read-back text braces a metric name that isn't one word (`...,1,{net sales (cumulative)}))`) and leaves a
+one-word name bare (`...,1,Sales))`); the command compares without braces (a test model's multi-word source first
+failed this check after a good create, 2026-11-17).
 Not yet verified: functions other than PreviousMonth (gated behind `--unverified-ok`), live (not in-memory)
-models, and `--replace` on a time-shift metric.
+models, `--replace` on a time-shift metric, and a time shift over a DERIVED source metric (e.g. a conditional
+one; Strategy documents simple aggregates only, and unsupported cases can return null or partial values with no
+error). The command warns when the source is derived.
 
 ## 1. Compound metric — ratio of two metrics
 

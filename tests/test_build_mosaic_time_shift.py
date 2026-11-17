@@ -192,5 +192,46 @@ class CommandTests(unittest.TestCase):
         self.assertEqual((args.function, args.periods, args.replace), ("PreviousMonth", 1, True))
 
 
+
+class MultiWordNameTests(unittest.TestCase):
+    """Item 22 (17 Nov): the service braces a metric name that isn't one word; the read-back must match."""
+
+    NET = {"objectId": "E" * 32, "subType": "fact_metric", "name": "net sales (cumulative)"}
+    RATIO = {"objectId": "F" * 32, "subType": "metric", "name": "open orders value"}
+
+    def _routes(self, source, read_back):
+        routes = _routes(read_back=read_back)
+        key = "factMetrics" if source["subType"] == "fact_metric" else "metrics"
+        routes[("GET", f"{MP}/{key}")] = _Resp(200, {key: [{"information": dict(source)}]})
+        routes[("GET", f"{MP}/factMetrics/{source['objectId']}")] = _Resp(200, {"format": {"header": [], "values": FMT}})
+        return routes
+
+    def test_text_braces_names_that_are_not_one_word(self):
+        self.assertEqual(bm.time_shift_text("PreviousMonth", DATE, 1, self.NET, "Sum"),
+                         "Sum(PreviousMonth({Order Date} (ID),1,{net sales (cumulative)}))")
+        self.assertEqual(bm.time_shift_text("PreviousMonth", DATE, 1, SALES, "Sum"),
+                         "Sum(PreviousMonth({Order Date} (ID),1,Sales))")
+
+    def test_braced_read_back_of_a_multi_word_source_passes(self):
+        read_back = "Sum(PreviousMonth({Order Date} (ID),1,{net sales (cumulative)}))"   # as the service wrote it
+        result = _run(_FakeMSTR(self._routes(self.NET, read_back)), source_metric="net sales (cumulative)")
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("warnings", result)
+        # either bracing compares equal; a different metric does not
+        self.assertEqual(bm._norm_formula("Sum(X({A b} (ID),1,c d))"), bm._norm_formula("Sum(X({A b} (ID),1,{c d}))"))
+        self.assertNotEqual(bm._norm_formula("Sum(X({A} (ID),1,{c d}))"), bm._norm_formula("Sum(X({A} (ID),1,{c e}))"))
+
+    def test_a_derived_source_warns(self):
+        read_back = "Sum(PreviousMonth({Order Date} (ID),1,{open orders value}))"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            result = _run(_FakeMSTR(self._routes(self.RATIO, read_back)), source_metric="open orders value")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("is a derived metric", result["warnings"][0])
+        self.assertIn("WARNING", err.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()):
+            dry = _run(_FakeMSTR(self._routes(self.RATIO, read_back)), source_metric="open orders value", dry_run=True)
+        self.assertEqual(len(dry["warnings"]), 1)
+
 if __name__ == "__main__":
     unittest.main()
