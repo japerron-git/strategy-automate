@@ -1399,9 +1399,7 @@ def _execute(runner: Runner, project: str, sql: str, max_rows: int) -> dict[str,
             "seconds": round(time.monotonic() - t0, 3), "cost": parsed.get("cost") or query_cost(sql, "")}
 
 
-def model_description_cost(runner: Runner, project: str, model: str) -> dict[str, int] | None:
-    """Size of the get_semantics reply: what every analyst session reads before its first query. It grows with
-    each metric and description added, so it is tracked per round next to the answer costs."""
+def _semantics_text(runner: Runner, project: str, model: str) -> str | None:
     try:
         reply = runner.call("get_semantics", {"project": project, "model": model})
     except PendingReply:
@@ -1410,7 +1408,15 @@ def model_description_cost(runner: Runner, project: str, model: str) -> dict[str
         return None
     if reply.get("isError"):
         return None
-    text = tool_text(reply)
+    return tool_text(reply)
+
+
+def model_description_cost(runner: Runner, project: str, model: str, text: str | None = None) -> dict[str, int] | None:
+    """Size of the get_semantics reply: what every analyst session reads before its first query. It grows with
+    each metric and description added, so it is tracked per round next to the answer costs."""
+    text = _semantics_text(runner, project, model) if text is None else text
+    if text is None:
+        return None
     return {"chars": len(text), "est_tokens": -(-len(text) // CHARS_PER_TOKEN)}
 
 
@@ -1418,12 +1424,19 @@ def run_bank(runner: Runner, project: str, bank: dict, *, only: str = "", levels
              max_rows: int = 1000, log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
     model = bank["model"]
     results = []
-    semantics_cost = model_description_cost(runner, project, model)
+    sem_text = _semantics_text(runner, project, model)
+    semantics_cost = model_description_cost(runner, project, model, sem_text) if sem_text is not None else None
+    shifted = time_shift_metrics(parse_semantics(sem_text)["metrics"]) if sem_text else {}
     questions = _select(bank.get("questions") or [], only, levels)
     for i, q in enumerate(questions):
         log(f"run {i + 1}/{len(questions)}: {q.get('id')}")
         entry: dict[str, Any] = {"id": q.get("id"), "level": q.get("level")}
         best = q.get("best_answer") or {}
+        sql_warnings = [f"{where}: {w}" for where, text in (("sql", q.get("sql") or ""),
+                                                            ("best answer", best.get("sql") or ""))
+                        for w in time_shift_sql_lint(text, shifted)]
+        if sql_warnings:   # the model's current time-shift metrics, read live
+            entry["sql_warnings"] = sql_warnings
         if (best.get("sql") or "").strip():   # also for questions the governed path can't answer
             best_sql = svm.inject_model(best["sql"], model)
             entry["best_run"] = {"sql": best_sql, **_execute(runner, project, best_sql, max_rows)}
@@ -3481,6 +3494,12 @@ def grouped_expressions(sql: str) -> list[str]:
     """Expressions a query groups by, at any level, instead of a plain column: in Mosaic grouping by an
     expression computed from an attribute doesn't regroup (each underlying value stays its own row), even in
     an outer query over a subquery. Group by the attribute itself, or its time attribute."""
+    bare = re.compile(r'(?:(?:"[^"]+"|[A-Za-z_]\w*)\.)?(?:"[^"]+"|[A-Za-z_]\w*)')
+    return [e for e in group_by_items(sql) if not bare.fullmatch(e) and not re.fullmatch(r"-?\d+(\.\d+)?|''", e)]
+
+
+def group_by_items(sql: str) -> list[str]:
+    """Every GROUP BY item of every SELECT in the query, ordinals and aliases resolved to their expressions."""
     text = _SQL_LITERAL.sub("''", sql or "")
     depth, d = [], 0
     for ch in text:
@@ -3510,7 +3529,6 @@ def grouped_expressions(sql: str) -> list[str]:
                 return k
         return -1
     found: list[str] = []
-    bare = re.compile(r'(?:(?:"[^"]+"|[A-Za-z_]\w*)\.)?(?:"[^"]+"|[A-Za-z_]\w*)')
     for m in re.finditer(r"\bselect\b", low):
         i = m.start()
         dd = at(i)
@@ -3537,18 +3555,98 @@ def grouped_expressions(sql: str) -> list[str]:
                 expr = _strip_alias(select_items[int(item) - 1])[0]
             elif item.strip('"').lower() in aliases:
                 expr = aliases[item.strip('"').lower()]
-            e = expr.strip()
-            if not bare.fullmatch(e) and not re.fullmatch(r"-?\d+(\.\d+)?|''", e):
-                found.append(e)
+            found.append(expr.strip())
     return found
 
 
-def _sql_lint(sql: str) -> list[str]:
+# ── Time-shift metrics in SQL ─────────────────────────────────────────────────────────────────
+# A Mosaic time-shift metric (PreviousMonth and friends) reads right only grouped AND filtered by its date's
+# period attribute (memory/reference_mosaic_derived_metrics.md §0e, seen live 2026-11-17): with no grouping, or
+# grouped by a parent date, it returns unshifted values with no error; by a coarser period, or with one period
+# filtered but not grouped, it reads blank; a filter on the base date blanks a range's first period.
+_TIME_SHIFT_CALL = re.compile(r"\b(previous(?:day|week|month|quarter|year)|(?:month|quarter|year)todate)\s*\(\s*"
+                              r"\{([^{}]+)\}", re.I)
+_FORMULA_REF = re.compile(r"\{([^{}]+)\}")
+TIME_PERIODS = ("day", "week", "month", "quarter", "year")
+
+
+def time_shift_metrics(metrics: list[dict]) -> dict[str, dict]:
+    """get_semantics metrics ({name, formula}) -> {lower(name): {name, function, attribute, period, via?}} for every
+    time-shift metric, and every metric whose formula refers to one (a ratio over it reads by the same rule)."""
+    canon = {f.lower(): f for f in TIME_SHIFT_FUNCTIONS}
+    out: dict[str, dict] = {}
+    for m in metrics or []:
+        hit = _TIME_SHIFT_CALL.search(str(m.get("formula") or ""))
+        if hit and m.get("name"):
+            fn = canon[hit.group(1).lower()]
+            out[str(m["name"]).lower()] = {"name": m["name"], "function": fn, "attribute": hit.group(2).strip(),
+                                           "period": time_shift_period(fn)}
+    changed = True
+    while changed:
+        changed = False
+        for m in metrics or []:
+            key = str(m.get("name") or "").lower()
+            if not key or key in out:
+                continue
+            for ref in _FORMULA_REF.findall(str(m.get("formula") or "")):
+                base = out.get(ref.strip().lower())
+                if base:
+                    out[key] = {**base, "name": m["name"], "via": base.get("via") or base["name"]}
+                    changed = True
+                    break
+    return out
+
+
+def time_shift_from_scope(path: str) -> dict[str, dict]:
+    """time_shift_metrics() of a scope.json's metrics; {} when the file is missing."""
+    if not path or not os.path.isfile(path):
+        return {}
+    return time_shift_metrics(_load_json(path).get("metrics") or [])
+
+
+def _mentions(text: str, name: str) -> bool:
+    """The query names this column, quoted ("name") or, for a one-word name, bare."""
+    low = text.lower()
+    if f'"{name.lower()}"' in low:
+        return True
+    return bool(re.fullmatch(r"[A-Za-z_]\w*", name)) and bool(
+        re.search(rf'(?<![\w"]){re.escape(name.lower())}(?![\w"])', low))
+
+
+def time_shift_sql_lint(sql: str, shifted: dict[str, dict] | None) -> list[str]:
+    """Problems with how a query reads the time-shift metrics in `shifted` (from time_shift_metrics)."""
+    if not shifted or not (sql or "").strip():
+        return []
+    text = _SQL_LITERAL.sub("''", sql)
+    grouped = {e.strip().strip('"').lower() for e in group_by_items(sql)}
+    out = []
+    for key in sorted(shifted):
+        ts = shifted[key]
+        if not _mentions(text, ts["name"]):
+            continue
+        attr, period = ts["attribute"].lower(), ts["period"]
+        allowed = [period] if ts["function"].startswith("Previous") else \
+            list(TIME_PERIODS[:TIME_PERIODS.index(period) + 1])
+        ok_cols = {f"{attr} ({p})__{form}" for p in allowed for form in ("id", "start", "desc")}
+        col = f'"{attr} ({period})__id"'
+        label = f"time-shift metric '{ts['name']}'" + (f" (built on '{ts['via']}')" if ts.get("via") else "")
+        if not grouped & ok_cols:
+            out.append(f"it reads {label} without grouping by {col}: with no grouping or grouped by another date it "
+                       f"returns unshifted values with no error, and by a coarser period or with one {period} "
+                       f"filtered but not grouped it reads blank; group (and filter) by {col}")
+        if _mentions(text, attr):
+            out.append(f"it filters or groups by the base date \"{attr}\" with {label}: a filter there also applies "
+                       f"to the shifted {period}, so a range's first {period} reads blank; use {col} instead")
+    return out
+
+
+def _sql_lint(sql: str, shifted: dict[str, dict] | None = None) -> list[str]:
     bad = grouped_expressions(sql)
-    return [f"it groups by an expression ({', '.join(b[:60] for b in bad)}), which doesn't regroup in Mosaic, even in "
-            f"an outer query over a subquery: group by the attribute itself or its time attribute ((year), (month) "
-            f"forms), or compute the expression in the subquery's SELECT (e.g. YEAR(MAX(<date>)) AS vintage) and "
-            f"group the outer query by that column"] if bad else []
+    out = [f"it groups by an expression ({', '.join(b[:60] for b in bad)}), which doesn't regroup in Mosaic, even in "
+           f"an outer query over a subquery: group by the attribute itself or its time attribute ((year), (month) "
+           f"forms), or compute the expression in the subquery's SELECT (e.g. YEAR(MAX(<date>)) AS vintage) and "
+           f"group the outer query by that column"] if bad else []
+    return out + time_shift_sql_lint(sql, shifted)
 
 
 def best_answer_version(q: dict) -> int:
@@ -3579,7 +3677,8 @@ _WS = re.compile(r"\s+")
 
 
 def set_best_answer(bank: dict, qid: str, *, sql: str = "", not_answerable: str = "", reason_kind: str,
-                    reason: str = "", rationale: str = "", round_no: int | None = None) -> dict[str, Any]:
+                    reason: str = "", rationale: str = "", round_no: int | None = None,
+                    time_shift: dict[str, dict] | None = None) -> dict[str, Any]:
     """Record a question's best answer: expert SQL over the model's own columns (or why none exists), with
     its rationale. Later changes are overrides with a recorded reason: the user's decision, a data change,
     or an error found in the earlier SQL. The history keeps every earlier version."""
@@ -3601,7 +3700,7 @@ def set_best_answer(bank: dict, qid: str, *, sql: str = "", not_answerable: str 
         problems.append("an override needs --reason: what was decided, what changed in the data, or what was wrong")
     if sql.strip() and _WS.sub(" ", sql.strip()).lower() == _WS.sub(" ", (q.get("sql") or "").strip()).lower():
         problems.append("the best answer must be independent of the question's own SQL, or it proves nothing")
-    problems += [f"the best answer: {p}" for p in _sql_lint(sql)]
+    problems += [f"the best answer: {p}" for p in _sql_lint(sql, time_shift)]
     if problems:
         return {"ok": False, "problems": problems}
     history = list((current or {}).get("history") or [])
@@ -3621,7 +3720,8 @@ QUESTION_SQL_REASONS = ("new_object", "sql_error", "type_change", "decision", "m
 
 
 def set_question_sql(bank: dict, qid: str, *, sql: str = "", not_answerable: bool = False, reason_kind: str,
-                     reason: str, round_no: int | None = None, path: str = "") -> dict[str, Any]:
+                     reason: str, round_no: int | None = None, path: str = "",
+                     time_shift: dict[str, dict] | None = None) -> dict[str, Any]:
     """Rewrite a question's governed SQL: a phase added the object that answers it (new_object), the SQL was
     wrong (sql_error), a type change altered the values it filters on (type_change), or the user decided
     (decision). The earlier SQL stays in `sql_history`, so the round it became answerable is on record."""
@@ -3642,7 +3742,7 @@ def set_question_sql(bank: dict, qid: str, *, sql: str = "", not_answerable: boo
         problems.append("the question's SQL can't be its best answer: then the grade proves nothing")
     if path and path not in PATHS:
         problems.append(f"path must be one of {', '.join(PATHS)}")
-    problems += [f"the SQL: {p}" for p in _sql_lint(sql)]
+    problems += [f"the SQL: {p}" for p in _sql_lint(sql, time_shift)]
     if problems:
         return {"ok": False, "problems": problems}
     history = list(q.get("sql_history") or [])
@@ -3697,6 +3797,8 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
                 item["best_answer"] = f"not answerable: {best_q['not_answerable']}"
         if res is not None:
             item["cost"] = add_costs(res.get("cost"), (res.get("expected_run") or {}).get("cost"))
+            if res.get("sql_warnings"):
+                item["sql_warnings"] = list(res["sql_warnings"])
             brun = res.get("best_run") or {}
             if brun:
                 item["best_cost"] = add_costs(brun.get("cost"))
@@ -4672,7 +4774,7 @@ def _dupes(ids: list[Any]) -> list[Any]:
     return dup
 
 
-def check_bank(bank: dict) -> dict[str, Any]:
+def check_bank(bank: dict, time_shift: dict[str, dict] | None = None) -> dict[str, Any]:
     problems: list[str] = []
     warnings: list[str] = []
     if not bank.get("model"):
@@ -4697,7 +4799,7 @@ def check_bank(bank: dict) -> dict[str, Any]:
         if (q.get("sql") or "").strip() and "{{MODEL}}" not in q["sql"]:
             warnings.append(f"{qid}: sql has no {{{{MODEL}}}} placeholder")
         for where, text in (("sql", q.get("sql") or ""), ("best answer", (q.get("best_answer") or {}).get("sql") or "")):
-            for lint in _sql_lint(text):
+            for lint in _sql_lint(text, time_shift):
                 warnings.append(f"{qid}: {where}: {lint}; fix with reason kind sql_error")
         for key in ("key", "measures", "metrics", "domain_claims"):
             if key in q and not isinstance(q[key], list):
@@ -4997,6 +5099,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--reason", required=True)
     sp.add_argument("--path", default="", choices=("",) + PATHS)
     sp.add_argument("--round", type=int, default=None)
+    sp.add_argument("--scope", help="scope.json for the time-shift SQL check (default: the one beside --bank)")
 
     sp = sub.add_parser("lookups", help="recommend lookup tables and write CSV templates for them")
     sp.add_argument("--probes", help="probes.json: attributes listing values with no fact rows point to existing tables")
@@ -5058,6 +5161,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--reason", default="", help="for an override: the decision, the data change or the error")
     sp.add_argument("--rationale", default="", help="what the SQL does and why it is the right definition")
     sp.add_argument("--round", type=int, default=None)
+    sp.add_argument("--scope", help="scope.json for the time-shift SQL check (default: the one beside --bank)")
 
     sp = sub.add_parser("references", help="names saved SQL uses that the model no longer has: compare this "
                         "round's scope with the previous one, rewrite SQL where the replacement is certain")
@@ -5115,7 +5219,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--bank")
     sp.add_argument("--findings")
     sp.add_argument("--domain")
+    sp.add_argument("--scope", help="scope.json: its metric formulas let the bank check catch time-shift misuse")
     return ap
+
+
+def _bank_time_shift(args: argparse.Namespace) -> dict[str, dict]:
+    """Time-shift metrics from --scope, else from the scope.json beside the bank (none when neither exists)."""
+    path = getattr(args, "scope", None) or os.path.join(os.path.dirname(os.path.abspath(args.bank)), "scope.json")
+    return time_shift_from_scope(path)
 
 
 def main(argv: list[str] | None = None, runner_factory: Callable[[argparse.Namespace], Runner] | None = None) -> int:
@@ -5438,7 +5549,7 @@ def _offline(args: argparse.Namespace) -> int:
                 sql = f.read()
         out = set_best_answer(bank, args.id, sql=sql, not_answerable=args.not_answerable or "",
                               reason_kind=args.reason_kind, reason=args.reason, rationale=args.rationale,
-                              round_no=args.round)
+                              round_no=args.round, time_shift=_bank_time_shift(args))
         if out["ok"]:
             _write_json(args.bank, bank)
         print(json.dumps(out, indent=2))
@@ -5450,7 +5561,8 @@ def _offline(args: argparse.Namespace) -> int:
             with open(args.sql_file, encoding="utf-8") as f:
                 sql = f.read()
         out = set_question_sql(bank, args.id, sql=sql, not_answerable=bool(args.not_answerable),
-                               reason_kind=args.reason_kind, reason=args.reason, round_no=args.round, path=args.path)
+                               reason_kind=args.reason_kind, reason=args.reason, round_no=args.round, path=args.path,
+                               time_shift=_bank_time_shift(args))
         if out["ok"]:
             _write_json(args.bank, bank)
         print(json.dumps(out, indent=2))
@@ -5496,7 +5608,9 @@ def _offline(args: argparse.Namespace) -> int:
         return 2
     report: dict[str, Any] = {}
     if args.bank:
-        report["bank"] = check_bank(_load_json(args.bank))
+        report["bank"] = check_bank(_load_json(args.bank), time_shift_from_scope(getattr(args, "scope", None) or ""))
+        if not getattr(args, "scope", None):
+            report["bank"]["notes"] = ["no --scope: the time-shift SQL check was skipped"]
     if args.findings:
         report["findings"] = check_findings(_load_json(args.findings))
     if args.domain:

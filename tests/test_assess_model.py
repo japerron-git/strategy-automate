@@ -181,6 +181,144 @@ def _replies():
     }
 
 
+
+# A model like the scratch one the time-shift rule was seen on live (2026-11-17), with generic names: "order date"
+# is the shifted date, "ship month" a parent date of it (an attribute relationship), "latest flag" a parent flag.
+TS_SEMANTICS = """## Schema: retail. Table: Orders
+### Attributes(Dimensions)
+- **order date** (date): Order month.
+- **ship month** (date): Shipping month, a parent of order date.
+- **latest flag** (varchar): Y on the latest month.
+- **order date (month)__id** (bigint)
+- **order date (quarter)__id** (bigint)
+- **order date (year)__id** (bigint)
+### Metrics(Measures)
+- **sales** (bigint)
+- **sales (previous month)** (bigint): Sales one month back.
+Sum(PreviousMonth({Order Date} (ID),1,Sales))
+- **sales over previous month** (double): This month over last month.
+Sales / {sales (previous month)}
+- **sales growth pct** (double): Built on the ratio.
+({sales over previous month} - 1) * 100
+- **sales mtd** (bigint): Month to date.
+Sum(MonthToDate({Order Date} (ID),Sales))
+"""
+TS_FROM = 'FROM {{MODEL}}'
+MONTH = '"order date (month)__id"'
+
+
+class TimeShiftSqlTests(unittest.TestCase):
+    def setUp(self):
+        self.shifted = am.time_shift_metrics(am.parse_semantics(TS_SEMANTICS)["metrics"])
+
+    def lint(self, sql):
+        return am.time_shift_sql_lint(sql, self.shifted)
+
+    def test_finds_time_shift_metrics_and_those_built_on_them(self):
+        self.assertEqual(sorted(self.shifted), sorted(["sales (previous month)", "sales over previous month",
+                                                       "sales growth pct", "sales mtd"]))
+        self.assertEqual(self.shifted["sales (previous month)"],
+                         {"name": "sales (previous month)", "function": "PreviousMonth", "attribute": "Order Date",
+                          "period": "month"})
+        self.assertEqual(self.shifted["sales growth pct"]["via"], "sales (previous month)")
+        self.assertEqual(self.shifted["sales mtd"]["function"], "MonthToDate")
+        self.assertNotIn("sales", self.shifted)
+
+    def test_live_outcomes(self):
+        prev = '"sales (previous month)"'
+        cases = [   # (sql, problems expected) — each outcome as read live through the connector
+            (f"SELECT {MONTH}, SUM({prev}) {TS_FROM} GROUP BY 1", 0),                                  # right
+            (f"SELECT {MONTH} AS m, SUM({prev}) {TS_FROM} WHERE {MONTH} BETWEEN 202001 AND 202003 GROUP BY m", 0),
+            (f'SELECT "order date (year)__id", {MONTH}, SUM({prev}) {TS_FROM} GROUP BY 1, 2', 0),       # right
+            (f"SELECT SUM(x) FROM (SELECT {MONTH}, SUM({prev}) AS x {TS_FROM} GROUP BY {MONTH}) t", 0),
+            (f"SELECT SUM({prev}) {TS_FROM}", 1),                                       # unshifted total, no error
+            (f'SELECT "ship month", SUM({prev}) {TS_FROM} GROUP BY 1', 1),                # parent date: unshifted
+            (f'SELECT "order date (year)__id", SUM({prev}) {TS_FROM} GROUP BY 1', 1),     # coarser period: blank
+            (f"SELECT SUM({prev}) {TS_FROM} WHERE {MONTH} = 202001", 1),                  # one month, ungrouped: blank
+            (f'SELECT "latest flag", SUM({prev}) {TS_FROM} GROUP BY 1', 1),               # parent flag: blank
+            (f'SELECT {MONTH}, SUM({prev}) {TS_FROM} WHERE "order date" >= DATE \'2020-01-01\' GROUP BY 1', 1),
+            (f'SELECT "order date", SUM({prev}) {TS_FROM} GROUP BY 1', 2),               # base date
+            (f'SELECT SUM("sales over previous month") {TS_FROM}', 1),                   # a ratio over it
+            (f'SELECT {MONTH}, SUM("sales") {TS_FROM} GROUP BY 1', 0),                  # no time-shift metric
+        ]
+        for sql, expected in cases:
+            self.assertEqual(len(self.lint(sql)), expected, sql)
+
+    def test_messages_name_the_column_and_the_base_date(self):
+        (missing,) = self.lint('SELECT SUM("sales growth pct") FROM {{MODEL}}')
+        self.assertIn("built on 'sales (previous month)'", missing)
+        self.assertIn('"order date (month)__id"', missing)
+        base = self.lint('SELECT "order date", SUM("sales (previous month)") FROM {{MODEL}} GROUP BY 1')
+        self.assertTrue(any('base date "order date"' in p for p in base))
+        self.assertEqual(self.lint("SELECT 'sales (previous month)' FROM {{MODEL}}"), [])   # a string, not a column
+
+    def test_to_date_allows_finer_periods_only(self):
+        self.assertEqual(self.lint(f'SELECT {MONTH}, SUM("sales mtd") {TS_FROM} GROUP BY 1'), [])
+        self.assertEqual(len(self.lint(f'SELECT "order date (quarter)__id", SUM("sales mtd") {TS_FROM} GROUP BY 1')), 1)
+
+    def test_bare_one_word_names(self):
+        shifted = am.time_shift_metrics([{"name": "prevsales", "formula": "Sum(PreviousMonth({d} (ID),1,s))"}])
+        self.assertEqual(len(am.time_shift_sql_lint("SELECT SUM(prevsales) FROM {{MODEL}}", shifted)), 1)
+        self.assertEqual(am.time_shift_sql_lint('SELECT SUM("prevsales_x") FROM {{MODEL}}', shifted), [])
+
+    def test_best_answer_and_question_sql_refuse_and_check_warns(self):
+        bank = {"model": "Orders", "questions": [
+            {"id": "Q1", "level": 2, "question": "Sales vs last month?", "expected_path": "governed",
+             "sql": f'SELECT {MONTH}, SUM("sales over previous month") {TS_FROM} GROUP BY 1'}]}
+        bad = 'SELECT SUM("sales over previous month") FROM {{MODEL}}'
+        out = am.set_best_answer(bank, "Q1", sql=bad, reason_kind="initial", rationale="r", time_shift=self.shifted)
+        self.assertFalse(out["ok"])
+        self.assertTrue(any("without grouping by" in p for p in out["problems"]))
+        ok = am.set_best_answer(bank, "Q1", sql=f'SELECT {MONTH}, SUM("sales") / SUM("sales (previous month)") '
+                                                f'{TS_FROM} GROUP BY 1', reason_kind="initial", rationale="r",
+                                time_shift=self.shifted)
+        self.assertTrue(ok["ok"], ok)
+        self.assertFalse(am.set_question_sql(bank, "Q1", sql=bad, reason_kind="sql_error", reason="r",
+                                             time_shift=self.shifted)["ok"])
+        bank["questions"][0]["sql"] = bad
+        warns = am.check_bank(bank, self.shifted)["warnings"]
+        self.assertTrue(any(w.startswith("Q1: sql: it reads time-shift metric") for w in warns), warns)
+        self.assertFalse(any("time-shift" in w for w in am.check_bank(bank)["warnings"]))   # no scope: skipped
+
+    def test_cli_reads_the_scope_beside_the_bank(self):
+        d = tempfile.mkdtemp(prefix="ts-cli-")
+        self.addCleanup(shutil.rmtree, d, True)
+        bank_path = os.path.join(d, "bank.json")
+        with open(bank_path, "w", encoding="utf-8") as f:
+            json.dump({"model": "Orders", "questions": [
+                {"id": "Q1", "level": 2, "question": "q", "expected_path": "governed",
+                 "sql": f'SELECT {MONTH}, SUM("sales") {TS_FROM} GROUP BY 1'}]}, f)
+        with open(os.path.join(d, "scope.json"), "w", encoding="utf-8") as f:
+            json.dump({"metrics": am.parse_semantics(TS_SEMANTICS)["metrics"]}, f)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = am.main(["best-answer", "--bank", bank_path, "--id", "Q1", "--reason-kind", "initial",
+                            "--rationale", "r", "--sql", 'SELECT SUM("sales (previous month)") FROM {{MODEL}}'])
+        self.assertEqual(code, 2)
+        self.assertIn("without grouping by", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            am.main(["check", "--bank", bank_path])
+        self.assertIn("time-shift SQL check was skipped", out.getvalue())
+
+    def test_run_flags_questions_from_the_live_semantics_and_grade_keeps_it(self):
+        class Runner(FakeRunner):
+            def call(self, tool, arguments):
+                if tool == "get_semantics":
+                    return _text(TS_SEMANTICS)
+                return _text(_md(["x"], [[1]]))
+        bank = {"model": "Orders", "questions": [
+            {"id": "Q1", "level": 2, "question": "q", "expected_path": "governed",
+             "sql": 'SELECT SUM("sales (previous month)") FROM {{MODEL}}'},
+            {"id": "Q2", "level": 2, "question": "q", "expected_path": "governed",
+             "sql": f'SELECT {MONTH}, SUM("sales (previous month)") {TS_FROM} GROUP BY 1'}]}
+        results = am.run_bank(Runner(), "retail", bank)
+        by_id = {r["id"]: r for r in results["results"]}
+        self.assertEqual(len(by_id["Q1"]["sql_warnings"]), 1)
+        self.assertNotIn("sql_warnings", by_id["Q2"])
+        graded = {g["id"]: g for g in am.grade_bank(bank, results)["questions"]}
+        self.assertTrue(graded["Q1"]["sql_warnings"][0].startswith("sql: it reads time-shift metric"))
+
 class RunTests(unittest.TestCase):
     def test_runs_questions_and_same_model_expected_sql(self):
         runner = FakeRunner(_replies())
