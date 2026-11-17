@@ -194,8 +194,10 @@ metric's name fails with `8004e409` ("object name ... is duplicated"), so a corr
 the metric. `create-conditional-metric --replace` does it in ONE changeset: `POST
 .../metrics/{id}/embeddedObjects` (a new filter in the existing metric) → `PUT .../metrics/{id}` with the full
 filter-bound body → commit. Live on 9 metrics: each kept its objectId and, after certification, returned the expected
-values; 8 of them had no embedded filter before (`previous_embedded_filter_id` null) and took one. Still unverified: whether the previous embedded filter object stays in
-the model (the connector can't show it; a read-only REST read of the model would).
+values; 8 of them had no embedded filter before (`previous_embedded_filter_id` null) and took one. The old filter
+goes (scratch model, 2026-11-17): after a replace of a filtered metric (latest flag Y → N) the metric's read-back
+(`get-model-object --show-expression-as tokens tree`) lists only the agg_metric and the NEW filter among its
+embedded objects, and the values follow the new filter. (A model export lists no embedded filter ids at all.)
 
 ## 0d. Periodic-snapshot facts — once-per-entity, filtered and point-in-time metrics (verified 2026-10-30/31)
 
@@ -332,8 +334,19 @@ one-word name bare (`...,1,Sales))`); the command compares without braces (a tes
 failed this check after a good create, 2026-11-17).
 A time shift over a CONDITIONAL (filtered) source metric read right grouped by month on a test model
 (2026-11-17, checked by the test chat: each month equal to its source's previous month).
-Not yet verified: functions other than PreviousMonth (gated behind `--unverified-ok`), live (not in-memory)
-models, `--replace` on a time-shift metric, and a time shift over other derived sources (compound or level
+**More functions and `--replace` (verified live 2026-11-17, scratch model; data where each month's value is
+month x 10,000 + year, so every expected value is exact):**
+- `PreviousYear` and `YearToDate`, created through REST with NO function objectId in their tokens (the service
+  resolves the name), read back as `Sum(PreviousYear({Date} (ID),1,M))` / `Sum(YearToDate({Date} (ID),M))`.
+- PreviousYear is right grouped by month (the same month a year before), by quarter and by year (the year
+  before's totals). YearToDate is right by month (running sum restarting each January), by quarter (the year's
+  running total) and by year (the full year), and reaches past a month filter (a range starting in March still
+  sums from January). With no grouping both return the plain total, like PreviousMonth.
+- `--replace` on a time-shift metric (2 → 3 periods back) kept the objectId; values moved to 3 months back.
+So the bank check accepts a Previous<P> metric grouped by its period or a calendar period nested in it (year:
+quarter, month; quarter: month), and a <P>ToDate metric by its period or any finer one.
+Not yet verified: PreviousDay / Week / Quarter and Month / QuarterToDate (`check` refuses them; the command needs
+`--unverified-ok`), live (not in-memory) models, and a time shift over other derived sources (compound or level
 metrics; Strategy documents simple aggregates only, and unsupported cases can return null or partial values with
 no error). The command warns when the source is derived.
 

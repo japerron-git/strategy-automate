@@ -79,6 +79,8 @@ ACTION_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_d
 TIME_SHIFT_FUNCTIONS = ("PreviousDay", "PreviousWeek", "PreviousMonth", "PreviousQuarter", "PreviousYear",
                         "MonthToDate", "QuarterToDate", "YearToDate")
 TIME_SHIFT_AGGREGATIONS = ("Sum", "Min", "Max", "Count", "Avg")
+# verified live through REST and the connector (2026-11-17); the others need a live check first
+TIME_SHIFT_VERIFIED = ("PreviousMonth", "PreviousYear", "YearToDate")
 # args that switch a step from create to rewrite, and the kinds whose build_mosaic.py command takes them
 MODE_ARGS = {"replace": ("create_conditional_metric", "create_compound_metric", "create_time_shift_metric"),
              "update": ("create_formula_attribute",)}
@@ -3568,6 +3570,19 @@ _TIME_SHIFT_CALL = re.compile(r"\b(previous(?:day|week|month|quarter|year)|(?:mo
                               r"\{([^{}]+)\}", re.I)
 _FORMULA_REF = re.compile(r"\{([^{}]+)\}")
 TIME_PERIODS = ("day", "week", "month", "quarter", "year")
+# Period attributes a Previous<P> metric reads right grouped by: its own and the calendar periods nested in it (seen
+# live 2026-11-17: PreviousYear by year, quarter and month; PreviousMonth by month). A <P>ToDate metric reads right
+# at its period or any finer one (YearToDate by year, quarter and month).
+PREVIOUS_GROUPINGS = {"year": ("year", "quarter", "month"), "quarter": ("quarter", "month"), "month": ("month",),
+                      "week": ("week",), "day": ("day",)}
+
+
+def time_shift_groupings(function: str) -> list[str]:
+    """The period attributes (finest last) a time-shift function reads right grouped by."""
+    period = time_shift_period(function)
+    if function.startswith("Previous"):
+        return list(PREVIOUS_GROUPINGS.get(period, (period,)))
+    return list(reversed(TIME_PERIODS[:TIME_PERIODS.index(period) + 1])) if period in TIME_PERIODS else [period]
 
 
 def time_shift_metrics(metrics: list[dict]) -> dict[str, dict]:
@@ -3625,8 +3640,7 @@ def time_shift_sql_lint(sql: str, shifted: dict[str, dict] | None) -> list[str]:
         if not _mentions(text, ts["name"]):
             continue
         attr, period = ts["attribute"].lower(), ts["period"]
-        allowed = [period] if ts["function"].startswith("Previous") else \
-            list(TIME_PERIODS[:TIME_PERIODS.index(period) + 1])
+        allowed = time_shift_groupings(ts["function"])
         ok_cols = {f"{attr} ({p})__{form}" for p in allowed for form in ("id", "start", "desc")}
         col = f'"{attr} ({period})__id"'
         label = f"time-shift metric '{ts['name']}'" + (f" (built on '{ts['via']}')" if ts.get("via") else "")
@@ -3966,6 +3980,9 @@ def time_shift_problems(args: dict) -> list[str]:
     fn = str(args.get("function") or "")
     if fn and fn not in TIME_SHIFT_FUNCTIONS:
         out.append(f"function must be one of {', '.join(TIME_SHIFT_FUNCTIONS)} (got '{fn}')")
+    elif fn and fn not in TIME_SHIFT_VERIFIED:
+        out.append(f"{fn} is not yet verified live (verified: {', '.join(TIME_SHIFT_VERIFIED)}); check it on a "
+                   f"scratch model first: create-time-shift-metric refuses it without --unverified-ok")
     periods = args.get("periods")
     if periods not in (None, ""):
         if fn.endswith("ToDate"):
@@ -3979,10 +3996,14 @@ def time_shift_problems(args: dict) -> list[str]:
 
 
 def time_shift_risk(args: dict) -> str:
-    """How a time-shift metric reads through the connector (seen live 2026-11-17 for PreviousMonth)."""
-    period = time_shift_period(str(args.get("function") or "")) or "period"
+    """How a time-shift metric reads through the connector (seen live 2026-11-17 for PreviousMonth, PreviousYear and
+    YearToDate)."""
+    fn = str(args.get("function") or "")
+    period = time_shift_period(fn) or "period"
     attr = args.get("time_attribute") or "its time attribute"
-    return (f"Reads right only grouped AND filtered by the {period} of '{attr}' (its ({period}) attribute), not by "
+    finer = [p for p in (time_shift_groupings(fn) if fn in TIME_SHIFT_FUNCTIONS else []) if p != period]
+    also = f" or a finer one: {', '.join(finer)}" if finer else ""
+    return (f"Reads right only grouped AND filtered by the {period} of '{attr}' (its ({period}) attribute{also}), not by "
             f"the base date. Without that {period} in GROUP BY it returns UNSHIFTED values with no error (no grouping, "
             f"grouped by a deal or a parent date, even with a latest-period flag), or blank (a coarser period, or "
             f"one {period} filtered but not grouped). With it, a latest-period flag or an attribute that changes "

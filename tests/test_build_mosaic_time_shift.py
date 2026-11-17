@@ -167,15 +167,17 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(_writes(fake), [])
 
     def test_unverified_functions_and_bad_periods_stop_before_sign_in(self):
-        for overrides in ({"function": "PreviousYear"}, {"function": "MonthToDate", "unverified_ok": True,
+        for overrides in ({"function": "PreviousQuarter"}, {"function": "MonthToDate", "unverified_ok": True,
                                                           "periods": 1},
                           {"periods": 0}, {"aggregation": "Median"}):
             fake = _FakeMSTR(_routes())
             with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
                 bm.cmd_create_time_shift_metric(fake, _args(**overrides))
             self.assertEqual(fake.calls, [], overrides)
-        result = _run(_FakeMSTR(_routes()), function="PreviousYear", unverified_ok=True, dry_run=True)
-        self.assertEqual(result["formula"], "Sum(PreviousYear({Order Date} (ID),1,Sales))")
+        result = _run(_FakeMSTR(_routes()), function="PreviousQuarter", unverified_ok=True, dry_run=True)
+        self.assertEqual(result["formula"], "Sum(PreviousQuarter({Order Date} (ID),1,Sales))")
+        for verified in ("PreviousYear", "YearToDate"):   # verified live 17 Nov: no --unverified-ok needed
+            self.assertTrue(_run(_FakeMSTR(_routes()), function=verified, dry_run=True)["ok"], verified)
 
     def test_dry_run_writes_nothing_and_shows_the_body(self):
         fake = _FakeMSTR(_routes())

@@ -5507,11 +5507,11 @@ def attribute_name_candidates(name: str) -> list[str]:
 # ── Time-shift metrics (Mosaic time transformations) ───────────────────────────────────────────
 # A derived metric `Agg(PreviousMonth({Date} (ID), 1, Metric))`. Body copied from a Studio-built PreviousMonth
 # metric (captured 2026-11-17, memory/reference_mosaic_derived_metrics.md §0e); the REST create was verified live
-# the same day (values identical to the Studio one). Only PreviousMonth has been seen; the other functions follow
-# the same pattern and need --unverified-ok until one is captured.
+# the same day (values identical to the Studio one). PreviousYear and YearToDate were then created the same way,
+# with no function objectId in their tokens, and read right (2026-11-17). The other functions need --unverified-ok.
 TIME_SHIFT_FUNCTIONS = ("PreviousDay", "PreviousWeek", "PreviousMonth", "PreviousQuarter", "PreviousYear",
                         "MonthToDate", "QuarterToDate", "YearToDate")
-TIME_SHIFT_VERIFIED = ("PreviousMonth",)
+TIME_SHIFT_VERIFIED = ("PreviousMonth", "PreviousYear", "YearToDate")   # REST create and values checked live
 TIME_SHIFT_FUNCTION_IDS = {"PreviousMonth": "B73B646EAF134F989008DFBC7272EDB4"}   # seen in the captured metric
 TIME_SHIFT_AGGREGATIONS = ("Sum", "Min", "Max", "Count", "Avg")
 ID_FORM = "45C11FA478E745FEA08D781CEA190FE5"
@@ -5588,7 +5588,7 @@ def _norm_formula(text: str) -> str:
 
 def cmd_create_time_shift_metric(m: MSTR, args):
     """Create (or, with --replace, rewrite in place) a time-shift metric: `Agg(Fn({Date} (ID), n, Metric))` with
-    Fn one of TIME_SHIFT_FUNCTIONS (PreviousMonth verified; the rest need --unverified-ok).
+    Fn one of TIME_SHIFT_FUNCTIONS (TIME_SHIFT_VERIFIED run freely; the rest need --unverified-ok).
 
     The date attribute must have time attributes for the function's period and a Day interval (Studio adds Day
     and Week, hidden, when the model is published from Studio). A derived metric of the same name stops the
@@ -7994,7 +7994,8 @@ def build_parser():
 
     sp = sub.add_parser("create-time-shift-metric",
                         help="derived metric Agg(PreviousMonth({Date} (ID), n, Metric)) and other Mosaic time "
-                             "transformation functions (PreviousMonth verified; others need --unverified-ok)")
+                             "transformation functions (PreviousMonth, PreviousYear, YearToDate verified; others "
+                             "need --unverified-ok)")
     sp.add_argument("--model-id", required=True)
     sp.add_argument("--name", required=True)
     sp.add_argument("--function", required=True, choices=list(TIME_SHIFT_FUNCTIONS))

@@ -232,7 +232,9 @@ Resolved:
   native command line unescaped, so python split a description at the quote (`unrecognized arguments`). Its
   quoting also drops an empty argument and lets a trailing backslash escape the quote it adds. The plugin's
   script writer now passes such a step's arguments in a JSON file (`build_mosaic.py --argv-file <file>`, the
-  whole argument list, nothing else on the line), so no text crosses PowerShell's quoting.
+  whole argument list, nothing else on the line), so no text crosses PowerShell's quoting. Verified live on
+  Windows PowerShell 5.1 (2026-11-17): a description holding `"`, an apostrophe, `%`, an em dash, a non-ASCII
+  letter and backslashes arrived intact through the file, and the same quote passed inline failed as before.
 - *Date tests inside CASE:* Mosaic refuses the month time attribute in a CASE that also reads another
   attribute ("Derived Attribute defined on multiple attributes including ... Smart attribute is not
   supported"); the DATE test works there, so `references` keeps it.
@@ -622,7 +624,7 @@ kind); without it an existing name stops the step, dry run included.
 `create_time_shift_metric` (`name`, `function` PreviousDay/Week/Month/Quarter/Year or Month/Quarter/
 YearToDate, `time_attribute` = the base date attribute, `source_metric`, optional `periods` (Previous* only,
 default 1), `aggregation` (default Sum), `description`, `format`, `replace`) runs `build_mosaic.py
-create-time-shift-metric`; only PreviousMonth is verified (REST create checked live against a Studio-built one).
+create-time-shift-metric`; PreviousMonth, PreviousYear and YearToDate are verified live (`check` refuses the others).
 `plan` attaches the reading rule (group and filter by the date's period attribute, not the base date; no
 latest-period flag) as the step's risk; derived-metrics note §0e. A compound over it (a ratio such as this
 period / previous period) reads right under the same rule.

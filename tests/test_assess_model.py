@@ -258,6 +258,15 @@ class TimeShiftSqlTests(unittest.TestCase):
         self.assertTrue(any('base date "order date"' in p for p in base))
         self.assertEqual(self.lint("SELECT 'sales (previous month)' FROM {{MODEL}}"), [])   # a string, not a column
 
+    def test_previous_year_reads_right_by_quarter_and_month_too(self):
+        shifted = am.time_shift_metrics([{"name": "sales (previous year)",
+                                          "formula": "Sum(PreviousYear({Order Date} (ID),1,Sales))"}])
+        for col in ("year", "quarter", "month"):   # each read right live on the scratch model, 17 Nov
+            sql = f'SELECT "order date ({col})__id", SUM("sales (previous year)") FROM {{{{MODEL}}}} GROUP BY 1'
+            self.assertEqual(am.time_shift_sql_lint(sql, shifted), [], col)
+        risk = am.time_shift_risk({"function": "PreviousYear", "time_attribute": "order date"})
+        self.assertIn("(its (year) attribute or a finer one: quarter, month)", risk)
+
     def test_to_date_allows_finer_periods_only(self):
         self.assertEqual(self.lint(f'SELECT {MONTH}, SUM("sales mtd") {TS_FROM} GROUP BY 1'), [])
         self.assertEqual(len(self.lint(f'SELECT "order date (quarter)__id", SUM("sales mtd") {TS_FROM} GROUP BY 1')), 1)
@@ -500,7 +509,13 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(report()["problems"], [])
         self.assertEqual(report(periods=2)["problems"], [])
         self.assertIn("function must be one of", report(function="LastMonth")["problems"][0])
-        self.assertIn("Previous* functions only", report(function="MonthToDate", periods=1)["problems"][0])
+        self.assertTrue(any("Previous* functions only" in p for p in report(function="MonthToDate", periods=1)["problems"]))
+        self.assertEqual(report(function="PreviousYear")["problems"], [])            # verified live 17 Nov
+        self.assertEqual(report(function="YearToDate")["problems"], [])
+        self.assertIn("not yet verified live", report(function="PreviousQuarter")["problems"][0])
+        self.assertEqual(am.time_shift_groupings("PreviousYear"), ["year", "quarter", "month"])
+        self.assertEqual(am.time_shift_groupings("PreviousMonth"), ["month"])
+        self.assertEqual(am.time_shift_groupings("YearToDate"), ["year", "quarter", "month", "week", "day"])
         for bad in (0, -1, "1", True, 1.5):
             self.assertIn("whole number", report(periods=bad)["problems"][0], bad)
         self.assertIn("aggregation must be", report(aggregation="Median")["problems"][0])
