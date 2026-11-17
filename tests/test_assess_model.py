@@ -1319,6 +1319,34 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         self.assertTrue(any("applied_phases must be" in p for p in
                             am.check_findings({"findings": [dict(f1, applied_phases=[9])]})["problems"]))
 
+    def test_a_later_phase_left_over_does_not_inherit_the_applied_part(self):
+        # seen 16 Nov: a type-change finding with republish: true, verified for phases 2-3 with one description
+        # left, gave phase 6 a republish, its type-change risks and its tests
+        describe = {"kind": "rename_describe", "args": {"items": [
+            {"object_type": "attribute", "current_name": "order date", "description": "Date the order was placed."}]}}
+        retype = {"kind": "change_column_type", "args": {"table": "orders", "column": "order_date", "type": "date"}}
+        f1 = _finding("F1", "data_type", status="verified", republish=True, actions=[retype, describe],
+                      applied_phases=[2], tests=["T-type"], risks=["Values read blank until the republish."])
+        f2 = _finding("F2", "description", actions=[{"kind": "rename_describe", "args": {"items": [
+            {"object_type": "attribute", "current_name": "region", "description": "Sales area."}]}}],
+            tests=["T-desc"])
+        plan = am.build_plan({"findings": [f1, f2]}, model_id="M")
+        (ph,) = plan["phases"]
+        self.assertEqual(ph["phase"], 6)
+        self.assertEqual([a["what"].split(" ")[0] for a in ph["after"]], ["Re-certify"])
+        self.assertEqual(ph["unit_tests"], ["T-desc"])
+        self.assertFalse(any("blank until the republish" in r for st in ph["steps"] for r in st.get("risks") or []))
+        # applied but not verified: its tests still run; a remaining action that needs a republish keeps it
+        applied = am.build_plan({"findings": [dict(f1, status="applied"), f2]}, model_id="M")
+        self.assertEqual(applied["phases"][0]["unit_tests"], ["T-desc", "T-type"])
+        level = {"kind": "create_level_metric", "args": {"name": "Orders Once", "source_metric": "Orders",
+                                                         "entity_attribute": "Order"}}
+        f3 = _finding("F3", "metric_defect", status="verified", republish=True, actions=[retype, level],
+                      applied_phases=[2])
+        (ph4,) = am.build_plan({"findings": [f3]}, model_id="M")["phases"]
+        self.assertEqual(ph4["phase"], 4)
+        self.assertEqual(ph4["after"][0]["what"].split(" ")[0], "Republish")
+
     def test_source_change_needs_a_change(self):
         plan = am.build_plan({"findings": [_finding("F1", "source_data", actions=[
             {"kind": "source_change", "args": {"column": "X"}}])]}, model_id="MID")

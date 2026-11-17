@@ -4172,7 +4172,12 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
         rest = pending_actions(f)
         if rest:
             phases_left = sorted({action_phase(f, a) for a in rest if action_phase(f, a) is not None})
-            chosen.append({**f, "actions": rest, "phase": phases_left[0] if phases_left else f.get("phase")})
+            # The finding's republish, risks and (once verified) tests were for the part already applied: a
+            # description left for phase 6 must not bring phase 2's republish, risks or type-change tests with it.
+            rest_republish = bool(f.get("republish")) and any(a.get("kind") not in NO_REPUBLISH_MERGED for a in rest)
+            chosen.append({**f, "actions": rest, "phase": phases_left[0] if phases_left else f.get("phase"),
+                           "republish": rest_republish, "risks": [],
+                           "tests": [] if f.get("status") == "verified" else f.get("tests")})
             warnings.append(f"{f['id']} is {f.get('status')} (phases {sorted(f.get('applied_phases') or [])} applied); "
                             f"its actions in phase(s) {phases_left} are still planned")
         elif f.get("status") in ("applied", "verified") and not isinstance(f.get("applied_phases"), list):
