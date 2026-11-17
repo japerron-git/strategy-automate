@@ -467,6 +467,8 @@ a title and a location, not a URL; keep the documents themselves out of the repo
                 "use_case": "U1", "domain_claims": ["D1"]}]}
 ```
 Result column names in `key` / `measures` must match the SQL aliases.
+`check --bank` warns when a level's share is off `target_mix` by more than 5 points, or by more than one
+question's share in a bank under 20 questions (a quick assessment can't round closer).
 
 **results.json** (written by `run`): per question `id`, `sql`, `ok`, `error`, `columns`, `rows`,
 `row_count`, `seconds`.

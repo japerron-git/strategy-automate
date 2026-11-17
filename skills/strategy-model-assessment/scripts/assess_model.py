@@ -4837,8 +4837,9 @@ def check_bank(bank: dict, time_shift: dict[str, dict] | None = None) -> dict[st
     counts = {str(lv): sum(1 for q in qs if q.get("level") == lv) for lv in LEVELS}
     mix = {lv: {"count": counts[lv], "share": round(counts[lv] / len(qs), 3),
                 "target_share": round(target.get(lv, 0) / total_target, 3)} for lv in counts}
+    tolerance = max(0.05, 1 / len(qs)) + 1e-9   # one question's share: a small (quick) bank can't round closer
     for lv, m in mix.items():
-        if abs(m["share"] - m["target_share"]) > 0.05:
+        if abs(m["share"] - m["target_share"]) > tolerance:
             warnings.append(f"level {lv}: {m['share']:.0%} of questions vs target {m['target_share']:.0%}")
     graded = sum(1 for q in qs if (q.get("expected") or {}).get("source", "none") != "none")
     return {"problems": problems, "warnings": warnings, "mix": mix,

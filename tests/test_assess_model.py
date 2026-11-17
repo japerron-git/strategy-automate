@@ -508,6 +508,19 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(am.time_shift_period("QuarterToDate"), "quarter")
         self.assertEqual(am.time_shift_period("PreviousYear"), "year")
 
+    def test_mix_tolerance_is_one_question_for_a_small_bank(self):
+        def bank(levels):
+            return {"model": "M", "questions": [
+                {"id": f"Q{i}", "level": lv, "question": "q", "expected_path": "not_answerable"}
+                for i, lv in enumerate(levels)]}
+        # 15 questions against 20/25/25/20/10: the nearest split (3/4/4/3/1) is off by under one question each
+        small = am.check_bank(bank([1] * 3 + [2] * 4 + [3] * 4 + [4] * 3 + [5] * 1))
+        self.assertFalse([w for w in small["warnings"] if w.startswith("level ")], small["warnings"])
+        skewed = am.check_bank(bank([1] * 6 + [2] * 4 + [3] * 3 + [4] * 2))   # level 5 missing, level 1 doubled
+        self.assertTrue(any(w.startswith("level 1:") for w in skewed["warnings"]))
+        big = am.check_bank(bank([1] * 30 + [2] * 25 + [3] * 25 + [4] * 15 + [5] * 5))   # 100: 5% still applies
+        self.assertTrue(any(w.startswith("level 1:") for w in big["warnings"]))
+
     def test_replace_reaches_the_conditional_metric_command(self):
         cond = am.action_commands({"kind": "create_conditional_metric", "args": {
             "name": "Closed Count", "source_metric": "Rows", "function": "Count", "attribute": "Status",
