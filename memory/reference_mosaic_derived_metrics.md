@@ -282,7 +282,7 @@ PreviousMonth | PreviousQuarter | PreviousYear (<date attribute>, <periods>, <me
 QuarterToDate | YearToDate (<date attribute>, <metric>)` (Strategy One Dec 2025 - Mar 2026). They are NOT the
 classic project-level transformation object (`/api/model/transformations`) that `create-transformation` /
 `attach-transformation` build; those stay classic-only and unverified. Studio writes, for example,
-`Sum(PreviousMonth({Activity Month Key} (ID),1,Dummy))`: the base date attribute's ID form (not the interval
+`Sum(PreviousMonth({Order Date} (ID),1,Sales))`: the base date attribute's ID form (not the interval
 attribute), the period count, the base metric, wrapped in an outer Sum.
 
 Read live through the connector on a scratch model (in-memory) whose date attribute had only REST-added

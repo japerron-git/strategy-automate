@@ -39,7 +39,7 @@ class TimeAttributeBodyTests(unittest.TestCase):
         self.assertEqual(bm.time_attribute_body(_attr("D", "date", ["year"]), ["year"]), (None, [], []))
 
     def test_a_number_must_be_converted_first(self):
-        body, _, problems = bm.time_attribute_body(_attr("Activity Month Key", "integer"), ["year"])
+        body, _, problems = bm.time_attribute_body(_attr("Order Month Key", "integer"), ["year"])
         self.assertIsNone(body)
         self.assertIn("convert it first", problems[0])
 

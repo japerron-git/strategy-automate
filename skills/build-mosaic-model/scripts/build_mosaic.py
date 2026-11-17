@@ -5522,7 +5522,7 @@ def time_shift_period(function: str) -> str:
 
 
 def time_shift_text(function: str, attribute: dict, periods: int | None, source: dict, aggregation: str) -> str:
-    """The formula as the service shows it: Sum(PreviousMonth({Activity Month Key} (ID),1,Dummy))."""
+    """The formula as the service shows it: Sum(PreviousMonth({Order Date} (ID),1,Sales))."""
     args = [f"{{{attribute['name']}}} (ID)"] + ([str(periods)] if function.startswith("Previous") else [])
     return f"{aggregation}({function}({','.join(args + [source['name']])}))"
 
