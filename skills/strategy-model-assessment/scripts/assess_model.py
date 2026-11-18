@@ -3592,18 +3592,22 @@ def group_by_clauses(sql: str) -> list[list[tuple[str, str]]]:
 
 
 def form_group_by_lint(sql: str) -> list[str]:
-    """The connector refuses a form column (`<attribute>__<form>`: a time form such as `month__id` or
-    `<date> (month)__id`, or a code or description form) anywhere but first in a GROUP BY written by name, with
-    MOSAIC_SQL_COLUMN_NOT_FOUND, even when it is first in the SELECT; GROUP BY by position works (seen live
-    2026-11-17/18 on two tenants, time and non-time forms)."""
+    """get_semantics lists forms as `<attribute>__<form>` (`month__id`, `<date> (month)__id`, `<code>__description`);
+    the engine's own columns are `<attribute> (<form>)` (`month (id)`, `<date> (month) (id)`; SHOW COLUMNS lists
+    them). The connector translates the `__` alias everywhere except in a GROUP BY written by name after its first
+    item, which then fails with MOSAIC_SQL_COLUMN_NOT_FOUND. The engine's name, or GROUP BY by position, works
+    everywhere (seen live 2026-11-17/18 on two tenants, time and code forms; a blind analyst hit it on 3 of 3 first
+    attempts)."""
     out = []
     for clause in group_by_clauses(sql):
         late = [item.strip('"') for i, (item, _) in enumerate(clause)
                 if i > 0 and not re.fullmatch(r"\d+", item) and "__" in item]
         if late:
+            fixed = ", ".join(repr(re.sub(r"__(\w[\w ]*)$", r" (\1)", x)) for x in late)
             out.append(f"its GROUP BY names the form column(s) {', '.join(repr(x) for x in late)} after another "
-                       f"column: the connector then fails with MOSAIC_SQL_COLUMN_NOT_FOUND. Group by position "
-                       f"(GROUP BY 1, 2, ...), or list the one form column first")
+                       f"column: the connector translates get_semantics' '__' names everywhere but there, so this "
+                       f"fails with MOSAIC_SQL_COLUMN_NOT_FOUND. Use the engine's own name ({fixed}, as SHOW COLUMNS "
+                       f"lists it) in the query, or group by position (GROUP BY 1, 2, ...)")
     return out
 
 
@@ -3687,7 +3691,8 @@ def time_shift_sql_lint(sql: str, shifted: dict[str, dict] | None) -> list[str]:
             continue
         attr, period = ts["attribute"].lower(), ts["period"]
         allowed = time_shift_groupings(ts["function"])
-        ok_cols = {f"{attr} ({p})__{form}" for p in allowed for form in ("id", "start", "desc")}
+        ok_cols = {spelled for p in allowed for form in ("id", "start", "desc")      # get_semantics' alias, and
+                   for spelled in (f"{attr} ({p})__{form}", f"{attr} ({p}) ({form})")}  # the engine's own name
         col = f'"{attr} ({period})__id"'
         label = f"time-shift metric '{ts['name']}'" + (f" (built on '{ts['via']}')" if ts.get("via") else "")
         if not grouped & ok_cols:

@@ -116,12 +116,19 @@ blocks; the parser joins them).
   tenfold for agent-driven runs.
 - Sentinels ("not available" written as a number, such as -1, 99 or a run of 9s) inside scores and ratios inflate averages; check the
   profile `max` against the documented range.
-- A form column (`<attribute>__<form>`: time forms like `month__id` or `<date> (month)__id`, and code or
-  description forms) anywhere but first in a GROUP BY written by name fails with MOSAIC_SQL_COLUMN_NOT_FOUND,
-  even when it is first in the SELECT; with two form columns the second always fails. `GROUP BY 1, 2` works,
-  and so does a form column in WHERE (verified 2026-11-17/18 on two tenants). The engine's own SQL groups by
-  position or by one column. `check --bank` warns, `run` flags (`sql_warnings`), and `best-answer` /
-  `question-sql` refuse such SQL (`form_group_by_lint`).
+- **Form columns have two names.** `get_semantics` lists a form as `<attribute>__<form>` (`month__id`,
+  `<date> (month)__id`, `<code>__description`); the engine's own column is `<attribute> (<form>)` (`month (id)`,
+  `<date> (month) (id)`), which `SHOW COLUMNS FROM "<model>"` lists (through the `query` tool, with each
+  column's attribute and form ids and its description) and which result headers show. The connector translates
+  the `__` alias everywhere except in a GROUP BY written by name after its first item: there it fails with
+  MOSAIC_SQL_COLUMN_NOT_FOUND, even when the column is first in the SELECT, and with two form columns the
+  second always fails. The error's advice ("re-read get_semantics") gives back the same alias. The engine's
+  name works in every place (SELECT, WHERE, any GROUP BY position; a time-shift metric grouped by it reads
+  right), and so does `GROUP BY 1, 2`. Verified 2026-11-17/18 on two tenants, time and code forms. A blind
+  analyst with only the connector failed on 3 of 3 first attempts that grouped an attribute and a form (or two
+  forms), and found the engine names with SHOW COLUMNS. The engine's own SQL groups by position or by one
+  column. `check --bank` warns, `run` flags (`sql_warnings`), and `best-answer` / `question-sql` refuse such
+  SQL (`form_group_by_lint`); the time-shift check accepts both spellings of the period column.
 
 ### Which rows a query reads: anchor on a fact metric (verified 2026-11-11 on two unrelated models)
 

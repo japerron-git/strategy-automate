@@ -20,6 +20,11 @@ type: reference
     in the outer `WHERE`. A join of two filtered subqueries returned too few rows with no error.
   - A group with no rows for any metric on the query is absent from the result (add an entity-count metric).
   - `COUNT(*)` gave wrong values with some groupings; use a count metric or `COUNT(DISTINCT <key>)`.
+- **Form column names** (verified 2026-11-17/18, two tenants): `get_semantics` lists `<attribute>__<form>`, an
+  alias the connector translates to the engine's `<attribute> (<form>)` everywhere except a GROUP BY written by name
+  after its first item (MOSAIC_SQL_COLUMN_NOT_FOUND). `SHOW COLUMNS FROM "<model>"` through `query` lists the
+  engine names with ids and descriptions; use them, or `GROUP BY 1, 2`. Details:
+  `reference_model_assessment.md` "Connector behaviors".
 
 **From scripts:** `skills/strategy-platform/scripts/strategy_mcp.py` signs in exactly like the MCP connector (OAuth 2.1 + PKCE through the tenant's single sign-on, dynamic client registration, refresh tokens in the OS secret store) and exposes `login`, `tools`, `call <tool> --args JSON` and `query --project P --sql S` (`--server mosaic` by default, `--server agent` for the Agent server). The token is scoped to the MCP server — REST ignores it — so REST scripts sign in with `strategy_auth.py` (`--auth-method sso` for the same SSO). See `reference_strategy_authentication.md`.
 

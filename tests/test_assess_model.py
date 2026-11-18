@@ -231,6 +231,9 @@ class TimeShiftSqlTests(unittest.TestCase):
             (f"SELECT {MONTH} AS m, SUM({prev}) {TS_FROM} WHERE {MONTH} BETWEEN 202001 AND 202003 GROUP BY m", 0),
             (f'SELECT "order date (year)__id", {MONTH}, SUM({prev}) {TS_FROM} GROUP BY 1, 2', 0),       # right
             (f"SELECT SUM(x) FROM (SELECT {MONTH}, SUM({prev}) AS x {TS_FROM} GROUP BY {MONTH}) t", 0),
+            # the engine's own name for the month form (SHOW COLUMNS), seen live to read right in any GROUP BY place
+            (f'SELECT "region", "order date (month) (id)", SUM({prev}) {TS_FROM} '
+             f'GROUP BY "region", "order date (month) (id)"', 0),
             (f"SELECT SUM({prev}) {TS_FROM}", 1),                                       # unshifted total, no error
             (f'SELECT "ship month", SUM({prev}) {TS_FROM} GROUP BY 1', 1),                # parent date: unshifted
             (f'SELECT "order date (year)__id", SUM({prev}) {TS_FROM} GROUP BY 1', 1),     # coarser period: blank
@@ -2987,6 +2990,7 @@ class SqlLintTests(unittest.TestCase):
         'SELECT "d (month)__id", "flag", SUM("x") FROM t WHERE "d (year)__id" = 2021 GROUP BY "d (month)__id", "flag"': [],
         'SELECT v, SUM(n) FROM (SELECT "a", "m__id" AS v, COUNT("x") AS n FROM t GROUP BY "a", "m__id") '
         'GROUP BY v': ["m__id"],                                          # a subquery's GROUP BY too
+        'SELECT "deal", "d (month) (id)", SUM("x") FROM t GROUP BY "deal", "d (month) (id)"': [],   # engine's name
     }
 
     def test_form_columns_late_in_group_by(self):
@@ -2995,6 +2999,8 @@ class SqlLintTests(unittest.TestCase):
             self.assertEqual(len(got), 1 if late else 0, sql)
             for name in late:
                 self.assertIn(repr(name), got[0])
+        self.assertIn("'d (month) (id)', as SHOW COLUMNS", am.form_group_by_lint(
+            'SELECT "y", "d (month)__id" FROM t GROUP BY "y", "d (month)__id"')[0])
         bad = 'SELECT "status", "month__id", SUM("x") FROM {{MODEL}} GROUP BY "status", "month__id"'
         bank = {"model": "M", "questions": [{"id": "Q1", "level": 1, "question": "q", "sql": 'SELECT 1 FROM {{MODEL}}'}]}
         res = am.set_question_sql(bank, "Q1", sql=bad, reason_kind="sql_error", reason="x")
