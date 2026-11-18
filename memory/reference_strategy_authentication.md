@@ -75,6 +75,12 @@ Tenant requirements: CORS must allow the page origin (`http://127.0.0.1:8753`) w
 - Every request goes through `strategy_auth.SafeSession`: a redirect to another origin is refused outright (a 307 would resend a password or identity token, and dict cookies would follow), 15 s / `MSTR_HTTP_TIMEOUT` timeouts, `MSTR_HTTP_RETRIES` retries for connection failures and GET/HEAD 502/503/504 only. `check_base` refuses plain http (localhost aside), credentials in the URL and host names with characters that could break a header or the consent page's CSP.
 - `MSTR_REUSE_SESSION=1` slots are per user (password) or per API token (a hash of it, never the token), so a second identity never inherits the first one's session; `strategy_auth.py logout` ends them.
 - A cached session is forgotten only when `GET /api/sessions` says 401/403; a 5xx or network blip keeps it for the next command.
+- An explicit `--auth-method sso` / `MSTR_AUTH_METHOD=sso` reuses a cached browser session too (before 2026-11-18 only
+  `auto` read the cache, so every command opened the browser; seen on Windows, where each step then waited for a new
+  Allow). `MSTR_SESSION_CACHE=0` forces a fresh sign-in. A refused cached session is now reported ("[auth] the cached
+  session was refused (HTTP n, saved m min ago)"), so a run shows whether the cache was missing or refused.
+  `strategy_auth.py methods` reports `configured_method` and, under `auto_would_use`, "cached" only when a session is
+  cached (it said "cached" whenever caching was on).
 - `auto` never falls through to a browser sign-in where nobody can answer it (`CI`, `MSTR_NO_BROWSER=1`, Linux without a display) — it fails fast naming `MSTR_API_TOKEN` / `MSTR_USER` + `MSTR_PASSWORD`. `MSTR_LOGIN_MODE=4096` with the token in `MSTR_USER` still works.
 - The file secret store (no Keychain / libsecret) is locked across read-modify-write, so parallel commands don't drop each other's entries.
 

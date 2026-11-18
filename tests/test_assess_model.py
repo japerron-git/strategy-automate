@@ -1925,6 +1925,29 @@ class RoleTests(unittest.TestCase):
                                 model_id="MID", statuses=("approved", "modified", "proposed"))
         self.assertEqual(blocked["unanswered"], {"1": ["F9"]})
 
+    def test_a_derived_metric_on_a_new_fact_metric_must_follow_phase_3(self):
+        # NUSA F008 (2026-11-18): two new fact metrics and a compound on them, all in an attribute finding (phase 3)
+        fm = lambda n: {"kind": "add_column_fact_metric", "args": {"name": n, "column": n, "function": "avg"}}
+        comp = {"kind": "create_compound_metric", "args": {"name": "avg discount depth",
+                                                           "formula": "1 - [Promo Price Amount] / [list price amount]"}}
+        f8 = _finding("F8", "attribute", actions=[fm("promo price amount"), fm("list price amount"), comp])
+        problems = am.check_findings({"findings": [f8]})["problems"]
+        self.assertEqual(len(problems), 1)
+        self.assertIn("['list price amount', 'promo price amount']", problems[0])
+        self.assertIn('Set the finding\'s "phase": 4', problems[0])
+        self.assertTrue(any("phase 3's republish" in p for p in am.build_plan({"findings": [f8]}, model_id="M")["problems"]))
+        f8["phase"] = 4                                                  # the fix: the compound now runs in phase 4
+        self.assertEqual(am.check_findings({"findings": [f8]})["problems"], [])
+        by = {ph["phase"]: [s["kind"] for s in ph["steps"]] for ph in am.build_plan({"findings": [f8]}, model_id="M")["phases"]}
+        self.assertEqual(by[3], ["add_column_fact_metric", "add_column_fact_metric"])
+        self.assertEqual(by[4], ["note", "create_compound_metric"])
+        # another finding's new fact metric counts too; a name that only contains it does not
+        other = _finding("F2", "attribute", actions=[{"kind": "create_level_metric", "args": {
+            "name": "max promo price amount by store", "source_metric": "sales", "entity_attribute": "store"}}])
+        self.assertEqual(am.check_findings({"findings": [f8, other]})["problems"], [])
+        other["actions"][0]["args"]["source_metric"] = "promo price amount"
+        self.assertIn("F2:", am.check_findings({"findings": [f8, other]})["problems"][0])
+
     def test_fact_metric_args_are_checked(self):
         bad = {"kind": "add_column_fact_metric", "args": {"column": "price", "name": "avg price", "function": "median"}}
         plan = am.build_plan({"findings": [_finding("F1", "metric_defect", actions=[bad])]}, model_id="MID")
@@ -2921,6 +2944,28 @@ class PhaseGateTests(unittest.TestCase):
              "actions": [act], "tests": ["Q2"]},
             {"id": "J-x", "category": "relationship", "impact": "high", "effort": "small", "status": "proposed",
              "actions": [], "needs_answer": True}]}
+
+    def test_a_spec_only_a_blocked_phase_reads_is_held_back(self):
+        # NUSA (2026-11-18): specs/rename_describe.json was written while phase 6, its only reader, was blocked
+        rd = {"kind": "rename_describe", "args": {"items": [
+            {"object_type": "attribute", "current_name": "region", "description": "Sales region."}]}}
+        doc = {"model": "M", "findings": [
+            _finding("F7", "description", actions=[rd]),
+            {"id": "F13", "category": "description", "impact": "low", "effort": "small", "status": "proposed",
+             "actions": [], "needs_answer": True}]}
+        plan = am.build_plan(doc, model_id="MID", bundle_dir="ignore/apply/m")
+        self.assertEqual(plan["files_held"], ["ignore/apply/m/specs/rename_describe.json"])
+        d = tempfile.mkdtemp(prefix="held-")
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(os.path.join(d, "findings.json"), "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            am.main(["plan", "--findings", os.path.join(d, "findings.json"), "--model-id", "MID",
+                     "--out", os.path.join(d, "change_plan.json"), "--bundle-dir", "ignore/apply/m"])
+        self.assertFalse(os.path.exists(os.path.join(d, "ignore", "apply", "m", "specs", "rename_describe.json")))
+        doc["findings"][1]["status"] = "declined"                          # answered: the spec is written
+        plan = am.build_plan(doc, model_id="MID", bundle_dir="ignore/apply/m")
+        self.assertNotIn("files_held", plan)
 
     def test_unanswered_findings_block_their_phase(self):
         plan = am.build_plan(self._doc(), model_id="MID")

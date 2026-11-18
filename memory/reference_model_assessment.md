@@ -582,7 +582,17 @@ label column is listed as an attribute that no metric filters on.
   on a lookup table is aggregated once per lookup row, and the dry run says so. Verified live (18 Nov, an
   in-memory model, a column an attribute already read): after the REST publish alone, with no Studio publish,
   the metric read right through the connector, so it adds no "publish from Studio" step. A column only on a
-  lookup table is not yet run live.
+  lookup table is not yet run live. A derived metric that reads a fact metric the plan adds this way must be
+  in phase 4 or later, so it's created after phase 3's republish: `check --findings` and `plan` refuse a
+  finding in phases 1-3 that does this and say to set its `"phase": 4` (NUSA F008, 18 Nov).
+- **Spec files held back:** a spec file (`specs/*.json`) that only blocked phases read is listed under
+  `files_held` in the plan and isn't written into the bundle until those phases are answered (the plugin's
+  script writer already skipped them; `plan` now does too).
+- **`rename_describe` and time attributes:** Studio's time attributes (`month__id`, `<date> (month)__id`) are
+  `smartAttributes` of their date attribute, not top-level attributes. `rename-describe` names them in its
+  problem list (name, objectId, base attribute) instead of "not found", and refuses them: no REST write for a
+  time attribute's name or description is verified yet (probe 4 on the scratch model tries three). Set them in
+  Studio meanwhile. `current_name` may also be an objectId.
 - **No change** (`actions: []`): a finding decided as "leave the model as it is" (ignore, assume correct).
   `plan` writes a note for it, not a manual step; a phase with nothing else to run gets no republish or
   re-certify, and its script only shows the notes and exits 0. A finding with no `actions` key at all still

@@ -322,6 +322,12 @@ def _sign_in(session: "requests.Session", cfg: AuthConfig) -> SignIn:
         _delegate(session, cfg.base, cfg.identity_token, None)
         return _finish_browser_sign_in(session, cfg, SignIn("identity-token", False))
     if method == "sso":
+        # a cached browser session is as good as a new one: reuse it rather than ask the browser for every command
+        # (an explicit --auth-method sso / MSTR_AUTH_METHOD=sso skipped the cache before; MSTR_SESSION_CACHE=0 still
+        # forces a fresh sign-in)
+        cached = load_cached_session(session, cfg.base) if cfg.cache else None
+        if cached is not None and str(cached.get("method", "")) in BROWSER_METHODS:
+            return SignIn("cached:" + str(cached.get("method", "")), False, str(cached.get("user", "")))
         identity_token, verifier, user = browser_sso(cfg)
         _delegate(session, cfg.base, identity_token, verifier)
         return _finish_browser_sign_in(session, cfg, SignIn("sso", False, user))
@@ -418,6 +424,17 @@ def _auto_method(cfg: AuthConfig) -> str:
     if cfg.identity_token:
         return "identity-token"
     return "cached" if cfg.cache else ("api-token" if _saved_api_token(cfg.base) else "sso")
+
+
+def _auto_would_use(cfg: AuthConfig) -> str:
+    """What `auto` would do on this machine now: "cached" only when a session is cached (it is checked with the
+    server at sign-in), else what it falls back to."""
+    method = _auto_method(cfg)
+    if method != "cached":
+        return method
+    if secret_get(f"session:{cfg.base}"):
+        return "cached (checked with the server at sign-in; sso if refused)"
+    return "api-token (saved)" if _saved_api_token(cfg.base) else "sso (no cached session yet)"
 
 
 def _finish_browser_sign_in(session: "requests.Session", cfg: AuthConfig, result: SignIn) -> SignIn:
@@ -916,6 +933,10 @@ def load_cached_session(session: "requests.Session", base: str, account: str = "
     session.cookies.clear()
     if status in (401, 403):   # expired or ended; a 5xx or network blip keeps the cache for next time
         secret_delete(account)
+    saved = data.get("saved") if isinstance(data, dict) else None
+    age = f", saved {int((time.time() - saved) // 60)} min ago" if isinstance(saved, (int, float)) else ""
+    print(f"[auth] the cached session was refused (HTTP {status or 'no answer'}{age})"
+          f"{'; forgotten' if status in (401, 403) else '; kept for next time'}. Signing in again.", file=sys.stderr)
     return None
 
 
@@ -1010,7 +1031,8 @@ def _methods(cfg: AuthConfig, s: "requests.Session") -> dict:
         "saved_api_token": bool(_saved_api_token(cfg.base)),
         "cached_session": bool(secret_get(f"session:{cfg.base}")),
         "secret_store": _store_kind(),
-        "auto_would_use": _auto_method(cfg),
+        "configured_method": cfg.method,
+        "auto_would_use": _auto_would_use(cfg),
     }
     return out
 

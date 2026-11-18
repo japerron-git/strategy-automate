@@ -3,6 +3,8 @@ import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import _hermetic  # noqa: E402,F401  (scrub MSTR_*/proxy env, private secret store)
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -293,6 +295,31 @@ class SecretStoreTests(unittest.TestCase):
         other_user = sa.AuthConfig.from_env(base=BASE, username="someone-else", password="p", reuse=True)
         third = FakeSession(routes)
         self.assertEqual(sa.sign_in(third, other_user).method, "password")   # separate cache slot
+
+    def test_explicit_sso_reuses_a_cached_browser_session(self):
+        # MSTR_AUTH_METHOD=sso used to skip the cache: every command asked the browser again (seen 2026-11-18)
+        s = FakeSession()
+        s.headers["X-MSTR-AuthToken"] = "TOK"
+        sa.save_session(s, BASE, sa.SignIn("sso", False, "A User"))
+        cfg = sa.AuthConfig.from_env(base=BASE, method="sso")
+        alive = FakeSession({("GET", "/api/sessions"): Resp(200, body={})})
+        with mock.patch.object(sa, "browser_sso", side_effect=AssertionError("asked the browser")):
+            self.assertEqual(sa.sign_in(alive, cfg).method, "cached:sso")
+        no_cache = sa.AuthConfig.from_env(base=BASE, method="sso", cache=False)        # a fresh sign-in on request
+        with mock.patch.object(sa, "browser_sso", side_effect=sa.AuthError("browser")), self.assertRaises(sa.AuthError):
+            sa.sign_in(FakeSession({("GET", "/api/sessions"): Resp(200, body={})}), no_cache)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), mock.patch.object(sa, "browser_sso", side_effect=sa.AuthError("b")), \
+                self.assertRaises(sa.AuthError):
+            sa.sign_in(FakeSession({("GET", "/api/sessions"): Resp(401)}), cfg)          # refused: said, then browser
+        self.assertIn("the cached session was refused (HTTP 401", err.getvalue())
+        self.assertIn("forgotten", err.getvalue())
+
+    def test_methods_says_what_auto_would_really_use(self):
+        cfg = sa.AuthConfig.from_env(base=BASE)
+        self.assertEqual(sa._auto_would_use(cfg), "sso (no cached session yet)")
+        sa.secret_set(f"session:{BASE}", json.dumps({"token": "T"}))
+        self.assertTrue(sa._auto_would_use(cfg).startswith("cached"))
 
     def test_expired_saved_api_token_is_ignored(self):
         sa.secret_set(f"api-token:{BASE}", json.dumps({"apiToken": "OLD", "expireTime": "2000-01-01T00:00:00Z"}))

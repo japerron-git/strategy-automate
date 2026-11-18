@@ -3975,6 +3975,41 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
 
 # ── plan ─────────────────────────────────────────────────────────────────────────────────────
 
+DERIVED_METRIC_KINDS = ("create_conditional_metric", "create_compound_metric", "create_level_metric",
+                        "create_weighted_average", "create_time_shift_metric")
+
+
+def new_fact_metric_order_problems(findings: list[dict]) -> list[str]:
+    """A derived metric that reads a fact metric this plan adds (add_column_fact_metric, always phase 3) must run after
+    phase 3's republish: refuse a finding that would create it in phase 3 or earlier (NUSA F008, 2026-11-18)."""
+    new = {str((a.get("args") or {}).get("name") or "").strip().casefold()
+           for f in findings for a in f.get("actions") or [] if a.get("kind") == "add_column_fact_metric"} - {""}
+    if not new:
+        return []
+
+    def reads(value: Any) -> set[str]:
+        if isinstance(value, dict):
+            return set().union(*(reads(v) for v in value.values())) if value else set()
+        if isinstance(value, list):
+            return set().union(*(reads(v) for v in value)) if value else set()
+        text = str(value or "").casefold()
+        return {n for n in new if re.search(r"(?<![\w])" + re.escape(n) + r"(?![\w])", text)}
+
+    out = []
+    for f in findings:
+        phase = _phase_of(f)
+        if phase is None or phase > FIXED_PHASE_KINDS["add_column_fact_metric"]:
+            continue
+        hit = sorted({n for a in f.get("actions") or [] if a.get("kind") in DERIVED_METRIC_KINDS
+                      for n in reads({k: v for k, v in (a.get("args") or {}).items()
+                                      if k not in ("name", "description")})})
+        if hit:
+            out.append(f"{f.get('id')}: its derived metric(s) read {hit}, fact metric(s) this plan adds in phase 3, but "
+                       f"the finding is in phase {phase}, so they would be created before phase 3's republish. Set the "
+                       f"finding's \"phase\": 4 (its add_column_fact_metric still runs in phase 3)")
+    return out
+
+
 def no_change(f: dict) -> bool:
     """A finding decided as "no change": an explicit empty action list (`actions: []`), not covered by another
     finding. A finding with no `actions` key at all still becomes a manual step from its recommendation."""
@@ -4836,6 +4871,16 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
             ph["blocked_by"] = unanswered[ph["phase"]]
             warnings.append(f"phase {ph['phase']}: no script until these findings are answered: "
                             f"{', '.join(unanswered[ph['phase']])}")
+    # spec files that only blocked phases read are held back (not written) until those phases are answered, as the
+    # plugin's script writer does: a file in the bundle should mean a script that runs reads it
+    blocked = {ph["phase"] for ph in phases if ph.get("blocked_by")}
+    readers: dict[str, set[int]] = {}
+    for ph in phases:
+        text = json.dumps(ph.get("steps") or [])
+        for rel in files:
+            if rel in text:
+                readers.setdefault(rel, set()).add(ph["phase"])
+    held = sorted(rel for rel, ps in readers.items() if ps and ps <= blocked)
     # the id covers what the scripts will run, not only the findings: an engine change that alters a step
     # (a new check around a manual step) must also retire the scripts made before it
     digest = hashlib.sha256(json.dumps({"findings": [{k: f.get(k) for k in ("id", "status", "actions", "decision_note",
@@ -4845,7 +4890,8 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
     return {"version": 1, "model": findings_doc.get("model"), "model_id": model_id or None,
             "generated": time.strftime("%Y-%m-%d"), "statuses_planned": list(statuses), "plan_id": digest,
             "bundle_dir": bundle, "copies": copies,
-            "phases": phases, "files": files, "not_planned": skipped, "problems": problems,
+            "phases": phases, "files": files, **({"files_held": held} if held else {}),
+            "not_planned": skipped, "problems": problems,
             "warnings": warnings, "unanswered": {str(k): v for k, v in sorted(unanswered.items())}}
 
 
@@ -5051,6 +5097,7 @@ def check_findings(doc: dict) -> dict[str, Any]:
             warnings.append(f"{fid}: a manual step is a question for someone, not a model edit ('{st}'): make it "
                             f"its own finding with needs_answer and no action, so this one holds only steps that run")
     problems += [f"findings: dependency cycle {c}" for c in _cycles(fs)]
+    problems += new_fact_metric_order_problems(fs)
     return {"problems": problems, "warnings": warnings}
 
 
@@ -5738,6 +5785,8 @@ def _offline(args: argparse.Namespace) -> int:
         _write_json(args.out, out)
         base = os.path.dirname(os.path.abspath(args.out))   # stands for the repo root: paths are relative to it
         for rel, content in (out.get("files") or {}).items():   # spec files the commands read (relative paths)
+            if rel in (out.get("files_held") or []):               # only blocked phases read it: not yet
+                continue
             dest = os.path.normpath(os.path.join(base, rel))
             if not dest.startswith(base + os.sep):
                 continue

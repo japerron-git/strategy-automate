@@ -611,6 +611,38 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(calls(m, "DELETE"), [])                                          # instance kept
         self.assertLess(len(calls(m, "GET", r"/api/dataModels/M/publishStatus")), 40)    # ~2 min, not 30
 
+    def test_an_edited_model_that_never_answers_stops_unconfirmed_for_the_publish_command(self):
+        # seen live (2026-11-18, 3-table model): "not published" before the publish, then {"status": 1} with no
+        # tables, and the query check never answered, while Studio showed the model published
+        def make():
+            routes = publish_routes(Resp(200, {"status": 1}))
+            routes[("POST", r"/api/v2/cubes/M/instances")] = Resp(400, {"code": "ERR001", "message": "-2147072488 not published"})
+            return make_m(routes)
+        m, err = make(), io.StringIO()
+        with mock.patch.object(bm.time, "time", side_effect=[i * 5.0 for i in range(2000)]), \
+             mock.patch.object(bm.time, "sleep"), contextlib.redirect_stderr(err):
+            bm._mosaic_publish_verified(m, "M", poll_seconds=1800, poll_interval=0.01, unconfirmed_after=300)
+        self.assertIn("publish NOT CONFIRMED: after 300s", err.getvalue())
+        self.assertIn("query check: HTTP 400", err.getvalue())                           # the answer, in the log
+        self.assertEqual(calls(m, "DELETE"), [])
+        # a first build passes no cutoff: it waits for the query check, as before
+        m, err = make(), io.StringIO()
+        with mock.patch.object(bm.time, "time", side_effect=[i * 5.0 for i in range(4000)]), \
+             mock.patch.object(bm.time, "sleep"), contextlib.redirect_stderr(err), \
+             self.assertRaises(SystemExit):
+            bm._mosaic_publish_verified(m, "M", poll_seconds=600, poll_interval=0.01)
+        self.assertNotIn("NOT CONFIRMED", err.getvalue())
+
+    def test_publish_and_refresh_commands_pass_the_cutoff(self):
+        seen = []
+        with mock.patch.object(bm, "_publish", side_effect=lambda *a, **k: seen.append(k["unconfirmed_after"])):
+            m = mock.Mock()
+            bm.cmd_publish(m, mock.Mock(model_id="M", poll_seconds=1800, skip_classify=True, unconfirmed_after=300))
+            bm.cmd_refresh(m, mock.Mock(model_id="M", poll_seconds=1800, refresh_type="replace", unconfirmed_after=0))
+        self.assertEqual(seen, [300, 0])
+        self.assertEqual(bm.build_parser().parse_args(["publish", "--model-id", "M"]).unconfirmed_after,
+                         bm.UNCONFIRMED_AFTER_S)
+
     def test_a_republish_that_lists_its_tables_still_waits_for_them(self):
         seq = iter([Resp(200, {"status": 1})] * 3 + [Resp(200, {"status": 1, "tables": [{"status": "loading"}]})] * 40
                    + [Resp(200, {"status": 1, "tables": [{"status": "completed"}]})])

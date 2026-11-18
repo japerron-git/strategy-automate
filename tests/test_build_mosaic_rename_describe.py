@@ -46,6 +46,25 @@ class ItemTests(unittest.TestCase):
 
 
 class WriteTests(unittest.TestCase):
+    def test_time_attributes_are_named_not_lost_and_object_ids_resolve(self):
+        # NUSA (2026-11-18): the connector's month__id / quarter__id are Studio time attributes, smartAttributes of
+        # the start date; rename-describe said "attribute 'month' not found"
+        model = {"attributes": [{"information": {"objectId": "A1", "name": "Region", "description": ""}},
+                                {"information": {"objectId": "D1", "name": "Start Date", "description": ""},
+                                 "smartAttributes": [{"information": {"objectId": "S1", "name": "Month"},
+                                                      "smartAttributeType": "month_interval"}]}],
+                 "factMetrics": [], "metrics": []}
+        for cur in ("month", "month__id", "month (id)", "s1"):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                bm.rename_describe_writes(model, "M1", bm.rename_describe_items(
+                    [{"object_type": "attribute", "current_name": cur, "description": "Start month."}]))
+            self.assertIn("is a time attribute ('Month', objectId S1) of date attribute 'Start Date'", err.getvalue())
+            self.assertIn("Set its name or description in Studio", err.getvalue())
+        writes, _ = bm.rename_describe_writes(model, "M1", bm.rename_describe_items(
+            [{"object_type": "attribute", "current_name": "a1", "description": "Sales region."}]))   # by objectId
+        self.assertEqual(writes[0][1], f"{MP}/attributes/A1")
+
     def test_writes_skip_done_and_refuse_collisions(self):
         items = bm.rename_describe_items([
             {"object_type": "attribute", "current_name": "region", "new_name": "Sales Region"},

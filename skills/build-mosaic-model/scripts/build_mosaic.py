@@ -3515,10 +3515,16 @@ LOADED_BUT_SILENT_S = 180     # tables said completed, the model still refuses q
 # server showed the publish complete; the new data was there through the connector afterwards.
 NO_TABLES_REPUBLISH_S = 120
 HEARTBEAT_S = 60              # a progress line while waiting, so a script never looks stuck
+# The publish / refresh commands (edits to an existing model, not a first build): when the model said "not published"
+# before the publish, the query check decides; if publishStatus never lists a table and the model still doesn't answer
+# after this, stop "NOT CONFIRMED". Seen live 2026-11-18 (3-table model, another tenant): {"status": 1} and no answer
+# for minutes while Studio showed the model published.
+UNCONFIRMED_AFTER_S = 300
 
 
 def _mosaic_publish_verified(m: MSTR, model_id: str, *, poll_seconds: int = 180,
-                             poll_interval: float = 5.0, refresh_policy: str = "replace") -> None:
+                             poll_interval: float = 5.0, refresh_policy: str = "replace",
+                             unconfirmed_after: int = 0) -> None:
     """Publish a Mosaic data model via the verified 3-step flow and assert completion.
 
     Flow (see memory/reference_mosaic_publish_path.md):
@@ -3584,6 +3590,7 @@ def _mosaic_publish_verified(m: MSTR, model_id: str, *, poll_seconds: int = 180,
         started = next_beat = time.time()
         next_beat += HEARTBEAT_S
         ever_tables = False
+        probe_note = "not yet asked"
         while time.time() < deadline:
             polls += 1
             if probe_decides and tables_loaded and not retriggered and time.time() - loaded_at >= LOADED_BUT_SILENT_S:
@@ -3607,7 +3614,8 @@ def _mosaic_publish_verified(m: MSTR, model_id: str, *, poll_seconds: int = 180,
                 next_probe = time.time() + 15
             if probe_decides and time.time() >= next_probe:
                 next_probe = time.time() + 15
-                if _executes(m, model_id):
+                probe_last, probe_note = _execute_probe(m, model_id)
+                if probe_last:
                     print("  ✓ mosaic publish COMPLETE: the model answers queries (publishStatus still said "
                           f"{json.dumps(last)[:120] if last else 'nothing'}).", file=sys.stderr)
                     return
@@ -3624,7 +3632,17 @@ def _mosaic_publish_verified(m: MSTR, model_id: str, *, poll_seconds: int = 180,
             if now >= next_beat:
                 next_beat = now + HEARTBEAT_S
                 print(f"  ... still waiting for the publish ({int(now - started)}s of {poll_seconds}s): publishStatus "
-                      f"{json.dumps(js)[:160]}", file=sys.stderr, flush=True)
+                      f"{json.dumps(js)[:160]}"
+                      + (f"; query check: {probe_note}" if probe_decides else ""), file=sys.stderr, flush=True)
+            if probe_decides and unconfirmed_after and not ever_tables and now - started >= unconfirmed_after \
+                    and not (isinstance(st, int) and st < 0) and not js.get("code"):
+                keep_instance = True      # the job may still be running: deleting the instance could abort it
+                print(f"  ! publish NOT CONFIRMED: after {unconfirmed_after}s publishStatus has listed no table (last "
+                      f"{json.dumps(js)[:120]}) and the model has not answered a query (last: {probe_note}). Seen live "
+                      f"on a tenant where Studio already showed the model published. Stopped waiting; check the new "
+                      f"data in the connector before relying on it (a first build does not stop this way).",
+                      file=sys.stderr, flush=True)
+                return
             if not probe_decides and not ever_tables and now - started >= NO_TABLES_REPUBLISH_S \
                     and not (isinstance(st, int) and st < 0) and not js.get("code"):
                 keep_instance = True      # the job may still be running: deleting the instance could abort it
@@ -3681,21 +3699,27 @@ def _mosaic_publish_verified(m: MSTR, model_id: str, *, poll_seconds: int = 180,
 def _executes(m: MSTR, model_id: str) -> bool | None:
     """True when the model answers a one-row query (published), False when Strategy says it is not published
     (-2147072488), None when neither is certain (a timeout or another error)."""
+    return _execute_probe(m, model_id)[0]
+
+
+def _execute_probe(m: MSTR, model_id: str) -> tuple[bool | None, str]:
+    """(_executes' answer, a short account of the reply), for the progress lines."""
     try:
         r = m.s.post(f"{m.base}/api/v2/cubes/{model_id}/instances", params={"limit": 1}, json={}, timeout=(15, 60))
-    except requests.RequestException:
-        return None
+    except requests.RequestException as e:
+        return None, f"request failed: {type(e).__name__}"
     if r.ok:
-        return True
+        return True, f"HTTP {r.status_code}"
     text = r.text.lower()
+    detail = f"HTTP {r.status_code} {r.text[:120]}"
     if "-2147072488" in r.text or "not published" in text:
-        return False
+        return False, detail
     # the whole-model query of a model with several fact tables can exceed the engine's row limits: the engine ran it
     # against loaded data, so the model is published
     # (or be refused as a cartesian join of two facts): either way the engine planned it against loaded data
     if "intermediate rows" in text or "exceeds the maximum" in text or "result set" in text and "limit" in text or "cartesian join" in text:
-        return True
-    return None
+        return True, detail
+    return None, detail
 
 
 def _classic_cube_publish(m: MSTR, cube_id: str) -> None:
@@ -3711,7 +3735,7 @@ def _classic_cube_publish(m: MSTR, cube_id: str) -> None:
 
 
 def _publish(m: MSTR, model_id: str, *, poll_seconds: int = 180,
-             skip_classify: bool = False, refresh_policy: str = "replace") -> None:
+             skip_classify: bool = False, refresh_policy: str = "replace", unconfirmed_after: int = 0) -> None:
     """Surface-routed publish: classify subType first, never mix Mosaic/legacy paths.
 
     skip_classify=True bypasses GET /api/objects/{id}?type=3 and assumes the caller
@@ -3723,11 +3747,13 @@ def _publish(m: MSTR, model_id: str, *, poll_seconds: int = 180,
     """
     if skip_classify:
         print("  ↳ skip-classify: assuming Mosaic data model (subType 779)", file=sys.stderr)
-        _mosaic_publish_verified(m, model_id, poll_seconds=poll_seconds, refresh_policy=refresh_policy)
+        _mosaic_publish_verified(m, model_id, poll_seconds=poll_seconds, refresh_policy=refresh_policy,
+                                 unconfirmed_after=unconfirmed_after)
         return
     info = classify_object_surface(m, model_id)
     if info["surface"] == "mosaic_data_model":
-        _mosaic_publish_verified(m, model_id, poll_seconds=poll_seconds, refresh_policy=refresh_policy)
+        _mosaic_publish_verified(m, model_id, poll_seconds=poll_seconds, refresh_policy=refresh_policy,
+                                 unconfirmed_after=unconfirmed_after)
     elif info["surface"] == "classic_cube":
         if refresh_policy != "replace":
             die(f"refresh policy {refresh_policy!r} applies to Mosaic models only; {model_id} is a "
@@ -3758,7 +3784,8 @@ def cmd_set_serve_mode(m: MSTR, args):
 def cmd_publish(m: MSTR, args):
     m.login()
     _publish(m, args.model_id, poll_seconds=args.poll_seconds,
-             skip_classify=getattr(args, "skip_classify", False))
+             skip_classify=getattr(args, "skip_classify", False),
+             unconfirmed_after=getattr(args, "unconfirmed_after", UNCONFIRMED_AFTER_S))
 
 
 def _refresh_policy(refresh_type: str | None) -> str:
@@ -3779,7 +3806,8 @@ def cmd_refresh(m: MSTR, args):
     table's refreshPolicy (replace by default)."""
     policy = _refresh_policy(getattr(args, "refresh_type", None))
     m.login()
-    _publish(m, args.model_id, poll_seconds=getattr(args, "poll_seconds", 180), refresh_policy=policy)
+    _publish(m, args.model_id, poll_seconds=getattr(args, "poll_seconds", 180), refresh_policy=policy,
+             unconfirmed_after=getattr(args, "unconfirmed_after", UNCONFIRMED_AFTER_S))
 
 
 # ── wire-relationships ─────────────────────────────────────────────────────────
@@ -6940,12 +6968,26 @@ def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[li
 
     A connector form name ('<attribute>__<form>', '<attribute> (<form>)') describes its attribute: a form has
     no description of its own, and the connector shows the attribute's on every form. A form name can't be
-    renamed here. Every item is checked before anything is written, and all problems are reported together."""
+    renamed here. `current_name` may also be the object's objectId. A Studio time attribute (a smartAttribute of a
+    date attribute, e.g. 'month__id') is named in the problem list with its objectId and base attribute: there is no
+    verified write for it yet. Every item is checked before anything is written, and all problems are reported
+    together."""
     pools = {"attribute": ("attributes", model.get("attributes") or []),
              "fact_metric": ("factMetrics", model.get("factMetrics") or []),
              "metric": ("metrics", model.get("metrics") or [])}   # derived metrics: a full-body PUT, see below
     by_name = {k: {(o.get("information") or {}).get("name", "").casefold(): o for o in objs}
                for k, (_, objs) in pools.items()}
+    by_id = {k: {str((o.get("information") or {}).get("objectId") or "").upper(): o for o in objs}
+             for k, (_, objs) in pools.items()}
+    # Studio's time attributes ('<date> (Month)', or a bare 'Month') are smartAttributes of their base date attribute,
+    # not top-level attributes; the connector shows them as '<name>__id' / '<name> (id)'
+    smart: dict[str, tuple[dict, dict]] = {}
+    for a in model.get("attributes") or []:
+        for sa in a.get("smartAttributes") or []:
+            si = sa.get("information") or {}
+            for key in (str(si.get("name") or sa.get("name") or "").casefold(), str(si.get("objectId") or "").upper()):
+                if key:
+                    smart[key] = (sa, a)
     writes, notes, problems = [], [], []
     for it in [x for x in items if x["object_type"] == "model"][:1]:
         current = str((model.get("information") or {}).get("description") or "")
@@ -6962,12 +7004,23 @@ def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[li
     for it in items:
         kind, cur = it["object_type"], it["current_name"]
         names = by_name[kind]
-        o, via_form = names.get(cur.casefold()) or renamed[kind].get(cur.casefold()), False
+        o, via_form = (names.get(cur.casefold()) or renamed[kind].get(cur.casefold())
+                       or by_id[kind].get(cur.strip().upper())), False
         if o is None and kind == "attribute":
             for alt in attribute_name_candidates(cur)[1:]:
                 if alt in names:
                     o, via_form = names[alt], True
                     break
+        if o is None and kind == "attribute":
+            hit = next((smart[c] for c in [cur.strip().upper()] + attribute_name_candidates(cur) if c in smart), None)
+            if hit is not None:
+                sa, base = hit
+                si = sa.get("information") or {}
+                problems.append(f"'{cur}' is a time attribute ('{si.get('name') or sa.get('name')}', objectId "
+                                f"{si.get('objectId')}) of date attribute '{(base.get('information') or {}).get('name')}':"
+                                f" rename-describe can't write time attributes yet (no verified REST call). Set its "
+                                f"name or description in Studio and leave this item out")
+                continue
         if o is None:
             if it["new_name"] and it["new_name"].casefold() in names:
                 notes.append(f"{cur}: already renamed to '{it['new_name']}'")
@@ -8051,6 +8104,9 @@ def build_parser():
                     help="skip GET /api/objects/{id}?type=3 surface classification; "
                          "assume Mosaic data model. Saves one project-scoped call to "
                          "stay under the session cap when chaining build→publish.")
+    sp.add_argument("--unconfirmed-after", type=int, default=UNCONFIRMED_AFTER_S,
+                    help="seconds after which a publish whose status never lists a table, on a model that doesn't "
+                         "answer yet, stops as NOT CONFIRMED (exit 0); 0 waits for --poll-seconds")
 
     sp = sub.add_parser("wire-relationships",
         help="Post-build relationship wiring with step-3/step-5 validation; avoids 8004ccdb/8004ccc7 retry loops. See memory/feedback_mosaic_relationship_wiring.md.")
@@ -8097,6 +8153,8 @@ def build_parser():
     sp.add_argument("--refresh-type", default="replace",
                     choices=["replace", "add", "update", "upsert", "incremental"],
                     help="publish refreshPolicy for every table (default replace; incremental = upsert)")
+    sp.add_argument("--unconfirmed-after", type=int, default=UNCONFIRMED_AFTER_S,
+                    help="as for publish: stop NOT CONFIRMED after this many seconds without a table or an answer")
     sp.add_argument("--poll-seconds", type=int, default=180,
                     help="max wait for every table to finish before failing")
 
