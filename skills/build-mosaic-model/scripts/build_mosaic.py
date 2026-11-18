@@ -3510,6 +3510,11 @@ REFRESH_POLICIES = ("replace", "add", "update", "upsert")
 
 
 LOADED_BUT_SILENT_S = 180     # tables said completed, the model still refuses queries: publish once more after this
+# A republish (the model already answers, with its old data) whose publishStatus never lists a table: stop waiting after
+# this, unconfirmed. Seen live 2026-11-18 (one-table in-memory model): {"status": 1} for the full 600 s while the
+# server showed the publish complete; the new data was there through the connector afterwards.
+NO_TABLES_REPUBLISH_S = 120
+HEARTBEAT_S = 60              # a progress line while waiting, so a script never looks stuck
 
 
 def _mosaic_publish_verified(m: MSTR, model_id: str, *, poll_seconds: int = 180,
@@ -3576,6 +3581,9 @@ def _mosaic_publish_verified(m: MSTR, model_id: str, *, poll_seconds: int = 180,
         loaded_at = 0.0
         retriggered = False
         polls = 0
+        started = next_beat = time.time()
+        next_beat += HEARTBEAT_S
+        ever_tables = False
         while time.time() < deadline:
             polls += 1
             if probe_decides and tables_loaded and not retriggered and time.time() - loaded_at >= LOADED_BUT_SILENT_S:
@@ -3611,6 +3619,21 @@ def _mosaic_publish_verified(m: MSTR, model_id: str, *, poll_seconds: int = 180,
                 js = {"raw": js}
             st = js.get("status")
             tbl = [t for t in (js.get("tables") or []) if isinstance(t, dict)]
+            ever_tables = ever_tables or bool(tbl)
+            now = time.time()
+            if now >= next_beat:
+                next_beat = now + HEARTBEAT_S
+                print(f"  ... still waiting for the publish ({int(now - started)}s of {poll_seconds}s): publishStatus "
+                      f"{json.dumps(js)[:160]}", file=sys.stderr, flush=True)
+            if not probe_decides and not ever_tables and now - started >= NO_TABLES_REPUBLISH_S \
+                    and not (isinstance(st, int) and st < 0) and not js.get("code"):
+                keep_instance = True      # the job may still be running: deleting the instance could abort it
+                print(f"  ! publish NOT CONFIRMED: publishStatus has listed no table for {NO_TABLES_REPUBLISH_S}s "
+                      f"(last {json.dumps(js)[:120]}), and on a republish the model already answers with its old data, "
+                      f"so nothing here can tell when the load ends. This tenant does this on small models even after "
+                      f"the load finished. Stopped waiting; check the new data in the connector before relying on it.",
+                      file=sys.stderr, flush=True)
+                return
             if isinstance(st, int) and st < 0:
                 die(f"_mosaic_publish_verified: terminal error status={st} body={json.dumps(js)[:400]}")
             if js.get("code"):
@@ -6737,6 +6760,9 @@ def cmd_create_formula_attribute(m: MSTR, args):
 # POST /factMetrics in one changeset, the fact reading the column with a column_reference token that carries the
 # column's objectId (the shape verified for fact metrics on an existing model, memory/reference_mosaic_rest_gotchas.md
 # "Fact metrics (custom formulas)"); function, dimty and functionProperties as cmd_build creates them.
+# Verified live 2026-11-18 (in-memory scratch model, a column an attribute and a fact metric already read): created,
+# read back, a rerun skipped; after the REST publish alone it read right through the connector (= the key's max per
+# group). A column only on a lookup table is not yet run live.
 FACT_METRIC_FUNCTIONS = ("sum", "avg", "max", "min", "count")
 
 

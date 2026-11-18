@@ -130,6 +130,10 @@ the `>` comparison work in formula attributes.
   }, "tables":[{"objectId":"<od logical table id>","subType":"logical_table","name":"ORDER_DETAIL"}]}]
   ```
 - Operators (`* + - / ( )`) are `character` tokens — NOT `operator`, `metric_reference`, or `object_reference`, all of which were tried and rejected. This is what makes a "derived calculation" (fact metric with an inline formula) finally commit. Functions (`Sum`, `Concat`, `ApplySimple`) are `function` tokens with `target.subType:"function"` and the well-known function objectId. Use `showExpressionAs=tokens` on a working metric to see the exact shape before inventing one.
+- A fact metric over one existing column (`add-column-fact-metric`): the same POST with tokens
+  `[column_reference with target, end_of_text]`, no `text`. Verified 2026-11-18 on an in-memory model, on a column an
+  attribute and another fact metric already read: created in one changeset, the read-back shows the function and
+  column, and after the REST publish alone the metric read right through the connector.
 
 ## Relationships
 - `PUT /api/model/dataModels/{id}/attributes/{childId}/relationships?changesetId=<cs>` (or via header `X-MSTR-MS-Changeset`). Body is the full list, not a delta.

@@ -597,6 +597,34 @@ class PublishTests(unittest.TestCase):
             bm._mosaic_publish_verified(m, "M", poll_seconds=30, poll_interval=0.01)
         self.assertEqual(len(calls(m, "POST", r"/api/v2/cubes/M/instances")), 1)    # only the check before the trigger
 
+    def test_a_republish_whose_status_never_lists_tables_stops_waiting_unconfirmed(self):
+        # seen live (2026-11-18, one-table in-memory model): {"status": 1} for 600 s while the server showed it done
+        routes = publish_routes(Resp(200, {"status": 1}))
+        routes[("POST", r"/api/v2/cubes/M/instances")] = Resp(200, {"result": {}})     # answers: a republish
+        m = make_m(routes)
+        err = io.StringIO()
+        with mock.patch.object(bm.time, "time", side_effect=[i * 5.0 for i in range(1000)]), \
+             mock.patch.object(bm.time, "sleep"), contextlib.redirect_stderr(err):
+            bm._mosaic_publish_verified(m, "M", poll_seconds=1800, poll_interval=0.01)
+        self.assertIn("publish NOT CONFIRMED", err.getvalue())
+        self.assertIn("still waiting for the publish (60s", err.getvalue())               # the heartbeat
+        self.assertEqual(calls(m, "DELETE"), [])                                          # instance kept
+        self.assertLess(len(calls(m, "GET", r"/api/dataModels/M/publishStatus")), 40)    # ~2 min, not 30
+
+    def test_a_republish_that_lists_its_tables_still_waits_for_them(self):
+        seq = iter([Resp(200, {"status": 1})] * 3 + [Resp(200, {"status": 1, "tables": [{"status": "loading"}]})] * 40
+                   + [Resp(200, {"status": 1, "tables": [{"status": "completed"}]})])
+        routes = publish_routes(lambda call: next(seq))
+        routes[("POST", r"/api/v2/cubes/M/instances")] = Resp(200, {"result": {}})
+        m = make_m(routes)
+        err = io.StringIO()
+        with mock.patch.object(bm.time, "time", side_effect=[i * 5.0 for i in range(1000)]), \
+             mock.patch.object(bm.time, "sleep"), contextlib.redirect_stderr(err):
+            bm._mosaic_publish_verified(m, "M", poll_seconds=1800, poll_interval=0.01)
+        self.assertNotIn("NOT CONFIRMED", err.getvalue())
+        self.assertIn("tables loaded", err.getvalue())
+        self.assertEqual(len(calls(m, "DELETE")), 1)
+
     def test_schema_comparison_error_fails_fast(self):
         m = make_m(publish_routes(Resp(200, {"status": 1, "tables": [{"status": "schema_comparison_error"}]})))
         started = time.monotonic()

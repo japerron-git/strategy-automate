@@ -95,8 +95,8 @@ FIXED_PHASE_KINDS = {"add_column_fact_metric": 3}
 PHASED_KINDS = {**MERGED_KINDS, **FIXED_PHASE_KINDS}   # every kind that runs outside its finding's phase
 FACT_METRIC_FUNCTIONS = ("sum", "avg", "max", "min", "count")   # build_mosaic.py add-column-fact-metric
 FACT_METRIC_RISK = ("Republish after this phase for the metric to hold data. A column on a lookup table (the dry run "
-                    "names the table) is aggregated once per lookup row, not once per fact row. Not yet run live on an "
-                    "existing model: record what the dry run and the step report.")
+                    "names the table) is aggregated once per lookup row, not once per fact row; that case is not yet "
+                    "run live.")
 NO_REPUBLISH_MERGED = ("rename_describe",)   # merged steps whose change shows without a republish
 MERGED_NOTES = {"source_change": "Source change done in the phase {phase} rebuild",
                 "change_column_type": "Column type change done in phase {phase} (set-column-types)",
@@ -4356,8 +4356,7 @@ def form_base_name(name: str) -> str:
 
 # step kinds whose result reached the connector only after a publish from Studio (see build_plan)
 STUDIO_PUBLISH_KINDS = ("wire_relationships", "remove_relationships", "add_time_attributes", "add_column_attribute",
-                        "create_formula_attribute",
-                        "add_column_fact_metric")   # not yet seen live: kept until a REST publish alone shows its data
+                        "create_formula_attribute")   # not add_column_fact_metric: its data showed after the REST publish
 # patch_model_object targets that are model structure, like the kinds above (an attribute's outer-join setting, a
 # table). Derived and fact metrics are left out: their changes have reached the connector after the REST publish.
 STUDIO_PUBLISH_OBJECT_KINDS = ("attribute", "table")

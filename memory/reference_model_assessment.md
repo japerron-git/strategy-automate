@@ -566,9 +566,10 @@ label column is listed as an attribute that no metric filters on.
   derived metrics of phases 4-5 built on it. The name must differ from every attribute's and derived
   metric's; the command treats a fact metric of that name reading the same column with the same function as
   done (a rerun is harmless). Without `table`, the largest table that has the column is used; a column only
-  on a lookup table is aggregated once per lookup row, and the dry run says so. Not yet run live on an
-  existing model (the body is the fact-metric shape verified with a column token carrying the column's id),
-  so phase 3 keeps the "publish from Studio" step for it until a REST publish alone is seen to show its data.
+  on a lookup table is aggregated once per lookup row, and the dry run says so. Verified live (18 Nov, an
+  in-memory model, a column an attribute already read): after the REST publish alone, with no Studio publish,
+  the metric read right through the connector, so it adds no "publish from Studio" step. A column only on a
+  lookup table is not yet run live.
 - **No change** (`actions: []`): a finding decided as "leave the model as it is" (ignore, assume correct).
   `plan` writes a note for it, not a manual step; a phase with nothing else to run gets no republish or
   re-certify, and its script only shows the notes and exits 0. A finding with no `actions` key at all still

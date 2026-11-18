@@ -1823,7 +1823,7 @@ class RoleTests(unittest.TestCase):
         self.assertEqual(step["dry_run"]["argv"][-1], "--dry-run")
         self.assertIn("lookup table", step["risks"][0])
         self.assertTrue(by[3]["after"][0]["what"].startswith("Republish"))
-        self.assertTrue(any("Studio" in a["what"] for a in by[3]["after"]))      # until a REST publish is seen to do
+        self.assertFalse(any("Studio" in a["what"] for a in by[3]["after"]))     # seen live: the REST publish is enough
         self.assertEqual(by[3]["unit_tests"], ["t"])
         self.assertEqual([s["kind"] for s in by[4]["steps"]], ["note", "create_level_metric"])
         self.assertIn("phase 3", by[4]["steps"][0]["note"])
