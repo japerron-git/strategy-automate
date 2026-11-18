@@ -801,7 +801,8 @@ def classify_roles(scope: dict, profiles: dict[str, dict], variation: dict[str, 
     """-> candidates [{name, object, role, reason, evidence, suggested_actions}]. Pure: the queries are run by
     review_roles. Roles: attribute (a code or flag read as a measure), both (a small count or a 0/1 flag: group
     by it and add it up), entity_characteristic (one value per entity on a multi-row fact), measure (continuous
-    values held only as an attribute), review (a small integer range the names don't explain)."""
+    values held only as an attribute), review (a small integer range the names don't explain), constant (one value
+    on every row: no data to read in this extract, whatever its role would be)."""
     out: list[dict[str, Any]] = []
     rows_per_entity = None
     if variation and variation.get("entities"):
@@ -821,6 +822,15 @@ def classify_roles(scope: dict, profiles: dict[str, dict], variation: dict[str, 
         ev = {"min": lo, "max": hi, "non_blank": n, "integer": integer,
               "entities_with_several_values": varying, "rows_per_entity": round(rows_per_entity, 2) if rows_per_entity else None}
         role, reason, acts = None, "", []
+        if span == 0:   # all zero (or all one value): no role can be read from it; say so in its description
+            value = int(lo) if float(lo).is_integer() else lo
+            out.append({"name": name, "object": "metric", "role": "constant",
+                        "reason": f"every non-blank row is {value} in this data: nothing to add up, group or filter "
+                                  f"by here. Say so in its description (and whether the source fills it elsewhere)",
+                        "evidence": ev, "suggested_actions": [{"kind": "rename_describe", "args": {"items": [
+                            {"object_type": "fact_metric", "current_name": name,
+                             "description": f"<what it means; {value} on every row in this data>"}]}}]})
+            continue
         attr_act = {"kind": "add_column_attribute",
                     "args": {"column": name, "name": f"<{name} as an attribute: a business name, not the metric's>"}}
         level_act = {"kind": "create_level_metric",
@@ -1448,8 +1458,8 @@ def run_bank(runner: Runner, project: str, bank: dict, *, only: str = "", levels
         best = q.get("best_answer") or {}
         sql_warnings = [f"{where}: {w}" for where, text in (("sql", q.get("sql") or ""),
                                                             ("best answer", best.get("sql") or ""))
-                        for w in time_shift_sql_lint(text, shifted)]
-        if sql_warnings:   # the model's current time-shift metrics, read live
+                        for w in form_group_by_lint(text) + time_shift_sql_lint(text, shifted)]
+        if sql_warnings:   # the model's current time-shift metrics, read live; form columns late in GROUP BY
             entry["sql_warnings"] = sql_warnings
         if (best.get("sql") or "").strip():   # also for questions the governed path can't answer
             best_sql = svm.inject_model(best["sql"], model)
@@ -3514,6 +3524,12 @@ def grouped_expressions(sql: str) -> list[str]:
 
 def group_by_items(sql: str) -> list[str]:
     """Every GROUP BY item of every SELECT in the query, ordinals and aliases resolved to their expressions."""
+    return [expr for clause in group_by_clauses(sql) for _, expr in clause]
+
+
+def group_by_clauses(sql: str) -> list[list[tuple[str, str]]]:
+    """Each SELECT's GROUP BY list, in order: (the item as written, its expression with ordinals and aliases
+    resolved)."""
     text = _SQL_LITERAL.sub("''", sql or "")
     depth, d = [], 0
     for ch in text:
@@ -3542,7 +3558,7 @@ def group_by_items(sql: str) -> list[str]:
             if at(k) == dd:
                 return k
         return -1
-    found: list[str] = []
+    found: list[list[tuple[str, str]]] = []
     for m in re.finditer(r"\bselect\b", low):
         i = m.start()
         dd = at(i)
@@ -3563,14 +3579,32 @@ def group_by_items(sql: str) -> list[str]:
             expr, alias = _strip_alias(it)
             if alias:
                 aliases[alias] = expr
+        clause = []
         for item in _split_top(text[gstart:stop]):
             expr = item
             if re.fullmatch(r"\d+", item) and 0 < int(item) <= len(select_items):
                 expr = _strip_alias(select_items[int(item) - 1])[0]
             elif item.strip('"').lower() in aliases:
                 expr = aliases[item.strip('"').lower()]
-            found.append(expr.strip())
+            clause.append((item.strip(), expr.strip()))
+        found.append(clause)
     return found
+
+
+def form_group_by_lint(sql: str) -> list[str]:
+    """The connector refuses a form column (`<attribute>__<form>`: a time form such as `month__id` or
+    `<date> (month)__id`, or a code or description form) anywhere but first in a GROUP BY written by name, with
+    MOSAIC_SQL_COLUMN_NOT_FOUND, even when it is first in the SELECT; GROUP BY by position works (seen live
+    2026-11-17/18 on two tenants, time and non-time forms)."""
+    out = []
+    for clause in group_by_clauses(sql):
+        late = [item.strip('"') for i, (item, _) in enumerate(clause)
+                if i > 0 and not re.fullmatch(r"\d+", item) and "__" in item]
+        if late:
+            out.append(f"its GROUP BY names the form column(s) {', '.join(repr(x) for x in late)} after another "
+                       f"column: the connector then fails with MOSAIC_SQL_COLUMN_NOT_FOUND. Group by position "
+                       f"(GROUP BY 1, 2, ...), or list the one form column first")
+    return out
 
 
 # ── Time-shift metrics in SQL ─────────────────────────────────────────────────────────────────
@@ -3673,7 +3707,7 @@ def _sql_lint(sql: str, shifted: dict[str, dict] | None = None) -> list[str]:
            f"an outer query over a subquery: group by the attribute itself or its time attribute ((year), (month) "
            f"forms), or compute the expression in the subquery's SELECT (e.g. YEAR(MAX(<date>)) AS vintage) and "
            f"group the outer query by that column"] if bad else []
-    return out + time_shift_sql_lint(sql, shifted)
+    return out + form_group_by_lint(sql) + time_shift_sql_lint(sql, shifted)
 
 
 def best_answer_version(q: dict) -> int:
@@ -5066,11 +5100,17 @@ def check_domain(doc: dict) -> dict[str, Any]:
             "user_documents": user_docs, "assumptions": len(doc.get("assumptions") or [])}
 
 
-def check_coverage(bank: dict, domain: dict) -> dict[str, Any]:
+def check_coverage(bank: dict, domain: dict, meta: dict | None = None) -> dict[str, Any]:
     """Cross-check a bank against domain notes: every use case has questions, and every claim or
-    use case a question cites exists."""
+    use case a question cites exists. A quick assessment (meta.json "depth": "quick") may leave use cases
+    uncovered if it lists them in "uncovered_use_cases" (ids or names): those are notes, not problems, except a
+    high-priority one, which a quick assessment still covers."""
     problems: list[str] = []
     warnings: list[str] = []
+    notes: list[str] = []
+    meta = meta or {}
+    listed = {str(x).strip().lower() for x in meta.get("uncovered_use_cases") or []} \
+        if meta.get("depth") == "quick" else set()
     claims = {c.get("id") for c in domain.get("claims") or [] if isinstance(c, dict)}
     use_cases = {u.get("id"): u for u in domain.get("use_cases") or [] if isinstance(u, dict)}
     per_use_case = {uid: 0 for uid in use_cases}
@@ -5090,10 +5130,22 @@ def check_coverage(bank: dict, domain: dict) -> dict[str, Any]:
     total = sum(per_use_case.values()) or 1
     for uid, n in per_use_case.items():
         if n == 0:
-            problems.append(f"use case {uid} has no questions")
+            uc = use_cases[uid]
+            named = {str(uid).lower(), str(uc.get("name") or uc.get("title") or "").strip().lower()} & listed
+            if named and uc.get("priority") != "high":
+                notes.append(f"use case {uid} has no questions: listed as uncovered in meta.json (quick assessment)")
+            elif named:
+                problems.append(f"use case {uid} has no questions: it is high priority, and a quick assessment still "
+                                f"gives every high-priority use case a question (listing it as uncovered doesn't "
+                                f"exempt it)")
+            else:
+                problems.append(f"use case {uid} has no questions"
+                                + (" (a quick assessment may list it in meta.json uncovered_use_cases)"
+                                   if meta.get("depth") == "quick" else ""))
         elif use_cases[uid].get("priority") == "high" and n / total < 1 / max(len(use_cases), 1):
             warnings.append(f"use case {uid} is high priority but has a below-average share of questions ({n})")
-    return {"problems": problems, "warnings": warnings, "questions_per_use_case": per_use_case}
+    return {"problems": problems, "warnings": warnings, **({"notes": notes} if notes else {}),
+            "questions_per_use_case": per_use_case}
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────────────────────
@@ -5311,6 +5363,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--findings")
     sp.add_argument("--domain")
     sp.add_argument("--scope", help="scope.json: its metric formulas let the bank check catch time-shift misuse")
+    sp.add_argument("--meta", help="meta.json (default: the one beside --bank): a quick assessment's "
+                                   "uncovered_use_cases are notes in the coverage check, not problems")
     return ap
 
 
@@ -5707,7 +5761,9 @@ def _offline(args: argparse.Namespace) -> int:
     if args.domain:
         report["domain"] = check_domain(_load_json(args.domain))
     if args.bank and args.domain:
-        report["coverage"] = check_coverage(_load_json(args.bank), _load_json(args.domain))
+        meta_path = getattr(args, "meta", None) or os.path.join(os.path.dirname(os.path.abspath(args.bank)), "meta.json")
+        meta = _load_json(meta_path) if os.path.isfile(meta_path) else {}
+        report["coverage"] = check_coverage(_load_json(args.bank), _load_json(args.domain), meta)
     ok = not any(r["problems"] for r in report.values())
     print(json.dumps({"ok": ok, **report}, indent=2))
     return 0 if ok else 1

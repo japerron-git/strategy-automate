@@ -333,6 +333,12 @@ class TimeShiftSqlTests(unittest.TestCase):
         self.assertNotIn("sql_warnings", by_id["Q2"])
         graded = {g["id"]: g for g in am.grade_bank(bank, results)["questions"]}
         self.assertTrue(graded["Q1"]["sql_warnings"][0].startswith("sql: it reads time-shift metric"))
+        late = {"model": "Orders", "questions": [
+            {"id": "Q3", "level": 2, "question": "q", "expected_path": "governed",
+             "sql": 'SELECT "region", "order date (month)__id", SUM("sales") FROM {{MODEL}} '
+                    'GROUP BY "region", "order date (month)__id"'}]}
+        (r3,) = am.run_bank(Runner(), "retail", late)["results"]
+        self.assertIn("MOSAIC_SQL_COLUMN_NOT_FOUND", r3["sql_warnings"][0])
 
 class RunTests(unittest.TestCase):
     def test_runs_questions_and_same_model_expected_sql(self):
@@ -740,6 +746,45 @@ class UseCaseAndDocumentTests(unittest.TestCase):
         self.assertIn("use case U3 has no questions", text)
         self.assertEqual(report["questions_per_use_case"], {"U1": 0, "U2": 2, "U3": 0})
         self.assertTrue(any("Q4: no use_case" in w for w in report["warnings"]))
+
+    def test_a_quick_assessment_may_list_uncovered_use_cases(self):
+        domain = {"claims": [], "use_cases": [
+            {"id": "U1", "description": "a", "priority": "high", "source": "s"},
+            {"id": "U2", "description": "b", "priority": "medium", "source": "s"},
+            {"id": "U3", "name": "Store comparisons", "description": "c", "priority": "low", "source": "s"},
+            {"id": "U4", "description": "d", "priority": "low", "source": "s"}]}
+        bank = {"questions": [{"id": "Q1", "use_case": "U2"}]}
+        quick = {"depth": "quick", "uncovered_use_cases": ["U1", "store comparisons"]}
+        report = am.check_coverage(bank, domain, quick)
+        problems = " ".join(report["problems"])
+        self.assertIn("use case U1 has no questions: it is high priority", problems)     # still a problem
+        self.assertIn("use case U4 has no questions (a quick assessment may list it", problems)
+        self.assertNotIn("U3", problems)
+        self.assertEqual(report["notes"], ["use case U3 has no questions: listed as uncovered in meta.json "
+                                           "(quick assessment)"])
+        full = am.check_coverage(bank, domain, {"depth": "full", "uncovered_use_cases": ["U3"]})
+        self.assertIn("use case U3 has no questions", " ".join(full["problems"]))       # only a quick run may skip
+        self.assertNotIn("notes", full)
+
+    def test_check_cli_reads_meta_beside_the_bank(self):
+        d = tempfile.mkdtemp(prefix="cov-meta-")
+        self.addCleanup(shutil.rmtree, d, True)
+        domain = {"claims": [], "use_cases": [{"id": "U1", "description": "a", "priority": "high", "source": "s"},
+                                              {"id": "U2", "description": "b", "priority": "low", "source": "s"}]}
+        for name, doc in (("question_bank.json", {"model": "M", "questions": [
+                {"id": "Q1", "level": 1, "question": "q", "use_case": "U1", "expected_path": "governed_metric",
+                 "sql": "SELECT 1 FROM {{MODEL}}"}]}),
+                          ("domain_notes.json", domain),
+                          ("meta.json", {"depth": "quick", "uncovered_use_cases": ["U2"]})):
+            with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+                json.dump(doc, f)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = am.main(["check", "--bank", os.path.join(d, "question_bank.json"),
+                            "--domain", os.path.join(d, "domain_notes.json")])
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["coverage"]["problems"], [])
+        self.assertEqual(len(report["coverage"]["notes"]), 1)
+        self.assertEqual(code, 0)
 
     def test_high_priority_use_case_with_a_thin_share_is_flagged(self):
         domain = {"claims": [], "use_cases": [{"id": "U1", "description": "a", "priority": "high", "source": "s"},
@@ -1796,6 +1841,21 @@ class RoleTests(unittest.TestCase):
             {"kind": "add_column_attribute", "args": {"column": "status code", "name": "<status code as an attribute>"}}])]},
             model_id="MID")
         self.assertTrue(any("placeholder" in p for p in bad["problems"]))
+
+    def test_a_column_with_one_value_is_constant_not_a_flag_or_characteristic(self):
+        profiles = {"unused amount": {"min": "0", "max": "0", "non_blank": "900", "non_integer": None},
+                    "fixed rate": {"min": "4.5", "max": "4.5", "non_blank": "900", "non_integer": "900"},
+                    "returned flag": {"min": "0", "max": "1", "non_blank": "900", "non_integer": "0"}}
+        variation = {"entities": 100, "row_count": 900, "varying": {"unused amount": 0, "fixed rate": 0,
+                                                                     "returned flag": 40}}
+        out = {c["name"]: c for c in am.classify_roles(self.SCOPE, profiles, variation, entity="store id")}
+        self.assertEqual(out["unused amount"]["role"], "constant")
+        self.assertIn("every non-blank row is 0", out["unused amount"]["reason"])
+        (act,) = out["unused amount"]["suggested_actions"]
+        self.assertEqual(act["kind"], "rename_describe")
+        self.assertEqual(act["args"]["items"][0]["object_type"], "fact_metric")
+        self.assertIn("4.5 on every row", out["fixed rate"]["suggested_actions"][0]["args"]["items"][0]["description"])
+        self.assertEqual(out["returned flag"]["role"], "both")                      # a real 0/1 flag is unchanged
 
     def test_a_measure_held_as_an_attribute_suggests_a_fact_metric(self):
         out = {c["name"]: c for c in am.classify_roles(self.SCOPE, self._profiles(), None)}
@@ -2912,6 +2972,36 @@ class SqlLintTests(unittest.TestCase):
         self.assertIn("doesn't regroup", " ".join(res["problems"]))
         bank["questions"][0]["sql"] = bad
         self.assertTrue(any("doesn't regroup" in w for w in am.check_bank(bank)["warnings"]))
+
+    # Seen live (two tenants): a form column after another column in a GROUP BY written by name fails with
+    # MOSAIC_SQL_COLUMN_NOT_FOUND; by position, or a form first, it runs. Names generic.
+    FORM_CASES = {
+        'SELECT "status", "month__id", SUM("x") FROM t GROUP BY "status", "month__id"': ["month__id"],
+        'SELECT "status", "month__id", SUM("x") FROM t GROUP BY "month__id", "status"': [],
+        'SELECT "status", "month__id", SUM("x") FROM t GROUP BY 1, 2': [],
+        'SELECT "month__id", "status", "year", SUM("x") FROM t GROUP BY "status", "month__id", "year"': ["month__id"],
+        'SELECT "d (year)__id", "d (month)__id", SUM("x") FROM t GROUP BY "d (year)__id", "d (month)__id"':
+            ["d (month)__id"],                                            # two forms: the second fails
+        'SELECT "flag", "purpose__code", SUM("x") FROM t GROUP BY "flag", "purpose__code"': ["purpose__code"],
+        'SELECT "status", "year", SUM("x") FROM t GROUP BY "status", "year"': [],
+        'SELECT "d (month)__id", "flag", SUM("x") FROM t WHERE "d (year)__id" = 2021 GROUP BY "d (month)__id", "flag"': [],
+        'SELECT v, SUM(n) FROM (SELECT "a", "m__id" AS v, COUNT("x") AS n FROM t GROUP BY "a", "m__id") '
+        'GROUP BY v': ["m__id"],                                          # a subquery's GROUP BY too
+    }
+
+    def test_form_columns_late_in_group_by(self):
+        for sql, late in self.FORM_CASES.items():
+            got = am.form_group_by_lint(sql)
+            self.assertEqual(len(got), 1 if late else 0, sql)
+            for name in late:
+                self.assertIn(repr(name), got[0])
+        bad = 'SELECT "status", "month__id", SUM("x") FROM {{MODEL}} GROUP BY "status", "month__id"'
+        bank = {"model": "M", "questions": [{"id": "Q1", "level": 1, "question": "q", "sql": 'SELECT 1 FROM {{MODEL}}'}]}
+        res = am.set_question_sql(bank, "Q1", sql=bad, reason_kind="sql_error", reason="x")
+        self.assertFalse(res["ok"])
+        self.assertIn("GROUP BY 1, 2", " ".join(res["problems"]))
+        bank["questions"][0]["sql"] = bad
+        self.assertTrue(any("MOSAIC_SQL_COLUMN_NOT_FOUND" in w for w in am.check_bank(bank)["warnings"]))
 
     def test_weighted_average_parts_are_not_summed_rates(self):
         metrics = [{"name": "wa rate numerator", "formula": "Sum(Max({Rate}) * Max({Balance}))"},

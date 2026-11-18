@@ -129,6 +129,8 @@ each numeric attribute, and names the role the evidence points to:
 - **measure** — continuous values held only as an attribute (`add_column_fact_metric` adds a fact metric on
   the same column, in phase 3);
 - **review** — a small integer range the names don't explain: check the dictionary.
+- **constant** — one value on every non-blank row (most often all zero): no role can be read from it in this
+  data; say so in its description (`rename_describe`), and whether the source fills it elsewhere.
 
 Evidence, not a verdict: confirm each against the domain notes. Fix roles early (phase 3), before
 metrics are built on these columns.

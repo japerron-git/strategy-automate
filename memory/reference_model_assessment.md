@@ -116,6 +116,12 @@ blocks; the parser joins them).
   tenfold for agent-driven runs.
 - Sentinels ("not available" written as a number, such as -1, 99 or a run of 9s) inside scores and ratios inflate averages; check the
   profile `max` against the documented range.
+- A form column (`<attribute>__<form>`: time forms like `month__id` or `<date> (month)__id`, and code or
+  description forms) anywhere but first in a GROUP BY written by name fails with MOSAIC_SQL_COLUMN_NOT_FOUND,
+  even when it is first in the SELECT; with two form columns the second always fails. `GROUP BY 1, 2` works,
+  and so does a form column in WHERE (verified 2026-11-17/18 on two tenants). The engine's own SQL groups by
+  position or by one column. `check --bank` warns, `run` flags (`sql_warnings`), and `best-answer` /
+  `question-sql` refuse such SQL (`form_group_by_lint`).
 
 ### Which rows a query reads: anchor on a fact metric (verified 2026-11-11 on two unrelated models)
 
