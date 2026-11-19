@@ -34,6 +34,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import shlex
 import sys
 import time
@@ -1278,12 +1279,19 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
     anchor_table = _metric_table(mets_by.get(anchor) or {})
     met_out = []
     mnames = [n for n in metrics if n in mets_by]
-    for start in range(0, len(mnames), max(batch, 1)):
-        chunk = mnames[start:start + max(batch, 1)]
+    queue = [mnames[i:i + max(batch, 1)] for i in range(0, len(mnames), max(batch, 1))]
+    while queue:
+        chunk = queue.pop(0)
         log(f"probe {len(chunk)} metrics")
         plain = ", ".join(f"SUM({quote_ident(n)}) AS m{i}" for i, n in enumerate(chunk))
         wrapped = ", ".join(f"CAST(SUM({quote_ident(n)}) AS VARCHAR) AS m{i}" for i, n in enumerate(chunk))
-        tot = rows_of(ask(f"SELECT {plain} FROM {M}{base}"))  # nosec B608
+        tot_res = ask(f"SELECT {plain} FROM {M}{base}")  # nosec B608
+        tot = rows_of(tot_res)
+        if tot is None and tot_res is not None and len(chunk) > 1:
+            # one metric's error fails the whole query: probe each alone so only the failing one is marked (NUSA,
+            # 18 Nov: a compound with a constant failed a plain SUM and took five other metrics down with it)
+            queue = [[n] for n in chunk] + queue
+            continue
         tot_w = rows_of(ask(f"SELECT {wrapped} FROM {M}{base}"))  # nosec B608
         averages = [(i, n) for i, n in enumerate(chunk)
                     if (re.match(r"^\s*(\w+)\(", mets_by[n].get("formula") or "") or [None, ""])[1].lower()
@@ -1301,7 +1309,22 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             key = f"m{i}"
             item = {"name": n, "issues": [], "filter": f"{filt} = {filt_value}" if fcond else None, "partner": partner or None}
             if tot is None:
-                item["pending" if pending else "error"] = True
+                item["pending" if tot_res is None else "error"] = True
+                if tot_res is not None:   # the plain read analysts write first fails: say so, and what works instead
+                    err = str(tot_res.get("error") or "no rows")
+                    item["error_text"] = err
+                    works = [label for label, ok in (
+                        ("CAST(SUM(...))", tot_w is not None),
+                        (f"grouped by '{period}'", by_t is not None),
+                        ("AVG(...)", rows_of(ask(f"SELECT AVG({quote_ident(n)}) AS m0 FROM {M}{base}")) is not None),  # nosec B608
+                    ) if ok]
+                    item["works"] = works
+                    item["issues"].append(f"a plain SUM(...) with no GROUP BY fails: {err[:160]}"
+                                          + (f". These work: {', '.join(works)}" if works else ". No other shape tried "
+                                             "worked either")
+                                          + ". Analysts write the plain form first: fix the metric, or say in its "
+                                            "description how to read it")
+                    warnings += [f"metric '{n}': {x}" for x in item["issues"]]
                 met_out.append(item)
                 continue
             t = _num(tot[0].get(key)) if tot else None
@@ -1339,7 +1362,9 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             filled_f = [v for _, v in groups_f if v not in (None, 0)]
             kept_share = (ent_filtered / ent_total) if ent_total and ent_filtered is not None else \
                          ((filt_rows / total) if total and filt_rows is not None else None)
-            if fcond and t and f_total is not None and _close(f_total, t) and kept_share is not None \
+            # exactly the value shown: _close's display allowance (0.005) called an average that moved from 0.672 to
+            # 0.669 "the same" (NUSA, 18 Nov); a metric that ignores the filter returns the identical value
+            if fcond and t and f_total is not None and f_total == t and kept_share is not None \
                     and kept_share < 0.9 and len(filled_f) >= 2:   # one filled group = that group only, not this
                 item["issues"].append(f"ignores a filter that keeps {kept_share:.0%} of "
                                       f"{'entities' if ent_total else 'fact rows'}: same value ({t}) with and without "
@@ -1726,8 +1751,26 @@ def _is_interval(name: str, base: str) -> bool:
     return any(rest.startswith(f" ({i})") for i in TIME_INTERVALS)
 
 
+def approved_renames(findings_doc: dict | None) -> dict[str, tuple[str, str]]:
+    """{old name (casefolded): (new name, finding id)} from the rename_describe actions of findings decided to apply
+    (approved, modified, or already applied), so `references` knows a rename without two exports (NUSA, 18 Nov)."""
+    out: dict[str, tuple[str, str]] = {}
+    for f in (findings_doc or {}).get("findings") or []:
+        if f.get("status") not in ("approved", "modified", "verified", "applied") and not f.get("applied_phases"):
+            continue
+        for a in f.get("actions") or []:
+            if a.get("kind") != "rename_describe":
+                continue
+            for it in (a.get("args") or {}).get("items") or []:
+                old, new = str(it.get("current_name") or "").strip(), str(it.get("new_name") or "").strip()
+                if old and new and old.casefold() != new.casefold():
+                    out[old.casefold()] = (new, str(f.get("id")))
+    return out
+
+
 def reference_changes(old_scope: dict, new_scope: dict, *, export: dict | None = None,
-                      old_export: dict | None = None) -> list[dict[str, Any]]:
+                      old_export: dict | None = None,
+                      renames: dict[str, tuple[str, str]] | None = None) -> list[dict[str, Any]]:
     """Connector names (attributes, metrics) the old round had and this one doesn't, each with the name that
     replaced it when there is exactly one: the same object id renamed (both exports), the attribute's key
     form when a form was added (`attr` -> `attr__id`), or the plain name when forms were dropped."""
@@ -1751,6 +1794,8 @@ def reference_changes(old_scope: dict, new_scope: dict, *, export: dict | None =
             cands, how = [], ""
             if renamed.get(k) in new:
                 cands, how = [new[renamed[k]]], "the same object, renamed (export ids)"
+            elif renames and renames.get(k) and renames[k][0].casefold() in new:
+                cands, how = [new[renames[k][0].casefold()]], f"an approved rename ({renames[k][1]}, findings.json)"
             elif kind == "attributes":
                 if key_forms.get(k, "").casefold() in new:
                     cands, how = [new[key_forms[k].casefold()]], "the attribute's key form (export)"
@@ -4010,6 +4055,18 @@ def new_fact_metric_order_problems(findings: list[dict]) -> list[str]:
     return out
 
 
+def engine_commit() -> str | None:
+    """The engine clone's commit (the one this script runs from), so the phase scripts can refuse an older clone.
+    None outside a git clone or without git."""
+    try:
+        out = subprocess.run(["git", "-C", os.path.dirname(os.path.abspath(__file__)), "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = out.stdout.strip()
+    return sha if out.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", sha) else None
+
+
 def no_change(f: dict) -> bool:
     """A finding decided as "no change": an explicit empty action list (`actions: []`), not covered by another
     finding. A finding with no `actions` key at all still becomes a manual step from its recommendation."""
@@ -4881,14 +4938,17 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
             if rel in text:
                 readers.setdefault(rel, set()).add(ph["phase"])
     held = sorted(rel for rel, ps in readers.items() if ps and ps <= blocked)
-    # the id covers what the scripts will run, not only the findings: an engine change that alters a step
-    # (a new check around a manual step) must also retire the scripts made before it
-    digest = hashlib.sha256(json.dumps({"findings": [{k: f.get(k) for k in ("id", "status", "actions", "decision_note",
-                                                                         "applied_phases")} for f in every],
-                                        "phases": phases, "model_id": model_id, "statuses": list(statuses)},
+    # the id covers what the scripts will run: every phase's steps (blocks included) and the spec files they read.
+    # A finding change that alters no step (verify-changes marking findings verified, a decision note) keeps the id,
+    # so delivered scripts still run (NUSA, 18 Nov); one that alters a step, or an engine change that does, retires
+    # the scripts made before it
+    digest = hashlib.sha256(json.dumps({"phases": phases, "files": files, "copies": copies, "model_id": model_id,
+                                        "statuses": list(statuses)},
                                        sort_keys=True, default=str).encode()).hexdigest()[:12]
+    engine = engine_commit()
     return {"version": 1, "model": findings_doc.get("model"), "model_id": model_id or None,
             "generated": time.strftime("%Y-%m-%d"), "statuses_planned": list(statuses), "plan_id": digest,
+            **({"engine_commit": engine} if engine else {}),
             "bundle_dir": bundle, "copies": copies,
             "phases": phases, "files": files, **({"files_held": held} if held else {}),
             "not_planned": skipped, "problems": problems,
@@ -5266,7 +5326,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--metrics", help="comma-separated names (default: every metric)")
     sp.add_argument("--changed-since", help="previous scope.json: probe only what changed since (verify-changes)")
     sp.add_argument("--findings", help="findings.json: also probe objects named by actions of --phases")
-    sp.add_argument("--phases", default="", help="comma-separated phases applied this round")
+    sp.add_argument("--phases", nargs="*", default=[],
+                    help="phases applied this round: 3,4,6 or 3 4 6 (both were written; NUSA, 18 Nov)")
     sp.add_argument("--probe-all-changed", action="store_true",
                     help="probe every changed attribute (default: forms of a probed attribute, a new date's time "
                          "attributes other than (year), and numeric attributes with more than 50 values are "
@@ -5366,7 +5427,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--model-export", help="this round's export: the key form a plain name became")
     sp.add_argument("--old-model-export", help="the previous round's export: objects renamed (same id)")
     sp.add_argument("--apply", action="store_true", help="rewrite the SQL (reason kind model_change) in --bank")
-    sp.add_argument("--findings", help="findings.json: report which earlier name findings are resolved")
+    sp.add_argument("--findings", help="findings.json: report which earlier name findings are resolved; its "
+                                       "approved rename_describe renames count as replacements (no export needed)")
     sp.add_argument("--round", type=int)
     sp.add_argument("--out", required=True)
 
@@ -5516,7 +5578,7 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
         attrs = [x.strip() for x in args.attributes.split(",") if x.strip()] if args.attributes else None
         mets = [x.strip() for x in args.metrics.split(",") if x.strip()] if args.metrics else None
         if args.changed_since or args.findings:
-            phases = [int(p) for p in args.phases.split(",") if p.strip().isdigit()]
+            phases = [int(p) for p in re.split(r"[,\s]+", " ".join(args.phases or [])) if p.strip().isdigit()]
             changed = changed_objects(_load_json(args.changed_since) if args.changed_since else None, scope,
                                       _load_json(args.findings) if args.findings else None, phases or None)
             attrs = changed["attributes"] if attrs is None else attrs
@@ -5683,8 +5745,10 @@ def _offline(args: argparse.Namespace) -> int:
         return _check_lookup_cmd(args)
     if args.cmd == "references":
         old, new, bank = _load_json(args.old_scope), _load_json(args.scope), _load_json(args.bank)
+        findings_doc = _load_json(args.findings) if getattr(args, "findings", None) else None
         changes = reference_changes(old, new, export=_load_json(args.model_export) if args.model_export else None,
-                                    old_export=_load_json(args.old_model_export) if args.old_model_export else None)
+                                    old_export=_load_json(args.old_model_export) if args.old_model_export else None,
+                                    renames=approved_renames(findings_doc))
         usage = apply_reference_changes(bank, changes, round_no=args.round, apply=args.apply)
         dchanges = date_filter_changes(old, new)
         dates = apply_date_filter_changes(bank, dchanges, round_no=args.round, apply=args.apply)
@@ -5778,6 +5842,7 @@ def _offline(args: argparse.Namespace) -> int:
         if bad:
             print(json.dumps({"ok": False, "problems": [f"unknown status {bad}"]}, indent=2))
             return 2
+        before_id = (_load_json(args.out) or {}).get("plan_id") if os.path.isfile(args.out) else None
         out = build_plan(_load_json(args.findings), model_id=args.model_id, statuses=statuses,
                          python=args.python, quoting=args.quoting, project=args.project, bank=args.bank,
                          bundle_dir=args.bundle_dir or (f"{BUNDLE_ROOT}/{slug}"
@@ -5797,7 +5862,14 @@ def _offline(args: argparse.Namespace) -> int:
             if dest.startswith(base + os.sep) and os.path.exists(src):
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 shutil.copyfile(src, dest)
-        print(json.dumps({"ok": not out["problems"], "out": args.out, "phases": [p["phase"] for p in out["phases"]],
+        id_note = ("new plan" if before_id is None else
+                   "plan_id unchanged: scripts already delivered for this plan still run" if before_id == out["plan_id"]
+                   else f"plan_id changed ({before_id} -> {out['plan_id']}): nothing is left to run, so the scripts "
+                        f"made before now refuse, as they should (their phases are applied)" if not out["phases"]
+                   else f"plan_id changed ({before_id} -> {out['plan_id']}): the steps changed, so scripts made before "
+                        f"refuse to run; deliver the new ones (plan_id.txt included)")
+        print(json.dumps({"ok": not out["problems"], "out": args.out, "plan_id": out["plan_id"], "plan_id_note": id_note,
+                          "phases": [p["phase"] for p in out["phases"]],
                           "steps": sum(len(p["steps"]) for p in out["phases"]), "files": sorted(out.get("files") or {}),
                           "problems": out["problems"], "warnings": out["warnings"]}, indent=2))
         return 1 if out["problems"] else 0

@@ -112,3 +112,17 @@ class GroupedNumberKeyTests(unittest.TestCase):
         self.assertEqual(svm.key_for({"y": "2,015"}, ["y"]), ("2015",))
         self.assertEqual(svm.key_for({"y": "Smith, John"}, ["y"]), ("Smith, John",))
         self.assertEqual(svm.key_for({"y": "1,234,567.5"}, ["y"]), ("1234567.5",))
+
+
+class DisplayRoundingTests(unittest.TestCase):
+    # NUSA (2026-11-18): the connector shows a governed metric rounded to 3 decimals; a best answer computed as a
+    # decimal comes back at full precision, so equal answers failed the default 1e-6 (Q23: 68.473 vs 68.4732590)
+    def test_a_value_shown_with_three_decimals_matches_within_its_rounding(self):
+        cmp = lambda a, b: svm.compare_rows([{"v": a}], [{"v": b}], [], ["v"], 1e-6, "q")["status"]
+        self.assertEqual(cmp("68.473", "68.4732590"), "ok")
+        self.assertEqual(cmp("0.672", "0.6724999"), "ok")
+        self.assertEqual(cmp("1,234.5", "1234.5004"), "ok")
+        self.assertEqual(cmp("68.473", "68.4741"), "mismatch")          # more than half the 3rd decimal apart
+        self.assertEqual(cmp("68", "68.0004"), "mismatch")              # whole numbers are not loosened
+        self.assertEqual(cmp("68.4736", "68.4732590"), "mismatch")      # 4 decimals: not the connector rounding
+        self.assertEqual(cmp(68.473, 68.473259), "mismatch")            # numbers, not text: no display to go by

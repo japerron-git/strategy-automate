@@ -350,6 +350,16 @@ Not yet verified: PreviousDay / Week / Quarter and Month / QuarterToDate (`check
 metrics; Strategy documents simple aggregates only, and unsupported cases can return null or partial values with
 no error). The command warns when the source is derived.
 
+## 0f. Constants in compound metrics (verified live 2026-11-18, two tenants)
+
+A numeric constant multiplying a fact metric inside a ratio breaks the plain ungrouped read:
+`(100 * {A}) / {B}` and `({A} * 100) / {B}` fail `SELECT SUM("<metric>") FROM <model>` (no GROUP BY) with
+MOSAIC_INTERNAL "Invalid node. Output column dependencies ([sum::[double]]) not in source plan output ([])".
+Grouped queries, `AVG(...)` and `CAST(SUM(...))` read it. `100 * [ratio metric]` and `100 * ({A} / {B})` work
+ungrouped and return the same values grouped. A constant in a subtraction over compounds (`1 - (...)`, CPR)
+works. So put the constant outside the ratio. Reported to the user as a Mosaic planner defect (probe 5,
+scratch model; NUSA 'event lift % (points)').
+
 ## 1. Compound metric — ratio of two metrics
 
 User example: `Avg({Competitor Lowest Price USD}) / Avg({Market Average Price USD})`.

@@ -62,6 +62,10 @@ class WriteTests(unittest.TestCase):
                              [(f"{MP}/attributes/S1", {"information": {"description": "Promotion start month."}})])
             self.assertTrue(any("time attribute ('Month', objectId S1) of date attribute 'Start Date'" in n
                                 for n in notes))
+        report = bm.rename_describe_report(writes, notes + ["Region: unchanged"], False)
+        self.assertEqual(report["skipped"], ["Region: unchanged"])           # only items not written
+        self.assertTrue(report["notes"] and all("time attribute" in n for n in report["notes"]))
+        self.assertEqual(report["changed"], [writes[0][0]])
         err = io.StringIO()
         with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
             bm.rename_describe_writes(model, "M1", bm.rename_describe_items(

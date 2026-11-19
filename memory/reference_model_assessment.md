@@ -116,6 +116,13 @@ blocks; the parser joins them).
   tenfold for agent-driven runs.
 - Sentinels ("not available" written as a number, such as -1, 99 or a run of 9s) inside scores and ratios inflate averages; check the
   profile `max` against the documented range.
+- **A compound metric with a numeric constant on a fact metric inside a ratio fails a plain query.**
+  `(100 * {A}) / {B}` and `({A} * 100) / {B}` return MOSAIC_INTERNAL "Invalid node. Output column dependencies
+  ([sum::[double]]) not in source plan output ([])" for `SELECT SUM("<metric>")` with no GROUP BY, on two
+  tenants; grouped, `AVG(...)` and `CAST(SUM(...))` read it. `100 * [ratio metric]` and `100 * ({A} / {B})`
+  work ungrouped and give the same values (verified 2026-11-18, probe 5, scratch model; NUSA F015). Write the
+  constant outside the ratio. `probe` now reports a metric whose plain SUM fails (issue + warning naming the
+  error and the shapes that work), and probes it alone so the other metrics of its query aren't marked failed.
 - **Form columns have two names.** `get_semantics` lists a form as `<attribute>__<form>` (`month__id`,
   `<date> (month)__id`, `<code>__description`); the engine's own column is `<attribute> (<form>)` (`month (id)`,
   `<date> (month) (id)`), which `SHOW COLUMNS FROM "<model>"` lists (through the `query` tool, with each
@@ -275,7 +282,10 @@ model probably cannot answer.
 ## Grading rubric (per question)
 
 - **Verdict:** `pass` (matches the expected value within tolerance), `fail`, `error` (query
-  failed), `empty` (no rows on either side), `ungraded` (no expected value).
+  failed), `empty` (no rows on either side), `ungraded` (no expected value). The connector shows a governed
+  metric rounded to 3 decimals: when one side shows 1-3 decimals and the other more, they match within half
+  the 3rd decimal (0.0005), whatever the relative tolerance (`within_display_rounding`; NUSA Q23 68.473 vs
+  68.4732590). Whole numbers are not loosened.
 - **Expected-value strength:** `reference` (trusted source) > `recomputed` (independent extract) >
   `same_model` (raw columns of the same model — consistency only).
 - **Answer path:** `governed_metric` (a metric answers it directly), `simple_sql` (metrics plus
@@ -414,7 +424,13 @@ the whole bank as regression.
 **Answers are enforced per phase.** A finding still `proposed` blocks the phases of its actions, or its
 own phase when it has none, wherever it came from (assessment, verification, a check): `plan` gives the
 phase `blocked_by` and no script is generated for it until the finding is answered. `plan_id` marks a
-plan; scripts made from an older plan refuse to run.
+plan; scripts made from an older plan refuse to run. It hashes what the scripts run (every phase's steps,
+blocks included, the spec files and lookup copies), not every finding field: a change that alters no step
+(a decision note, findings marked verified while other phases still run the same steps) keeps it; `plan`
+says whether it changed and why (`plan_id_note`). The plan also records `engine_commit` (outside the id),
+and every phase script stops before any step when its clone doesn't contain that commit
+(`git merge-base --is-ancestor`), telling the user to `git pull` with no remote name (NUSA, 18 Nov: a clone
+two commits behind refused what the plan needed; its remote was `fork`, not `origin`).
 
 **Test outcomes every round, not edits.** Tables and attributes change in too many ways to predict, so
 each round (assessment and every verification) tests two outcomes:
@@ -588,6 +604,10 @@ label column is listed as an attribute that no metric filters on.
 - **Spec files held back:** a spec file (`specs/*.json`) that only blocked phases read is listed under
   `files_held` in the plan and isn't written into the bundle until those phases are answered (the plugin's
   script writer already skipped them; `plan` now does too).
+- **`references` and approved renames:** with `--findings`, the `rename_describe` renames of findings that
+  are approved, modified or applied count as replacements (no export needed), so the bank SQL is rewritten
+  and no N- finding is raised for them. A rename meant to steer a question to another metric still needs the
+  question's SQL rewritten by hand.
 - **`rename_describe` and time attributes:** Studio's time attributes (`month__id`, `<date> (month)__id`) are
   `smartAttributes` of their date attribute, not top-level attributes. `rename-describe` finds them by name,
   form name or objectId and sets the description with `PATCH .../attributes/<time attribute id>`

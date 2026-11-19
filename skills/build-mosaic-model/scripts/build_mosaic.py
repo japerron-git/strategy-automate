@@ -7085,6 +7085,14 @@ def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[li
     return writes, notes
 
 
+def rename_describe_report(writes: list, notes: list[str], dry_run: bool) -> dict[str, Any]:
+    """"skipped" holds only items not written (unchanged, renamed already); the rest of the notes (a form described
+    on its attribute, a time attribute) go under "notes", so nothing reads as both written and skipped (NUSA, 18 Nov)."""
+    skipped = [n for n in notes if n.endswith(": unchanged") or ": already renamed to " in n]
+    return {"ok": True, "dry_run": dry_run, "changed": [w[0] for w in writes], "skipped": skipped,
+            "notes": [n for n in notes if n not in skipped]}
+
+
 def cmd_rename_describe(m: MSTR, args):
     """Rename attributes, fact metrics and derived metrics and/or set their descriptions, by name, in one
     changeset."""
@@ -7101,8 +7109,7 @@ def cmd_rename_describe(m: MSTR, args):
         print(f"  ~ {w[0]}", file=sys.stderr)
     if writes and not args.dry_run:
         _patch_in_changeset(m, writes, "rename-describe")
-    print(json.dumps({"ok": True, "dry_run": bool(args.dry_run), "changed": [w[0] for w in writes],
-                      "skipped": notes}, indent=2))
+    print(json.dumps(rename_describe_report(writes, notes, bool(args.dry_run)), indent=2))
 
 
 TIME_INTERVALS = ("year", "quarter", "month", "week", "day")   # seen live on a date attribute (smartAttributeType "<x>_interval")

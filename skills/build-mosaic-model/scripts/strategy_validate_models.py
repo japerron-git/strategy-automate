@@ -253,6 +253,28 @@ def index_rows(rows: list[dict[str, Any]], key_cols: list[str], label: str) -> t
     return indexed, duplicates
 
 
+CONNECTOR_DECIMALS = 3   # the Mosaic connector shows a metric's value rounded to 3 decimals
+
+
+def _shown_decimals(value: Any) -> int | None:
+    """Decimals in a value as the connector printed it ('68.473' -> 3), None for a non-text value."""
+    if not isinstance(value, str):
+        return None
+    m = re.fullmatch(r"\s*-?[\d,]*\.(\d+)\s*", value)
+    return len(m.group(1)) if m else 0 if re.fullmatch(r"\s*-?[\d,]+\s*", value) else None
+
+
+def within_display_rounding(a: Any, b: Any, av: float, bv: float) -> bool:
+    """Equal once the side shown with 1-3 decimals (a governed metric, rounded by the connector) is taken as
+    rounded: the other side shows more decimals, and they differ by no more than half the 3rd decimal (NUSA, 18 Nov:
+    68.473 vs 68.4732590). Whole numbers are not loosened."""
+    da, db = _shown_decimals(a), _shown_decimals(b)
+    if da is None or db is None or da == db:
+        return False
+    coarse = min(da, db)
+    return 1 <= coarse <= CONNECTOR_DECIMALS and abs(av - bv) <= 0.5 * 10 ** -CONNECTOR_DECIMALS + 1e-12
+
+
 def compare_rows(model_rows: list[dict[str, Any]], reference_rows: list[dict[str, Any]],
                  key_cols: list[str], measure_cols: list[str], tolerance: float,
                  query_name: str, allow_empty: bool = False) -> dict[str, Any]:
@@ -289,6 +311,9 @@ def compare_rows(model_rows: list[dict[str, Any]], reference_rows: list[dict[str
             else:
                 rel = abs(mv - rv) / max(abs(mv), abs(rv), 1.0)
             worst = max(worst, rel)
+            if rel > tolerance and mv is not None and rv is not None \
+                    and within_display_rounding(mrow.get(col), rrow.get(col), mv, rv):
+                rel = 0.0
             if rel > tolerance:
                 deltas.append({
                     "key": list(key) if isinstance(key, tuple) else key,

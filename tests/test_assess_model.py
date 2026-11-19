@@ -20,6 +20,7 @@ import stat
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SKILL = os.path.join(ROOT, "skills", "strategy-model-assessment")
@@ -2161,6 +2162,64 @@ class ProbeTests(unittest.TestCase):
         self.assertTrue(any("truncated (746 for 746.868)" in x and "(bigint)" in x for x in issues["avg score"]))
         self.assertEqual(issues["net sales"], [])
 
+    def test_an_average_that_moves_a_little_with_the_filter_does_not_ignore_it(self):
+        # NUSA (18 Nov): 'bill back rate amount' 0.672 unfiltered vs 0.669 filtered was called "same value"
+        scope = dict(self.SCOPE, metrics=[{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
+                                          {"name": "avg rate", "type": "double", "formula": "avg(t.csv.{RATE})"}])
+
+        def run(filtered_rate):
+            def answer(sql):
+                flt = "\"latest flag\" = 'Y'" in sql
+                if sql.startswith("SELECT CAST(COUNT(*) AS VARCHAR) AS n FROM (SELECT"):
+                    return [["n"], ["40" if flt else "100"]]                # the filter keeps 40% of stores
+                if sql.startswith("SELECT SUM(") or sql.startswith("SELECT CAST(SUM("):
+                    return [["m0", "m1"], ["400", filtered_rate] if flt else ["1000", "0.672"]]
+                if sql.startswith("SELECT AVG("):
+                    return [["m1"], [filtered_rate if flt else "0.672"]]
+                if sql.startswith('SELECT CAST("latest flag" AS VARCHAR) AS g, SUM('):
+                    return [["g", "m0", "m1"], ["N", "600", "0.70"], ["Y", "400", filtered_rate]]
+                if sql.startswith('SELECT CAST("') and "AS g" in sql and "SUM(" in sql:
+                    return [["g", "m0", "m1"]]
+                return self.answer(sql)
+            out = am.probe_objects(_SqlRunner(answer), "retail", scope, period="period", attributes=[])
+            return " | ".join({m["name"]: m for m in out["metrics"]}["avg rate"]["issues"])
+        self.assertNotIn("ignores a filter", run("0.669"))
+        self.assertIn("ignores a filter that keeps 40%", run("0.672"))       # the identical value: still caught
+
+    def test_a_metric_whose_plain_sum_fails_is_isolated_and_reported(self):
+        # NUSA (18 Nov): a compound with a constant failed SELECT SUM(...) with no GROUP BY (MOSAIC_INTERNAL "Invalid
+        # node...") while grouped, CAST(SUM) and AVG worked; it took the other metrics of its query down with it
+        scope = dict(self.SCOPE, metrics=[{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
+                                          {"name": "lift points", "type": "double", "formula": "(100 * {a}) / {b}"},
+                                          {"name": "units", "type": "double", "formula": "sum(t.csv.{UNITS})"}])
+        err = 'MOSAIC_INTERNAL: Invalid node. Output column dependencies ([sum::[double]]) not in source plan output ([])'
+
+        def answer(sql):
+            if sql.startswith("SELECT SUM(") and '"lift points"' in sql and "GROUP BY" not in sql:
+                return err
+            if sql.startswith("SELECT SUM("):
+                cols = re.findall(r"AS (m\d+)", sql)
+                return [cols, ["1000"] * len(cols)]
+            if sql.startswith("SELECT CAST(SUM("):
+                cols = re.findall(r"AS (m\d+)", sql)
+                return [cols, ["1000"] * len(cols)]
+            if sql.startswith("SELECT AVG("):
+                return [["m0"], ["4.5"]]
+            if sql.startswith('SELECT CAST("') and "AS g" in sql:
+                cols = re.findall(r"AS (m\d+)", sql)
+                return [["g"] + cols]
+            return self.answer(sql)
+        out = am.probe_objects(_ErrRunner(answer), "retail", scope, period="period", attributes=[])
+        mets = {m["name"]: m for m in out["metrics"]}
+        self.assertNotIn("error", mets["net sales"])                       # no longer taken down by its neighbour
+        self.assertNotIn("error", mets["units"])
+        lift = mets["lift points"]
+        self.assertTrue(lift["error"])
+        self.assertIn("Invalid node", lift["error_text"])
+        self.assertEqual(lift["works"], ["CAST(SUM(...))", "grouped by 'period'", "AVG(...)"])
+        self.assertTrue(any(w.startswith("metric 'lift points': a plain SUM(...) with no GROUP BY fails")
+                            and "These work: CAST(SUM(...)), grouped by 'period', AVG(...)" in w for w in out["warnings"]))
+
     def test_needs_an_anchor(self):
         with self.assertRaises(SystemExit):
             am.probe_objects(_SqlRunner(self.answer), "retail", dict(self.SCOPE, anchor=None))
@@ -2749,6 +2808,30 @@ class ReferenceChangeTests(unittest.TestCase):
         with open(paths["bank"], encoding="utf-8") as f:
             self.assertIn("status code__id", json.load(f)["questions"][0]["sql"])
 
+    def test_approved_renames_are_replacements_without_an_export(self):
+        # NUSA (18 Nov): two approved F004 renames were reported "no replacement found" and raised N- findings
+        old = {"model": "M", "attributes": [], "metrics": [{"name": "forecasted units"}, {"name": "sales"}]}
+        new = {"model": "M", "attributes": [], "metrics": [{"name": "forecasted incremental units"}, {"name": "sales"}]}
+        findings = {"findings": [
+            {"id": "F004", "status": "approved", "applied_phases": [6], "actions": [{"kind": "rename_describe", "args": {
+                "items": [{"object_type": "fact_metric", "current_name": "forecasted units",
+                           "new_name": "forecasted incremental units"}]}}]},
+            {"id": "F009", "status": "declined", "actions": [{"kind": "rename_describe", "args": {
+                "items": [{"object_type": "fact_metric", "current_name": "sales", "new_name": "gross sales"}]}}]}]}
+        renames = am.approved_renames(findings)
+        self.assertEqual(renames, {"forecasted units": ("forecasted incremental units", "F004")})   # declined: no
+        (c,) = am.reference_changes(old, new, renames=renames)
+        self.assertEqual((c["replacement"], c["how"]), ("forecasted incremental units",
+                                                        "an approved rename (F004, findings.json)"))
+        bank = {"model": "M", "questions": [{"id": "Q3", "question": "q", "level": 1,
+                                             "sql": 'SELECT SUM("forecasted units") FROM {{MODEL}}'}]}
+        usage = am.apply_reference_changes(bank, [c], round_no=2, apply=True)
+        self.assertEqual(usage["unresolved"], [])
+        self.assertIn('"forecasted incremental units"', bank["questions"][0]["sql"])
+        self.assertEqual(am.reference_findings([c], usage, 2), [])                 # no N- finding to answer
+        (bare,) = am.reference_changes(old, new)
+        self.assertIsNone(bare["replacement"])                                       # without findings: as before
+
 
 class _ErrRunner(_SqlRunner):
     def call(self, tool, args):
@@ -2966,6 +3049,54 @@ class PhaseGateTests(unittest.TestCase):
         doc["findings"][1]["status"] = "declined"                          # answered: the spec is written
         plan = am.build_plan(doc, model_id="MID", bundle_dir="ignore/apply/m")
         self.assertNotIn("files_held", plan)
+
+    def test_the_plan_id_follows_the_steps_not_every_finding_field(self):
+        # NUSA (18 Nov): plan after verify-changes changed the id though no script changed
+        doc = self._doc()
+        plan = am.build_plan(doc, model_id="MID")
+        doc["findings"][0]["decision_note"] = "approved after review"           # no step changes
+        self.assertEqual(am.build_plan(doc, model_id="MID")["plan_id"], plan["plan_id"])
+        doc["findings"][0]["actions"][0]["args"]["object_id"] = "Y"                # a step changes
+        self.assertNotEqual(am.build_plan(doc, model_id="MID")["plan_id"], plan["plan_id"])
+        d = tempfile.mkdtemp(prefix="planid-")
+        self.addCleanup(shutil.rmtree, d, True)
+        fpath, out = os.path.join(d, "findings.json"), os.path.join(d, "change_plan.json")
+        with open(fpath, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        notes = []
+        for _ in range(2):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                am.main(["plan", "--findings", fpath, "--model-id", "MID", "--out", out, "--bundle-dir", "b"])
+            notes.append(json.loads(buf.getvalue())["plan_id_note"])
+        self.assertEqual(notes, ["new plan", "plan_id unchanged: scripts already delivered for this plan still run"])
+        for f in doc["findings"]:                                                  # every phase applied and verified
+            f["status"] = "verified"
+        with open(fpath, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            am.main(["plan", "--findings", fpath, "--model-id", "MID", "--out", out, "--bundle-dir", "b"])
+        self.assertIn("nothing is left to run", json.loads(buf.getvalue())["plan_id_note"])
+
+    def test_probe_takes_phases_as_a_comma_or_space_list(self):
+        # NUSA (18 Nov): verify-changes' text showed "--phases 3 4 6"; the engine took only "3,4,6"
+        parser = am.build_parser()
+        for argv in (["3,4,6"], ["3", "4", "6"], ["3,", "4", "6"]):
+            args = parser.parse_args(["probe", "--project", "p", "--scope", "s.json", "--out", "o.json", "--phases"] + argv)
+            self.assertEqual([int(p) for p in re.split(r"[,\s]+", " ".join(args.phases)) if p.strip().isdigit()],
+                             [3, 4, 6])
+
+    def test_the_plan_records_the_engine_commit_outside_its_id(self):
+        sha = "a" * 40
+        with unittest.mock.patch.object(am, "engine_commit", return_value=sha):
+            plan = am.build_plan(self._doc(), model_id="MID")
+        self.assertEqual(plan["engine_commit"], sha)
+        with unittest.mock.patch.object(am, "engine_commit", return_value=None):
+            other = am.build_plan(self._doc(), model_id="MID")
+        self.assertNotIn("engine_commit", other)
+        self.assertEqual(other["plan_id"], plan["plan_id"])        # a new engine commit alone doesn't retire scripts
+        self.assertRegex(am.engine_commit() or "a" * 40, r"^[0-9a-f]{40}$")
 
     def test_unanswered_findings_block_their_phase(self):
         plan = am.build_plan(self._doc(), model_id="MID")
