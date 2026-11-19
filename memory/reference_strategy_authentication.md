@@ -80,7 +80,9 @@ Tenant requirements: CORS must allow the page origin (`http://127.0.0.1:8753`) w
   Allow). `MSTR_SESSION_CACHE=0` forces a fresh sign-in. A refused cached session is now reported ("[auth] the cached
   session was refused (HTTP n, saved m min ago)"), so a run shows whether the cache was missing or refused.
   `strategy_auth.py methods` reports `configured_method` and, under `auto_would_use`, "cached" only when a session is
-  cached (it said "cached" whenever caching was on).
+  cached (it said "cached" whenever caching was on). First live evidence (2026-11-18, Windows, file store): a cached
+  session saved 552 min earlier was reused until the server refused it (HTTP 401), then the browser was asked once,
+  so the cache works there; the earlier "browser every step" runs fit an explicit sso method.
 - `auto` never falls through to a browser sign-in where nobody can answer it (`CI`, `MSTR_NO_BROWSER=1`, Linux without a display) — it fails fast naming `MSTR_API_TOKEN` / `MSTR_USER` + `MSTR_PASSWORD`. `MSTR_LOGIN_MODE=4096` with the token in `MSTR_USER` still works.
 - The file secret store (no Keychain / libsecret) is locked across read-modify-write, so parallel commands don't drop each other's entries.
 

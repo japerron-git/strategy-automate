@@ -589,10 +589,12 @@ label column is listed as an attribute that no metric filters on.
   `files_held` in the plan and isn't written into the bundle until those phases are answered (the plugin's
   script writer already skipped them; `plan` now does too).
 - **`rename_describe` and time attributes:** Studio's time attributes (`month__id`, `<date> (month)__id`) are
-  `smartAttributes` of their date attribute, not top-level attributes. `rename-describe` names them in its
-  problem list (name, objectId, base attribute) instead of "not found", and refuses them: no REST write for a
-  time attribute's name or description is verified yet (probe 4 on the scratch model tries three). Set them in
-  Studio meanwhile. `current_name` may also be an objectId.
+  `smartAttributes` of their date attribute, not top-level attributes. `rename-describe` finds them by name,
+  form name or objectId and sets the description with `PATCH .../attributes/<time attribute id>`
+  `{"information": {"description": ...}}` (verified live 2026-11-18, probe 4 on the scratch model: read back,
+  and the connector showed it on the `__id`, `__start` and `__desc` columns with no republish; re-certify).
+  Renaming a time attribute is refused (not verified; it changes every connector name of its forms).
+  `current_name` may also be an objectId.
 - **No change** (`actions: []`): a finding decided as "leave the model as it is" (ignore, assume correct).
   `plan` writes a note for it, not a manual step; a phase with nothing else to run gets no republish or
   re-certify, and its script only shows the notes and exits 0. A finding with no `actions` key at all still

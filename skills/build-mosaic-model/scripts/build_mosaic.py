@@ -6969,9 +6969,8 @@ def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[li
     A connector form name ('<attribute>__<form>', '<attribute> (<form>)') describes its attribute: a form has
     no description of its own, and the connector shows the attribute's on every form. A form name can't be
     renamed here. `current_name` may also be the object's objectId. A Studio time attribute (a smartAttribute of a
-    date attribute, e.g. 'month__id') is named in the problem list with its objectId and base attribute: there is no
-    verified write for it yet. Every item is checked before anything is written, and all problems are reported
-    together."""
+    date attribute, e.g. 'month__id') gets its description by PATCH on its own id (verified live 2026-11-18); renaming
+    one is refused. Every item is checked before anything is written, and all problems are reported together."""
     pools = {"attribute": ("attributes", model.get("attributes") or []),
              "fact_metric": ("factMetrics", model.get("factMetrics") or []),
              "metric": ("metrics", model.get("metrics") or [])}   # derived metrics: a full-body PUT, see below
@@ -6989,6 +6988,7 @@ def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[li
                 if key:
                     smart[key] = (sa, a)
     writes, notes, problems = [], [], []
+    smart_ids: set[str] = set()
     for it in [x for x in items if x["object_type"] == "model"][:1]:
         current = str((model.get("information") or {}).get("description") or "")
         if current == str(it["description"]):
@@ -7016,11 +7016,16 @@ def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[li
             if hit is not None:
                 sa, base = hit
                 si = sa.get("information") or {}
-                problems.append(f"'{cur}' is a time attribute ('{si.get('name') or sa.get('name')}', objectId "
-                                f"{si.get('objectId')}) of date attribute '{(base.get('information') or {}).get('name')}':"
-                                f" rename-describe can't write time attributes yet (no verified REST call). Set its "
-                                f"name or description in Studio and leave this item out")
-                continue
+                label = (f"'{cur}' is a time attribute ('{si.get('name') or sa.get('name')}', objectId "
+                         f"{si.get('objectId')}) of date attribute '{(base.get('information') or {}).get('name')}'")
+                if it["new_name"]:
+                    problems.append(f"{label}: renaming a time attribute isn't verified (it changes every connector "
+                                    f"name of its forms); rename it in Studio, or leave new_name out")
+                    continue
+                o, via_form = sa, False
+                smart_ids.add(str(si.get("objectId") or ""))
+                notes.append(f"{label}: its description is set on it (PATCH, verified live) and the connector shows "
+                             f"it on every form")
         if o is None:
             if it["new_name"] and it["new_name"].casefold() in names:
                 notes.append(f"{cur}: already renamed to '{it['new_name']}'")
@@ -7066,6 +7071,10 @@ def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[li
         what = " + ".join(x for x in ((f"rename -> '{name}'" if name != info["name"] else ""),
                                        ("description" if desc != info.get("description", "") else "")) if x)
         body = {"information": {"name": name, "description": desc}}
+        if info["objectId"] in smart_ids:
+            # a time attribute: PATCH /attributes/<its id> with the description only, as verified live 2026-11-18
+            # (scratch model; the connector showed it on the __id, __start and __desc columns, no republish)
+            body = {"information": {"description": desc}}
         if kind == "metric":
             body["_full_put"] = True   # a derived metric takes no PATCH: its whole body is read and PUT back
         writes.append((f"{kind} '{info['name']}': {what}",

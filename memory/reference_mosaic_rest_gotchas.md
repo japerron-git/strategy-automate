@@ -112,6 +112,16 @@ the `>` comparison work in formula attributes.
 ## Hierarchies endpoint absent on some Library builds
 - `POST /api/model/dataModels/{id}/hierarchies` AND `…/userHierarchies` → 404 `8004cc04` on a Strategy ONE Cloud tenant (2026-06-11). Auto-hierarchy drill objects cannot be created via REST there; relationships alone still drive drill. `cmd_build` logs a WARN and continues — treat the WARN as expected on this build family.
 
+## Time attributes (smartAttributes)
+
+- Studio's time attributes ('<date> (Month)', or a bare 'Month') are `smartAttributes` of their date attribute in the
+  export, not top-level attributes. `PUT .../attributes/<date attribute>/smartAttributes` replaces the whole set
+  (`add-time-attributes`).
+- A time attribute's description: `PATCH /api/model/dataModels/<model>/attributes/<time attribute id>` with
+  `{"information": {"description": "..."}}` in a changeset. HTTP 200, read back in the export, and the connector
+  showed it on all three form columns (`__id`, `__start`, `__desc`) right after commit + certify, no republish
+  (verified 2026-11-18, scratch model). Renaming one this way is not tried.
+
 ## Fact metrics (custom formulas)
 - `POST /api/model/dataModels/{id}/factMetrics` with `text`-only expression is rejected. Provide tokens:
   ```json
