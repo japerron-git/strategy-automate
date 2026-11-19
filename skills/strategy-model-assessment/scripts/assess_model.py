@@ -284,7 +284,8 @@ def parse_query_result(result: dict) -> dict[str, Any]:
     return {"ok": False, "columns": [], "rows": [], "error": f"no result table in reply: {stripped[:300]}"}
 
 
-_SEM_LINE = re.compile(r"^- \*\*(?P<name>.+?)\*\* \((?P<type>[^)]*)\)(?::\s*(?P<desc>.*))?$")
+# the type may hold its own parentheses: timestamp(0), decimal(18,2) (NUSA item 48: a "(timestamp(0))" line was dropped)
+_SEM_LINE = re.compile(r"^- \*\*(?P<name>.+?)\*\* \((?P<type>[^()]*(?:\([^()]*\)[^()]*)*)\)(?::\s*(?P<desc>.*))?$")
 
 
 def parse_semantics(text: str) -> dict[str, list[dict[str, Any]]]:
@@ -303,7 +304,11 @@ def parse_semantics(text: str) -> dict[str, list[dict[str, Any]]]:
             continue
         m = _SEM_LINE.match(line.strip())
         if m and section:
-            last = {"name": m.group("name"), "type": m.group("type"), "description": (m.group("desc") or "").strip()}
+            typ = m.group("type").strip()
+            base = re.sub(r"\(.*\)$", "", typ).strip()   # the checks compare base types (timestamp, decimal)
+            last = {"name": m.group("name"), "type": base, "description": (m.group("desc") or "").strip()}
+            if base != typ:
+                last["type_full"] = typ
             out[section].append(last)
             continue
         if section == "metrics" and last is not None and line.strip() and "formula" not in last \
@@ -516,6 +521,7 @@ def _profile_rows(runner: Runner, project: str, model: str, names: list[str], wh
 
 def scope_model(runner: Runner, project: str, model: str, *, profile: bool = True, where: str = "",
                 sample_max: int = 30, max_attributes: int = 200, profile_batch: int = 8,
+                reuse_from: dict | None = None,
                 log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
     sem_result = runner.call("get_semantics", {"project": project, "model": model})
     if sem_result.get("isError"):
@@ -534,7 +540,16 @@ def scope_model(runner: Runner, project: str, model: str, *, profile: bool = Tru
         out["anchor"] = choose_anchor(runner, project, model, semantics["metrics"], where, profile_batch)
         out["maturity"] = maturity_signals(out)
         return out
-    todo = semantics["attributes"][:max_attributes]
+    # a time attribute's __start timestamp holds the same periods as its __id: not profiled (replay cost, item 32)
+    starts = {c["name"] for cols in time_attribute_columns(semantics["attributes"]).values() for c in cols
+              if c["name"].lower().endswith("__start")}
+    for a in semantics["attributes"]:
+        if a["name"] in starts:
+            a["profile"] = {"skipped": "a time attribute's start timestamp: same periods as its __id"}
+    todo = [a for a in semantics["attributes"] if a["name"] not in starts][:max_attributes]
+    if reuse_from:   # verify-changes after metric-only phases: same name and type -> the previous round's profile
+        out["notes"]["profiles_reused"] = reuse_profiles(out, reuse_from)
+        todo = [a for a in todo if not a.get("profile")]
     log(f"profile {len(todo)} attributes, {profile_batch} per query")
     profiles = _profile_rows(runner, project, model, [a["name"] for a in todo], where, profile_batch)
     wanted = {a["name"]: (profiles.get(a["name"]) or {}).get("distinct_values") for a in todo}
@@ -548,7 +563,7 @@ def scope_model(runner: Runner, project: str, model: str, *, profile: bool = Tru
             else:
                 prof["values"] = samples[attr["name"]]
         attr["profile"] = prof
-    skipped = len(semantics["attributes"]) - max_attributes
+    skipped = len(semantics["attributes"]) - len(starts) - max_attributes
     if skipped > 0:
         out["notes"]["unprofiled_attributes"] = skipped
     out["anchor"] = choose_anchor(runner, project, model, semantics["metrics"], where, profile_batch)
@@ -1079,6 +1094,9 @@ def trim_probe_list(names: list[str], scope: dict) -> tuple[list[str], dict[str,
         a = attrs.get(n.casefold()) or {}
         if "__" in n and (bare.casefold() in attrs or bare.casefold() in listed):
             skipped[n] = f"a form of '{bare}'"
+        elif re.search(r"__(start|desc)$", n, re.I) and \
+                re.sub(r"__(start|desc)$", "__id", n, flags=re.I).casefold() in (set(attrs) | listed):
+            skipped[n] = f"a form of time attribute '{n.rsplit('__', 1)[0]}': its __id is probed"
         elif t and str((attrs.get(t.group(1).casefold()) or {}).get("type") or "").lower().startswith("date") \
                 and t.group(2).lower() != "year":
             skipped[n] = f"time attribute of '{t.group(1)}': its (year) is probed"
@@ -4188,6 +4206,50 @@ def _phase_of(f: dict) -> int | None:
     return CATEGORY_PHASE.get(str(f.get("category") or ""))
 
 
+# actions that change only derived metrics (or nothing): attributes, tables, joins and the data stay as they were, so a
+# verify round can reuse the previous round's attribute profiles and join paths (NUSA, 18 Nov: ~120 identical queries
+# re-run after a phase that rewrote one derived metric)
+METRIC_ONLY_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_derived_metric",
+                     "create_level_metric", "create_weighted_average", "create_time_shift_metric", "publish", "certify")
+
+
+def structural_actions(findings_doc: dict | None, phases: list[int] | None) -> list[str] | None:
+    """The applied actions (of `phases`) that may change attributes, tables, joins or data, as 'F001: kind'. None
+    when that can't be told (no findings or no phases): treat as structural. A rename_describe that renames
+    nothing (descriptions only) is not structural."""
+    if not findings_doc or not phases:
+        return None
+    out = []
+    for f in findings_doc.get("findings") or []:
+        for a in f.get("actions") or []:
+            if action_phase(f, a) not in phases:
+                continue
+            kind = a.get("kind")
+            if kind in METRIC_ONLY_KINDS:
+                continue
+            if kind == "rename_describe" and not any(
+                    (it or {}).get("new_name") for it in ((a.get("args") or {}).get("items") or [])):
+                continue
+            out.append(f"{f.get('id')}: {kind}")
+    return list(dict.fromkeys(out))
+
+
+def _phase_list(values: list[str] | None) -> list[int]:
+    return [int(p) for p in re.split(r"[,\s]+", " ".join(values or [])) if p.strip().isdigit()]
+
+
+def reuse_profiles(scope: dict, old_scope: dict) -> int:
+    """Copy the old scope's attribute profiles onto attributes with the same name and type; returns how many."""
+    old = {a["name"]: a for a in old_scope.get("attributes") or []}
+    n = 0
+    for a in scope.get("attributes") or []:
+        o = old.get(a["name"])
+        if o and o.get("type") == a.get("type") and o.get("profile") and "error" not in o["profile"]:
+            a["profile"] = o["profile"]
+            n += 1
+    return n
+
+
 def action_phase(f: dict, action: dict) -> int | None:
     """The phase an action runs in: merged and fixed-phase kinds have a set phase, the rest run in the finding's."""
     return PHASED_KINDS.get(str(action.get("kind") or "")) or _phase_of(f)
@@ -5397,6 +5459,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="list the values of attributes with at most this many distinct values (default 30)")
     sp.add_argument("--max-attributes", type=int, default=200, help="profile at most this many attributes")
     sp.add_argument("--profile-batch", type=int, default=8, help="attributes profiled per query (default 8)")
+    sp.add_argument("--reuse-profiles", help="the previous round's scope.json: when the applied phases (--findings, "
+                                              "--phases) changed only derived metrics, attributes with the same name "
+                                              "and type keep their profile instead of being queried again")
+    sp.add_argument("--findings", help="findings.json, with --reuse-profiles")
+    sp.add_argument("--phases", nargs="*", default=[], help="applied phases (3,4,6), with --reuse-profiles")
 
     sp = sub.add_parser("run", help="run a question bank through the MCP query tool")
     sp.add_argument("--project", required=True)
@@ -5552,6 +5619,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--model-export", help="the export: tables each attribute reaches, declared relationships")
     sp.add_argument("--previous", help="the previous round's join_paths.json, to compare relationships")
     sp.add_argument("--findings", help="findings.json: report which earlier join-paths findings are resolved")
+    sp.add_argument("--phases", nargs="*", default=[],
+                    help="applied phases (3,4,6): when they changed only derived metrics, --previous is carried "
+                         "forward instead of re-run (no attribute it would test is new)")
+    sp.add_argument("--always", action="store_true", help="re-run even when --phases changed only derived metrics")
     sp.add_argument("--where", default="")
     sp.add_argument("--round", type=int)
     sp.add_argument("--max-attributes", type=int, default=300)
@@ -5652,9 +5723,21 @@ def main(argv: list[str] | None = None, runner_factory: Callable[[argparse.Names
 
 def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[[str], None]) -> int:
     if args.cmd == "scope":
+        reuse, why = None, ""
+        if args.reuse_profiles:
+            structural = structural_actions(_load_json(args.findings) if args.findings else None,
+                                            _phase_list(args.phases))
+            if structural is None:
+                why = "--reuse-profiles needs --findings and --phases: profiling every attribute"
+            elif structural:
+                why = f"applied phases change more than derived metrics ({', '.join(structural[:5])}): profiling every attribute"
+            else:
+                reuse = _load_json(args.reuse_profiles)
         out = scope_model(runner(), args.project, args.model, profile=not args.no_profile, where=args.where,
                           sample_max=args.sample_max, max_attributes=args.max_attributes,
-                          profile_batch=args.profile_batch, log=log)
+                          profile_batch=args.profile_batch, reuse_from=reuse, log=log)
+        if why:
+            out["notes"]["profiles_not_reused"] = why
         _write_json(args.out, out)
         if _pending(runner):
             return 3
@@ -5725,6 +5808,28 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
         return _check_lookup_cmd(args, runner)
     if args.cmd == "join-paths":
         scope = _load_json(args.scope)
+        prev = _load_json(args.previous) if args.previous else None
+        structural = structural_actions(_load_json(args.findings) if args.findings else None, _phase_list(args.phases)) \
+            if args.phases else None
+        if prev and structural == [] and not args.always:
+            tested = {n.casefold() for n in (prev.get("attributes") or {})} | \
+                     {n.casefold() for n in prev.get("not_tested") or []}
+            new = [t["name"] for t in _testable_attributes(scope, _load_json(args.model_export) if args.model_export
+                                                           else None) if t["name"].casefold() not in tested]
+            if not new and not any(v.get("verdict") == "pending" for r in (prev.get("attributes") or {}).values()
+                                   for v in r.values()):
+                out = dict(prev, carried={"from": args.previous, "round": args.round,
+                                          "reason": "the applied phases changed only derived metrics: joins and "
+                                                    "attributes are as the previous round tested them"})
+                if args.findings:
+                    out["earlier_findings"] = resolved_findings(
+                        _load_json(args.findings), out.get("findings") or [],
+                        out.get("relationships") if args.model_export else None)
+                out["sources"] = source_info(scope=args.scope, export=args.model_export)
+                _write_json(args.out, out)
+                print(json.dumps({"out": args.out, "carried": out["carried"], "unjoined": out.get("unjoined"),
+                                  "filter_problems": sorted(out.get("filter_problems") or [])}, indent=2))
+                return 0
         out = check_join_paths(runner(), args.project, scope,
                                export=_load_json(args.model_export) if args.model_export else None,
                                previous=_load_json(args.previous) if args.previous else None, where=args.where,

@@ -266,6 +266,15 @@ Resolved:
   in its formula) when the probe list left them out, and warns when the metric reads 0 in a group where
   every operand is blank. `--previous <last round's probes.json>` also warns when a group went from blank
   to 0 or back (an older probes.json has no `groups`: nothing to compare).
+- *Types with parentheses (NUSA item 48):* get_semantics shows `timestamp(0)` and `decimal(18,2)`; an
+  entry with such a type used to be dropped from scope.json (every time attribute's `__start`). The scope
+  keeps the base type in `type` (`timestamp`) and the full one in `type_full`. A time attribute's `__start`
+  is kept but not profiled, and probe skips it (its `__id` is probed).
+- *Metric-only verify rounds:* when the applied phases (`--findings`, `--phases`) hold only derived-metric
+  actions, publish/certify and description-only `rename_describe`, `scope --reuse-profiles
+  <scope_round<N-1>.json>` keeps last round's profiles for attributes with the same name and type, and
+  `join-paths --phases` carries the previous join_paths.json forward (`carried`) when no attribute it would
+  test is new (`--always` re-runs). A data reload between rounds isn't seen in such a round.
 - *Renamed time attributes (NUSA item 46):* `month__id` with a timestamp `month__start` beside it is a
   Studio time attribute, not a date stored as a number, whatever its description says ("coded yyyyMM").
   It belongs to the date its description names, or to the model's only date. Maturity and the

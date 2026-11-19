@@ -116,6 +116,20 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(sem["metrics"][0]["formula"], "sum(sales.csv.{NET SALES})")
         self.assertEqual(sem["metrics"][1]["type"], "bigint")
 
+    def test_types_with_parentheses_are_kept(self):
+        # NUSA item 48: '- **month__start** (timestamp(0)): ...' did not match and the column was dropped
+        sem = am.parse_semantics("### Attributes(Dimensions)\n"
+                                 "- **month__id** (bigint): Calendar month of the start date, coded yyyyMM.\n"
+                                 "- **month__start** (timestamp(0)): Calendar month (Jan = 1).\n"
+                                 "- **rate** (decimal(18,2))\n"
+                                 "- **promotion in-store start date** (date)\n")
+        by = {a["name"]: a for a in sem["attributes"]}
+        self.assertEqual(by["month__start"], {"name": "month__start", "type": "timestamp", "type_full": "timestamp(0)",
+                                              "description": "Calendar month (Jan = 1)."})
+        self.assertEqual(by["rate"]["type"], "decimal")
+        m = am.maturity_signals({"attributes": sem["attributes"], "metrics": []})
+        self.assertEqual((m["dates_stored_as_numbers"], m["dates_without_time_attributes"]), ([], []))
+
 
 # ── scope / run ─────────────────────────────────────────────────────────────────────────────
 
@@ -138,6 +152,31 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(out["notes"]["undescribed_attributes"], ["months active"])
         sqls = [a["query"] for t, a in runner.calls if t == "query"]
         self.assertTrue(all('FROM "store sales" WHERE "region" <> \'Test\'' in s for s in sqls))
+
+    def test_time_attribute_starts_are_kept_but_not_profiled(self):
+        text = ("## Schema: retail. Table: Store Sales\n### Attributes(Dimensions)\n- **region** (varchar)\n"
+                "- **month__id** (bigint)\n- **month__start** (timestamp(0))\n### Metrics(Measures)\n"
+                "- **net sales** (double)\nsum(sales.csv.{NET SALES})\n")
+
+        class Sem(FakeRunner):
+            def call(self, tool, arguments):
+                return _text(text) if tool == "get_semantics" else super().call(tool, arguments)
+        runner = Sem()
+        out = am.scope_model(runner, "retail", "Store Sales", profile_batch=1)
+        by = {a["name"]: a for a in out["attributes"]}
+        self.assertIn("skipped", by["month__start"]["profile"])
+        self.assertFalse(any('"month__start"' in a["query"] for t, a in runner.calls if t == "query"))
+        self.assertEqual(am.trim_probe_list(["month__start", "month__id"], out)[1],
+                         {"month__start": "a form of time attribute 'month': its __id is probed"})
+
+    def test_reused_profiles_are_not_queried_again(self):
+        runner = FakeRunner()
+        old = {"attributes": [{"name": "region", "type": "varchar", "profile": {"distinct_values": 3.0}},
+                              {"name": "snapshot month", "type": "date", "profile": {"distinct_values": 38.0}}]}
+        out = am.scope_model(runner, "retail", "Store Sales", profile_batch=1, reuse_from=old)
+        self.assertEqual(out["notes"]["profiles_reused"], 2)
+        profiled = [a["query"] for t, a in runner.calls if t == "query" and "DISTINCT" in a["query"]]
+        self.assertTrue(profiled and all('"months active"' in q for q in profiled))
 
     def test_no_profile_and_empty_semantics(self):
         runner = FakeRunner()
@@ -2296,6 +2335,51 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(am.blank_zero_changes({"period": [["a", None], ["b", 1.0]]},
                                                {"period": [["a", 0.0], ["b", None], ["c", None]]}),
                          {"period": ["a: 0 -> blank"]})
+
+    def test_metric_only_phases_reuse_profiles_and_join_paths(self):
+        # NUSA (18 Nov): ~120 identical queries re-run after a phase that rewrote one derived metric
+        def f(fid, phase, *actions):
+            return {"id": fid, "phase": phase, "actions": list(actions)}
+        doc = {"findings": [f("F1", 4, {"kind": "create_compound_metric", "args": {"name": "x"}}),
+                            f("F2", 6, {"kind": "rename_describe", "args": {"items": [{"current_name": "a",
+                                                                                       "description": "d"}]}}),
+                            f("F3", 3, {"kind": "add_column_attribute", "args": {"name": "y"}}),
+                            f("F4", 6, {"kind": "rename_describe", "args": {"items": [{"current_name": "a",
+                                                                                       "new_name": "b"}]}})]}
+        self.assertEqual(am.structural_actions(doc, [4]), [])
+        self.assertEqual(am.structural_actions(dict(findings=doc["findings"][:2]), [4, 6]), [])
+        self.assertEqual(am.structural_actions(doc, [3, 4, 6]), ["F3: add_column_attribute", "F4: rename_describe"])
+        self.assertIsNone(am.structural_actions(doc, []))
+        new = {"attributes": [{"name": "region", "type": "varchar"}, {"name": "units", "type": "double"}]}
+        old = {"attributes": [{"name": "region", "type": "varchar", "profile": {"distinct_values": 3}},
+                              {"name": "units", "type": "bigint", "profile": {"distinct_values": 9}}]}
+        self.assertEqual(am.reuse_profiles(new, old), 1)                      # a changed type is profiled again
+        self.assertNotIn("profile", new["attributes"][1])
+
+        with tempfile.TemporaryDirectory() as d:
+            def put(name, obj):
+                path = os.path.join(d, name)
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(obj, fh)
+                return path
+            scope = put("scope.json", {"model": "Store Sales", "attributes": [{"name": "region", "type": "varchar"}],
+                                       "metrics": []})
+            prev = put("prev.json", {"version": 2, "attributes": {"region": {"units": {"verdict": "ok"}}},
+                                     "findings": [], "unjoined": [], "filter_problems": {}})
+            findings = put("findings.json", doc)
+            out = os.path.join(d, "jp.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = am.main(["join-paths", "--project", "retail", "--scope", scope, "--previous", prev,
+                                "--findings", findings, "--phases", "4", "--round", "4", "--out", out])
+            self.assertEqual(code, 0)
+            with open(out, encoding="utf-8") as fh:
+                carried = json.load(fh)
+            self.assertEqual(carried["attributes"], {"region": {"units": {"verdict": "ok"}}})
+            self.assertIn("changed only derived metrics", carried["carried"]["reason"])
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = am.main(["join-paths", "--project", "retail", "--scope", scope, "--previous", prev,
+                                "--findings", findings, "--phases", "4,6", "--round", "4", "--out", out])
+            self.assertNotEqual(code, 0)                                   # F4 renames: re-run (no tenant here)
 
     def test_needs_an_anchor(self):
         with self.assertRaises(SystemExit):
