@@ -47,7 +47,7 @@ class ItemTests(unittest.TestCase):
 
 class WriteTests(unittest.TestCase):
     def test_time_attributes_get_descriptions_and_object_ids_resolve(self):
-        # NUSA (2026-11-18): the connector's month__id / quarter__id are Studio time attributes, smartAttributes of
+        # seen 2026-11-18: the connector's month__id / quarter__id are Studio time attributes, smartAttributes of
         # the start date; a PATCH on the time attribute's own id with the description was verified live (probe 4)
         model = {"attributes": [{"information": {"objectId": "A1", "name": "Region", "description": ""}},
                                 {"information": {"objectId": "D1", "name": "Start Date", "description": ""},
@@ -157,11 +157,11 @@ class DerivedMetricTests(unittest.TestCase):
         spec = os.path.join(d, "spec.json")
         self.addCleanup(lambda: (os.remove(spec), os.rmdir(d)))
         with open(spec, "w", encoding="utf-8") as f:
-            json.dump({"items": [{"object_type": "metric", "current_name": "Original UPB (once per loan)",
+            json.dump({"items": [{"object_type": "metric", "current_name": "Order value (once per order)",
                                   "description": "new text"}]}, f)
-        model = {**MODEL, "metrics": [{"information": {"objectId": "D1", "name": "Original UPB (once per loan)",
+        model = {**MODEL, "metrics": [{"information": {"objectId": "D1", "name": "Order value (once per order)",
                                                        "description": "old text"}}]}
-        body = {"information": {"objectId": "D1", "name": "Original UPB (once per loan)", "description": "old text",
+        body = {"information": {"objectId": "D1", "name": "Order value (once per order)", "description": "old text",
                                 "subType": "metric"},
                 "expression": {"tokens": [{"value": "Sum"}], "text": "Sum(Max({x}))"}, "format": {"x": 1}}
         routes = {("POST", f"{MP}/export"): _Resp(200, {"model": [model]}),

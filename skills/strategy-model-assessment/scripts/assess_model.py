@@ -284,7 +284,7 @@ def parse_query_result(result: dict) -> dict[str, Any]:
     return {"ok": False, "columns": [], "rows": [], "error": f"no result table in reply: {stripped[:300]}"}
 
 
-# the type may hold its own parentheses: timestamp(0), decimal(18,2) (NUSA item 48: a "(timestamp(0))" line was dropped)
+# the type may hold its own parentheses: timestamp(0), decimal(18,2) (seen 2026-11-18: a "(timestamp(0))" line was dropped)
 _SEM_LINE = re.compile(r"^- \*\*(?P<name>.+?)\*\* \((?P<type>[^()]*(?:\([^()]*\)[^()]*)*)\)(?::\s*(?P<desc>.*))?$")
 
 
@@ -540,7 +540,7 @@ def scope_model(runner: Runner, project: str, model: str, *, profile: bool = Tru
         out["anchor"] = choose_anchor(runner, project, model, semantics["metrics"], where, profile_batch)
         out["maturity"] = maturity_signals(out)
         return out
-    # a time attribute's __start timestamp holds the same periods as its __id: not profiled (replay cost, item 32)
+    # a time attribute's __start timestamp holds the same periods as its __id: not profiled (saves replay queries)
     starts = {c["name"] for cols in time_attribute_columns(semantics["attributes"]).values() for c in cols
               if c["name"].lower().endswith("__start")}
     for a in semantics["attributes"]:
@@ -567,6 +567,13 @@ def scope_model(runner: Runner, project: str, model: str, *, profile: bool = Tru
     if skipped > 0:
         out["notes"]["unprofiled_attributes"] = skipped
     out["anchor"] = choose_anchor(runner, project, model, semantics["metrics"], where, profile_batch)
+    prev = (reuse_from or {}).get("period") if isinstance(reuse_from, dict) else None
+    if prev and prev.get("kind") in ("snapshot", "event", "mixed") and prev.get("attribute") == guess_period(out):
+        period = {**prev, "reused": True}   # a metric-only round doesn't change which periods each entity has
+    else:
+        period = period_profile(runner, project, model, out, where)
+    if period:
+        out["period"] = period
     out["maturity"] = maturity_signals(out)
     return out
 
@@ -606,12 +613,51 @@ def choose_anchor(runner: Runner, project: str, model: str, metrics: list[dict],
     if not counts:
         return None
     best = max(counts.values())
-    name = next(n for n in names if counts.get(n) == best)    # first of the fullest, in model order
-    return {"metric": name, "non_blank": best,
+    tied = [n for n in names if counts.get(n) == best]          # the fullest, in model order
+    name, tie_note = tied[0], None
+    if len(tied) > 1:
+        name, tie_note = _anchor_tie_break(runner, project, model, tied, metrics, where, batch)
+    out = {"metric": name, "non_blank": best,
             "counts": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
             "note": "Count fact rows with COUNT(<anchor>), and conditions with COUNT(CASE WHEN ... THEN <anchor> "
                     "END). Aggregates over attributes only read the attributes' lookups, not the fact. A model "
                     "with several fact tables needs one anchor per fact."}
+    if tie_note:
+        out["tie_break"] = tie_note
+    return out
+
+
+_EMPTY_DESCRIPTION = re.compile(r"\b(empty|unused|deprecated|obsolete|do not use|don't use|not populated|not loaded|"
+                                r"no data|placeholder)\b", re.I)
+
+
+def _anchor_tie_break(runner: Runner, project: str, model: str, tied: list[str], metrics: list[dict],
+                      where: str = "", batch: int = 8) -> tuple[str, str]:
+    """Among metrics filled on equally many rows, prefer one that holds values: not described as empty or
+    unused, and not 0 on every row. A column that is all 0 counts rows today but reads nothing, and a later load
+    that leaves it NULL would break every count built on it. One query (MAX(ABS(...))), only on a tie."""
+    desc = {m["name"]: m.get("description") or "" for m in metrics}
+    ordered = sorted(tied, key=lambda n: bool(_EMPTY_DESCRIPTION.search(desc.get(n, ""))))   # stable: model order
+    clause = f" WHERE {where}" if where else ""
+    for start in range(0, len(ordered), max(batch, 1)):
+        chunk = ordered[start:start + max(batch, 1)]
+        parts = ", ".join(f"CAST(MAX(ABS({quote_ident(n)})) AS VARCHAR) AS z{i}" for i, n in enumerate(chunk))
+        sql = f"SELECT {parts} FROM {quote_model(model)}{clause}"  # nosec B608  # identifiers are quoted; the connector is read-only
+        try:
+            parsed = parse_query_result(runner.call("query", {"project": project, "query": sql}))
+        except PendingReply:
+            break
+        row = (parsed.get("rows") or [{}])[0] if parsed.get("ok") else {}
+        for i, n in enumerate(chunk):
+            if (_num(row.get(f"z{i}")) or 0) > 0:
+                return n, (f"{len(tied)} metrics tie on non-blank rows; '{n}' is the first that holds non-zero values"
+                           + (" and isn't described as empty" if ordered[0] == n and n != tied[0] else ""))
+        if not parsed.get("ok"):
+            break
+    first = ordered[0]
+    return first, (f"{len(tied)} metrics tie on non-blank rows; no non-zero check was possible, so '{first}' is the "
+                   f"first not described as empty" if first != tied[0] else
+                   f"{len(tied)} metrics tie on non-blank rows and none showed a non-zero value; '{first}' is first")
 
 
 # one aggregation of one column: "sum(table.csv.{Net Sales})", or with no braces when the column has no space
@@ -627,7 +673,8 @@ def _weighted_part(m: dict) -> bool:
                 or "*" in (m.get("formula") or ""))
 
 
-_SUMMED_NONADDITIVE = re.compile(r"\b(rate|ratio|score|percent|percentage|pct|age|months|term|price|index|"
+# words naming a value that doesn't add up across rows; not 'term', which also names a horizon ('long term spend')
+_SUMMED_NONADDITIVE = re.compile(r"\b(rate|ratio|score|percent|percentage|pct|age|months|price|index|"
                                  r"average|avg|mean|latitude|longitude)\b", re.I)
 
 
@@ -721,7 +768,7 @@ def time_attribute_columns(attrs: list) -> dict[str, list[dict]]:
 
 def has_time_attributes(name: str, all_names: list) -> bool:
     """Studio's time attributes show on the connector as '<date> (<interval>)__id / __start / __desc'. Renamed ones
-    ('month__id', NUSA) belong to the date their descriptions name, or to the only date when the model has one.
+    ('month__id') belong to the date their descriptions name, or to the only date when the model has one.
     all_names: attribute names, or attribute dicts (needed for renamed time attributes)."""
     names = [(n.get("name") or "") if isinstance(n, dict) else n for n in all_names]
     pre = name.lower() + " ("
@@ -1184,12 +1231,12 @@ def _metric_table(m: dict) -> str:
     return hit.group(1).strip().lower() if hit else ""
 
 
-PROBE_GROUPS_KEPT = 60   # grouped values kept per metric and grouping, for the blank/0 checks (item 47)
+PROBE_GROUPS_KEPT = 60   # grouped values kept per metric and grouping, for the blank-to-0 checks
 _OPERAND = re.compile(r"\{([^{}~+]+)\}")
 
 
 def formula_operands(formula: str, metric_names: list[str]) -> list[str]:
-    """Metrics a derived metric's formula reads ({Lift PCT} -> 'lift pct'), by the model's own names."""
+    """Metrics a derived metric's formula reads ({Net Margin} -> 'net margin'), by the model's own names."""
     by = {n.casefold(): n for n in metric_names}
     return list(dict.fromkeys(by[x.strip().casefold()] for x in _OPERAND.findall(formula or "")
                               if x.strip().casefold() in by))
@@ -1269,8 +1316,8 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             truthy = [v for v, _ in filled if v.strip().lower() in _TRUE_VALUES]
             if len(filled) <= 2 and truthy:          # a flag: its "yes" value
                 filt_value = truthy[0]
-            elif filt == period:                     # the latest period
-                filt_value = max(filled, key=lambda x: x[0])[0]
+            elif filt == period and period_kind(scope, period) != "event":   # the latest observed period
+                filt_value = latest_observed([v for v, _ in filled], scope)[0] or max(filled, key=lambda x: x[1])[0]
             else:                                    # the largest group
                 filt_value = max(filled, key=lambda x: x[1])[0]
     filt_type = (attrs_by.get(filt) or {}).get("type") or ""
@@ -1365,8 +1412,8 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
         tot_res = ask(f"SELECT {plain} FROM {M}{base}")  # nosec B608
         tot = rows_of(tot_res)
         if tot is None and tot_res is not None and len(chunk) > 1:
-            # one metric's error fails the whole query: probe each alone so only the failing one is marked (NUSA,
-            # 18 Nov: a compound with a constant failed a plain SUM and took five other metrics down with it)
+            # one metric's error fails the whole query: probe each alone so only the failing one is marked (seen
+            # 2026-11-18: a compound with a constant failed a plain SUM and took five other metrics down with it)
             queue = [[n] for n in chunk] + queue
             continue
         tot_w = rows_of(ask(f"SELECT {wrapped} FROM {M}{base}"))  # nosec B608
@@ -1444,7 +1491,7 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             kept_share = (ent_filtered / ent_total) if ent_total and ent_filtered is not None else \
                          ((filt_rows / total) if total and filt_rows is not None else None)
             # exactly the value shown: _close's display allowance (0.005) called an average that moved from 0.672 to
-            # 0.669 "the same" (NUSA, 18 Nov); a metric that ignores the filter returns the identical value
+            # 0.669 "the same" (seen 2026-11-18); a metric that ignores the filter returns the identical value
             if fcond and t and f_total is not None and f_total == t and kept_share is not None \
                     and kept_share < 0.9 and len(filled_f) >= 2:   # one filled group = that group only, not this
                 item["issues"].append(f"ignores a filter that keeps {kept_share:.0%} of "
@@ -1473,7 +1520,7 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             warnings += [f"metric '{n}': {x}" for x in item["issues"]]
             met_out.append(item)
 
-    # Blank groups read as 0 (NUSA item 47): a constant times a blank operand evaluates as 0 in Mosaic, so
+    # Blank groups read as 0 (seen 2026-11-18): a constant times a blank operand evaluates as 0 in Mosaic, so
     # 100 * [ratio] reads 0 where the ratio is blank. Compare each derived metric's groups with its operands'
     # (read here when the probe list left them out), and with the previous round's probe of the same metric.
     dims = {"period": period, "partner": partner}
@@ -1874,7 +1921,7 @@ def _is_interval(name: str, base: str) -> bool:
 
 def approved_renames(findings_doc: dict | None) -> dict[str, tuple[str, str]]:
     """{old name (casefolded): (new name, finding id)} from the rename_describe actions of findings decided to apply
-    (approved, modified, or already applied), so `references` knows a rename without two exports (NUSA, 18 Nov)."""
+    (approved, modified, or already applied), so `references` knows a rename without two exports (seen 2026-11-18)."""
     out: dict[str, tuple[str, str]] = {}
     for f in (findings_doc or {}).get("findings") or []:
         if f.get("status") not in ("approved", "modified", "verified", "applied") and not f.get("applied_phases"):
@@ -2892,6 +2939,115 @@ def existing_lookup_tables(scope: dict, *, relationships: dict | None = None, pr
     return groups
 
 
+_PERIOD_PREFERRED = re.compile(r"\b(period|reporting|snapshot|as of|activity|month)\b", re.I)
+PERIOD_EVENT_SHARE = 0.9      # at least this share of entities with one period: an event date, not a snapshot period
+PERIOD_SNAPSHOT_AVG = 1.5     # at least this many periods per entity on average: a snapshot period
+
+
+def guess_period(scope: dict) -> str:
+    """The attribute most likely to be the model's period: a date (or a number or text holding one) whose name
+    says period, date, month..., preferring reporting / snapshot / as-of names, then the most values."""
+    dated = [a for a in scope.get("attributes") or []
+             if (a.get("type", "").lower() in ("date", "timestamp") or looks_like_stored_date(a))
+             and _PERIOD_NAME.search(_words(a["name"])) and (_distinct(a) or 0) >= 2]
+    if not dated:
+        return ""
+    return max(dated, key=lambda a: (bool(_PERIOD_PREFERRED.search(_words(a["name"]))), _distinct(a) or 0))["name"]
+
+
+def period_date(value: Any) -> datetime.date | None:
+    """The first day of a period value as the connector shows it: 2026-12-01, 2026-12-01 00:00:00, 202612,
+    20261215, 2026-12, 2026. None when it isn't one."""
+    text = _plain_number(value)
+    m = re.match(r"^(\d{4})(?:-?(\d{2})(?:-?(\d{2}))?)?(?:[ T].*)?$", text)
+    if not m:
+        return None
+    try:
+        return datetime.date(int(m.group(1)), int(m.group(2) or 1), int(m.group(3) or 1))
+    except ValueError:
+        return None
+
+
+def run_date(scope: dict) -> datetime.date:
+    """The day the scope was read (its 'generated' date): periods after it are planned, not observed."""
+    try:
+        return datetime.date.fromisoformat(str(scope.get("generated") or "")[:10])
+    except ValueError:
+        return datetime.date.today()
+
+
+def latest_observed(values: list[Any], scope: dict) -> tuple[Any, list[Any]]:
+    """(the latest period value not after the run date, the values after it). A future period (a plan, a
+    forecast, a scheduled start or end) is never 'latest'. Values that aren't dates compare as given."""
+    if not values:
+        return None, []
+    today = run_date(scope)
+    dated = [(v, period_date(v)) for v in values]
+    if any(d is None for _, d in dated):
+        return max(values, key=lambda v: str(v)), []
+    future = [v for v, d in dated if d and d > today]
+    past = [(v, d) for v, d in dated if d and d <= today]
+    return (max(past, key=lambda x: x[1])[0] if past else None), future
+
+
+def period_kind(scope: dict, attribute: str) -> str:
+    """'snapshot', 'event', 'mixed' or 'unknown' for the period attribute scope tested (scope.json 'period')."""
+    p = scope.get("period") or {}
+    return str(p.get("kind") or "unknown") if attribute and p.get("attribute") == attribute else "unknown"
+
+
+def period_profile(runner: Runner, project: str, model: str, scope: dict, where: str = "") -> dict[str, Any] | None:
+    """Is the period a snapshot period (each entity repeats across periods: balances, inventory, status) or an
+    event date (one period per entity: an order, a start, a shipment)? Counted on the fact: distinct periods per
+    entity, rows read through the anchor metric. A 'latest period' only means something for a snapshot. Also
+    reports periods after the run date (plans, forecasts), which are never 'latest'."""
+    attribute = guess_period(scope)
+    if not attribute:
+        return None
+    prof = next((a.get("profile") or {} for a in scope.get("attributes") or [] if a["name"] == attribute), {})
+    latest, future = latest_observed([v for v in (prof.get("values") or []) if not _blank(v)], scope)
+    out: dict[str, Any] = {"attribute": attribute, "kind": "unknown", "run_date": run_date(scope).isoformat()}
+    largest = period_date(prof.get("max"))
+    if largest and largest > run_date(scope):
+        out["after_run_date"] = {"largest": prof.get("max"), "values": future[:20],
+                                 "note": "periods after the run date are planned or forecast, not observed: "
+                                         "never the 'latest' period"}
+    if latest is not None and prof.get("values"):
+        out["latest_observed"] = latest
+    entity, anchor = guess_entity(scope), (scope.get("anchor") or {}).get("metric")
+    if not entity or entity == attribute or not anchor:
+        out["note"] = "no entity or anchor metric to test it with"
+        return out
+    E, T, A = quote_ident(entity), quote_ident(attribute), quote_ident(anchor)
+    clause = f" WHERE {where}" if where else ""
+    sql = (f"SELECT CAST(COUNT(*) AS VARCHAR) AS entities, "  # nosec B608  # identifiers are quoted; the connector is read-only
+           f"CAST(SUM(CASE WHEN p_ = 1 THEN 1 ELSE 0 END) AS VARCHAR) AS one_period, "
+           f"CAST(AVG(CAST(p_ AS DOUBLE)) AS VARCHAR) AS avg_periods FROM (SELECT e_, COUNT(*) AS p_ FROM "
+           f"(SELECT {E} AS e_, {T} AS t_, COUNT({A}) AS r_ FROM {quote_model(model)}{clause} GROUP BY 1, 2) x "
+           f"WHERE r_ > 0 GROUP BY e_) y")
+    try:
+        parsed = parse_query_result(runner.call("query", {"project": project, "query": sql}))
+    except PendingReply:
+        out["note"] = "pending: the per-entity query has no saved reply yet"
+        return out
+    row = (parsed.get("rows") or [{}])[0] if parsed.get("ok") else {}
+    n, one, avg = _num(row.get("entities")), _num(row.get("one_period")), _num(row.get("avg_periods"))
+    if not n:
+        out["note"] = f"the per-entity query failed: {parsed.get('error') or 'no rows'}"
+        return out
+    share = (one or 0) / n
+    kind = "event" if share >= PERIOD_EVENT_SHARE else "snapshot" if (avg or 0) >= PERIOD_SNAPSHOT_AVG else "mixed"
+    out.update({"kind": kind, "entity": entity, "entities": n, "one_period_share": round(share, 4),
+                "avg_periods_per_entity": avg,
+                "note": {"event": "one period per entity: an event date. Time attributes give its calendar; a "
+                                  "latest-period flag would mean nothing",
+                         "snapshot": "entities repeat across periods: a snapshot. 'Latest' is the latest observed "
+                                     "period",
+                         "mixed": "neither clearly a snapshot nor an event date: check before adding a "
+                                  "latest-period flag"}[kind]})
+    return out
+
+
 def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 200,
                        relationships: dict | None = None, time_attributes: bool = True,
                        probes: dict | None = None, export: dict | None = None) -> list[dict[str, Any]]:
@@ -2990,14 +3146,8 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                                 f"instead of adding a column that duplicates it",
                     "action": {"kind": "show_forms", "args": {"attribute": h["attribute"], "forms": [h["form"]]}},
                     "columns": [], "new_forms": [], "new_attributes": []})
-    period_attr = period
-    if not period_attr:
-        dated = [a for a in attrs if (a.get("type", "").lower() in ("date", "timestamp") or looks_like_stored_date(a))
-                 and _PERIOD_NAME.search(_words(a["name"])) and (_distinct(a) or 0) >= 2]
-        if dated:
-            preferred = re.compile(r"\b(period|reporting|snapshot|as of|activity|month)\b", re.I)
-            period_attr = max(dated, key=lambda a: (bool(preferred.search(_words(a["name"]))),
-                                                    _distinct(a) or 0))["name"]
+    period_attr = period or guess_period(scope)
+    event_period = period_kind(scope, period_attr) == "event"   # an event date: a 'latest' flag means nothing
     latest = any("latest" in n.lower() or "current period" in n.lower() for n in names)
     if time_attributes:
         for a in attrs:
@@ -3025,7 +3175,7 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
                                   " (add_time_attributes): year, quarter and month intervals that group correctly, "
                                   "enable time-intelligence metrics, and need no lookup table",
                         "columns": [], "new_forms": [], "new_attributes": []})
-        if period_attr and not latest:   # time attributes give the calendar, not "latest": a small lookup does
+        if period_attr and not latest and not event_period:   # time attributes give the calendar, not "latest"
             out.append({"id": f"L-{_slug(period_attr)}", "kind": "period_lookup", "attribute": period_attr,
                         "reason": "no latest-period flag: point-in-time metrics resolve 'latest' per group without "
                                   "one (calendar parents come from the period's time attributes)",
@@ -3034,7 +3184,7 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
         if relationships:
             out += _entity_table_suggestion(relationships)
         return out
-    if period_attr and not latest:
+    if period_attr and not latest and not event_period:
         out.append({"id": f"L-{_slug(period_attr)}", "kind": "period_lookup", "attribute": period_attr,
                     "reason": "no latest-period flag: point-in-time metrics resolve 'latest' per group without one, "
                               "and calendar parents (year, quarter) need a period table",
@@ -3274,7 +3424,7 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
         elif sug["kind"] == "date_lookup":
             rows = [[v, *_period_parts(v)[:2]] for v in values]
         else:
-            latest = max(values) if values else None
+            latest, future = latest_observed(values, scope)
             parts = (lambda v: _period_parts(v)) if len(sug["columns"]) > 2 else (lambda v: ())
             rows = [[v, *parts(v), "Y" if v == latest else "N"] for v in values]
         entry = {**_finish_template(sug, path, sug["columns"], [[str(x) for x in r] for r in rows], new_fmt),
@@ -3282,6 +3432,10 @@ def build_lookups(runner: Runner, project: str, scope: dict, suggestions: list[d
         if dropped:
             entry["note"] = (f"dropped {sorted(dropped)}: outside the attribute's min/max, so a NULL rendered as a "
                              f"number by CAST — represent 'no value' explicitly if users need it")
+        if sug["kind"] == "period_lookup" and future:
+            entry["latest_note"] = (f"{len(future)} period(s) after the run date ({run_date(scope).isoformat()}), "
+                                    f"e.g. {future[0]}: planned or forecast, so flagged N; latest = {latest}. "
+                                    f"Update the flag when the data is reloaded")
         done.append(entry)
     return done
 
@@ -3639,17 +3793,67 @@ def rows_digest(rows: list[dict] | None) -> str:
                           .encode("utf-8")).hexdigest()[:12]
 
 
-def _compare(q: dict, rows: list[dict], ref: list[dict], tol: float) -> tuple[str, dict | None, str | None]:
-    """-> (verdict, comparison, error note) with the question's key and measures."""
+def column_canon(name: str) -> str:
+    """One spelling for a result column. get_semantics names a form '<attribute>__<form>', while the connector
+    heads that column '<attribute> (<form>)' in a result; both read as '<attribute> (<form>)'. Case, quotes and
+    spacing are ignored."""
+    text = _WS.sub(" ", str(name or "").strip().strip('"').lower())
+    head, sep, tail = text.rpartition("__")
+    return f"{head.strip()} ({tail.strip()})" if sep and head.strip() and tail.strip() else text
+
+
+def align_columns(rows: list[dict], cols: list[str]) -> tuple[list[dict], list[str]]:
+    """Rename each result header that names one of `cols` in another spelling (a form column's '__' name
+    against the connector's '(form)' header, case, quotes) to the name in `cols`. -> (rows, columns of
+    `cols` the result doesn't have). An empty result has no headers to check."""
+    if not rows:
+        return rows, []
+    headers = list(rows[0].keys())
+    rename: dict[str, str] = {}
+    missing = []
+    for c in cols:
+        if c in headers:
+            continue
+        hit = next((h for h in headers if column_canon(h) == column_canon(c) and h not in rename), None)
+        if hit is None:
+            missing.append(c)
+        else:
+            rename[hit] = c
+    if rename:
+        rows = [{rename.get(k, k): v for k, v in r.items()} for r in rows]
+    return rows, missing
+
+
+def _compare(q: dict, rows: list[dict], ref: list[dict], tol: float,
+             sides: tuple[str, str] = ("question", "reference"),
+             sqls: tuple[str, str] = ("", "")) -> tuple[str, dict | None, str | None]:
+    """-> (verdict, comparison, error note) with the question's key and measures. A key or measure named in
+    another spelling than the result's header (a form column) is matched; one the result doesn't have is an
+    error that names the result's columns."""
+    keys, measures = list(q.get("key") or []), list(q.get("measures") or [])
+    rows, miss_rows = align_columns(rows or [], keys + measures)
+    ref, miss_ref = align_columns(ref or [], keys + measures)
+    for side, data, miss in ((sides[0], rows, miss_rows), (sides[1], ref, miss_ref)):
+        if miss:
+            what = "key" if miss[0] in keys else "measure"
+            return "error", None, (f"comparison: {what} column {miss[0]!r} is not in the {side} result (its columns: "
+                                   f"{', '.join(data[0].keys())}); name the column as the SQL outputs it, or give "
+                                   f"both queries the same alias (reason kind sql_error)")
     try:
-        cmp = svm.compare_rows(rows or [], ref or [], list(q.get("key") or []), list(q.get("measures") or []),
-                               float(tol), str(q.get("id")))
+        cmp = svm.compare_rows(rows, ref, keys, measures, float(tol), str(q.get("id")))
         return {"ok": "pass", "mismatch": "fail", "empty": "empty"}.get(cmp["status"], "fail"), cmp, None
     except SystemExit as e:
         msg = str(e)
         if "duplicate keys" in msg:
-            msg += (" — the result repeats a group. Grouping by an expression of an attribute doesn't regroup in "
-                    "Mosaic: rewrite the SQL to group by the attribute or its time attribute (reason kind sql_error)")
+            side_sql = sqls[0] if msg.startswith("model") else sqls[1]
+            msg = msg.replace("model:", f"{sides[0]}:", 1).replace("reference:", f"{sides[1]}:", 1)
+            msg += " — the result repeats a key: the key columns don't identify one row"
+            if grouped_expressions(side_sql):
+                msg += (". It groups by an expression of an attribute, which doesn't regroup in Mosaic: group by the "
+                        "attribute or its time attribute (reason kind sql_error)")
+            else:
+                msg += (". Add the missing grouping column to the key, or check that the SQL groups by every key "
+                        "column (reason kind sql_error)")
         return "error", None, f"comparison: {msg}"
 
 
@@ -3878,7 +4082,83 @@ def _sql_lint(sql: str, shifted: dict[str, dict] | None = None) -> list[str]:
            f"an outer query over a subquery: group by the attribute itself or its time attribute ((year), (month) "
            f"forms), or compute the expression in the subquery's SELECT (e.g. YEAR(MAX(<date>)) AS vintage) and "
            f"group the outer query by that column"] if bad else []
-    return out + form_group_by_lint(sql) + time_shift_sql_lint(sql, shifted)
+    return out + form_group_by_lint(sql) + time_shift_sql_lint(sql, shifted) + avg_decimal_lint(sql)
+
+
+def output_columns(sql: str) -> list[str | None] | None:
+    """The names of the main SELECT's output columns, in order: an alias, else a bare column's name; None for an
+    expression without an alias (the connector heads it _col<n>). None when it can't tell (SELECT *, no SELECT)."""
+    text = _SQL_LITERAL.sub("''", sql or "")
+    d, start = 0, -1
+    for m in re.finditer(r"\(|\)|\bselect\b", text, re.I):
+        tok = m.group(0)
+        if tok == "(":
+            d += 1
+        elif tok == ")":
+            d -= 1
+        elif d == 0:
+            start = m.end()
+            break
+    if start < 0:
+        return None
+    d, end = 0, len(text)
+    for m in re.finditer(r"\(|\)|\bfrom\b", text[start:], re.I):
+        tok = m.group(0)
+        if tok == "(":
+            d += 1
+        elif tok == ")":
+            d -= 1
+        elif d == 0:
+            end = start + m.start()
+            break
+    items = _split_top(re.sub(r"^\s*(distinct|all)\b", "", text[start:end], flags=re.I))
+    out: list[str | None] = []
+    for item in items:
+        if re.search(r"(^|\.)\*$", item.strip()):
+            return None
+        expr, alias = _strip_alias(item)
+        if alias:
+            out.append(alias)
+            continue
+        bare = re.fullmatch(r'(?:(?:"[^"]+"|[A-Za-z_]\w*)\.)*("[^"]+"|[A-Za-z_]\w*)', expr.strip())
+        out.append(bare.group(1).strip('"').lower() if bare else None)
+    return out
+
+
+def bank_column_lint(q: dict) -> list[str]:
+    """Key and measure columns each query of a question doesn't output (by alias or column name, a form column's
+    '__' name matching the connector's '(form)' header): grade can't pair rows on a column a result lacks."""
+    cols = [c for c in list(q.get("key") or []) + list(q.get("measures") or []) if isinstance(c, str)]
+    if not cols:
+        return []
+    out = []
+    sqls = (("sql", q.get("sql") or ""), ("best answer", (q.get("best_answer") or {}).get("sql") or ""),
+            ("expected sql", (q.get("expected") or {}).get("sql") or ""))
+    for where, text in sqls:
+        names = output_columns(text) if text.strip() else None
+        if names is None:
+            continue
+        have = {column_canon(n) for n in names if n}
+        missing = [c for c in cols if column_canon(c) not in have]
+        if missing:
+            shown = ", ".join(n or "<expression with no alias>" for n in names)
+            out.append(f"{where}: outputs no column {', '.join(repr(c) for c in missing)} named in key/measures "
+                       f"(it outputs: {shown}); alias each query's columns with the names in key and measures")
+    return out
+
+
+_AVG_DECIMAL_LITERAL = re.compile(r"\bavg\s*\(\s*(?:\d+\.\d+\s*\*|[^()]*?\*\s*\d+\.\d+\s*\))", re.I)
+
+
+def avg_decimal_lint(sql: str) -> list[str]:
+    """AVG over a decimal literal times a value keeps the literal's decimals: 1.0 is DECIMAL(2,1), so
+    AVG(1.0 * n) over integers returns one decimal (11.095 -> 11.1). Standard Trino typing."""
+    text = _SQL_LITERAL.sub("''", sql or "")
+    if _AVG_DECIMAL_LITERAL.search(text):
+        return ["it averages a decimal literal times a value (AVG(1.0 * n)): the result keeps the literal's "
+                "decimals (one for 1.0), so 11.095 reads 11.1; write 1.0 * SUM(n) / COUNT(n) (full precision) or "
+                "AVG(n)"]
+    return []
 
 
 def best_answer_version(q: dict) -> int:
@@ -3891,7 +4171,9 @@ def baseline_check(q: dict, res: dict) -> dict[str, Any]:
     model answered when someone checked it, not that it was right."""
     base = q["baseline"]
     try:
-        cmp = svm.compare_rows(res.get("rows") or [], list(base.get("rows") or []), list(q.get("key") or []),
+        cols = list(q.get("key") or []) + list(q.get("measures") or [])
+        cmp = svm.compare_rows(align_columns(res.get("rows") or [], cols)[0],
+                               align_columns(list(base.get("rows") or []), cols)[0], list(q.get("key") or []),
                                list(q.get("measures") or []), float(base.get("tolerance", 1e-6)), str(q.get("id")),
                                allow_empty=True)
     except SystemExit as e:   # no numeric columns: compare the rows as they are
@@ -4059,14 +4341,21 @@ def grade_bank(bank: dict, results: dict, *, bank_dir: str = ".", tolerance: flo
             if ref is None:
                 item.update({"verdict": "ungraded" if why == "no expected value" else "error", "note": why})
             else:
-                verdict, cmp, err = _compare(q, res.get("rows") or [], ref, tol)
+                graded_against = item.get("graded_against") or ("expected" if exp.get("source") == "same_model_sql"
+                                                                else "reference")
+                ref_sql = ((q.get("best_answer") or {}).get("sql") if graded_against == "best_answer"
+                           else exp.get("sql")) or ""
+                verdict, cmp, err = _compare(q, res.get("rows") or [], ref, tol,
+                                             ("question", graded_against.replace("_", " ")),
+                                             (q.get("sql") or "", ref_sql))
                 item["verdict"] = verdict
                 if cmp:
                     item["comparison"] = cmp
                 if err:
                     item["note"] = err
             if outside and best.get("ok") and ref is not None:   # an outside reference checks the best answer too
-                item["best_vs_reference"] = _compare(q, best.get("rows") or [], ref, tol)[0]
+                item["best_vs_reference"] = _compare(q, best.get("rows") or [], ref, tol, ("best answer", "reference"),
+                                                     ((q.get("best_answer") or {}).get("sql") or "", ""))[0]
             item["seconds"] = res.get("seconds")
             item["rows_digest"] = rows_digest(res.get("rows"))
             if item["verdict"] == "ungraded" and q.get("baseline") and res.get("ok"):
@@ -4147,7 +4436,7 @@ DERIVED_METRIC_KINDS = ("create_conditional_metric", "create_compound_metric", "
 
 def new_fact_metric_order_problems(findings: list[dict]) -> list[str]:
     """A derived metric that reads a fact metric this plan adds (add_column_fact_metric, always phase 3) must run after
-    phase 3's republish: refuse a finding that would create it in phase 3 or earlier (NUSA F008, 2026-11-18)."""
+    phase 3's republish: refuse a finding that would create it in phase 3 or earlier (seen 2026-11-18)."""
     new = {str((a.get("args") or {}).get("name") or "").strip().casefold()
            for f in findings for a in f.get("actions") or [] if a.get("kind") == "add_column_fact_metric"} - {""}
     if not new:
@@ -4207,7 +4496,7 @@ def _phase_of(f: dict) -> int | None:
 
 
 # actions that change only derived metrics (or nothing): attributes, tables, joins and the data stay as they were, so a
-# verify round can reuse the previous round's attribute profiles and join paths (NUSA, 18 Nov: ~120 identical queries
+# verify round can reuse the previous round's attribute profiles and join paths (seen 2026-11-18: ~120 identical queries
 # re-run after a phase that rewrote one derived metric)
 METRIC_ONLY_KINDS = ("create_conditional_metric", "create_compound_metric", "delete_derived_metric",
                      "create_level_metric", "create_weighted_average", "create_time_shift_metric", "publish", "certify")
@@ -5111,7 +5400,7 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
     held = sorted(rel for rel, ps in readers.items() if ps and ps <= blocked)
     # the id covers what the scripts will run: every phase's steps (blocks included) and the spec files they read.
     # A finding change that alters no step (verify-changes marking findings verified, a decision note) keeps the id,
-    # so delivered scripts still run (NUSA, 18 Nov); one that alters a step, or an engine change that does, retires
+    # so delivered scripts still run (seen 2026-11-18); one that alters a step, or an engine change that does, retires
     # the scripts made before it
     digest = hashlib.sha256(json.dumps({"phases": phases, "files": files, "copies": copies, "model_id": model_id,
                                         "statuses": list(statuses)},
@@ -5206,6 +5495,8 @@ def check_bank(bank: dict, time_shift: dict[str, dict] | None = None) -> dict[st
         for where, text in (("sql", q.get("sql") or ""), ("best answer", (q.get("best_answer") or {}).get("sql") or "")):
             for lint in _sql_lint(text, time_shift):
                 warnings.append(f"{qid}: {where}: {lint}; fix with reason kind sql_error")
+        for lint in bank_column_lint(q):
+            warnings.append(f"{qid}: {lint}")
         for key in ("key", "measures", "metrics", "domain_claims"):
             if key in q and not isinstance(q[key], list):
                 problems.append(f"{qid}: {key} must be a list")
@@ -5505,7 +5796,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--changed-since", help="previous scope.json: probe only what changed since (verify-changes)")
     sp.add_argument("--findings", help="findings.json: also probe objects named by actions of --phases")
     sp.add_argument("--phases", nargs="*", default=[],
-                    help="phases applied this round: 3,4,6 or 3 4 6 (both were written; NUSA, 18 Nov)")
+                    help="phases applied this round: 3,4,6 or 3 4 6 (both were written)")
     sp.add_argument("--probe-all-changed", action="store_true",
                     help="probe every changed attribute (default: forms of a probed attribute, a new date's time "
                          "attributes other than (year), and numeric attributes with more than 50 values are "
@@ -5856,12 +6147,17 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
                                   export=_load_json(args.model_export) if args.model_export else None)
         export = _load_json(args.model_export) if args.model_export else None
         built = build_lookups(runner(), args.project, scope, sugg, args.csv_dir, where=args.where, export=export)
-        _write_json(args.out, {"version": 1, "model": scope.get("model"), "lookups": built,
-                               "sources": source_info(scope=args.scope, export=args.model_export)})
+        doc = {"version": 1, "model": scope.get("model"), "lookups": built,
+               "sources": source_info(scope=args.scope, export=args.model_export)}
+        chosen = args.period or guess_period(scope)
+        if chosen and period_kind(scope, chosen) == "event":
+            doc["notes"] = [f"no latest-period lookup for '{chosen}': {(scope.get('period') or {}).get('note')}"]
+        _write_json(args.out, doc)
         if _pending(runner):
             return 3
         print(json.dumps({"ok": True, "out": args.out, "suggestions": len(built),
-                          "csv_files": [b["csv"] for b in built if b.get("csv")]}, indent=2))
+                          "csv_files": [b["csv"] for b in built if b.get("csv")], "notes": doc.get("notes") or []},
+                         indent=2))
         return 0
     if args.cmd == "run":
         bank = _load_json(args.bank)

@@ -115,7 +115,7 @@ class GroupedNumberKeyTests(unittest.TestCase):
 
 
 class DisplayRoundingTests(unittest.TestCase):
-    # NUSA (2026-11-18): the connector shows a governed metric rounded to 3 decimals; a best answer computed as a
+    # seen 2026-11-18: the connector shows a governed metric rounded to 3 decimals; a best answer computed as a
     # decimal comes back at full precision, so equal answers failed the default 1e-6 (Q23: 68.473 vs 68.4732590)
     def test_a_value_shown_with_three_decimals_matches_within_its_rounding(self):
         cmp = lambda a, b: svm.compare_rows([{"v": a}], [{"v": b}], [], ["v"], 1e-6, "q")["status"]

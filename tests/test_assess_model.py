@@ -117,12 +117,12 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(sem["metrics"][1]["type"], "bigint")
 
     def test_types_with_parentheses_are_kept(self):
-        # NUSA item 48: '- **month__start** (timestamp(0)): ...' did not match and the column was dropped
+        # seen 2026-11-18: '- **month__start** (timestamp(0)): ...' did not match and the column was dropped
         sem = am.parse_semantics("### Attributes(Dimensions)\n"
                                  "- **month__id** (bigint): Calendar month of the start date, coded yyyyMM.\n"
                                  "- **month__start** (timestamp(0)): Calendar month (Jan = 1).\n"
                                  "- **rate** (decimal(18,2))\n"
-                                 "- **promotion in-store start date** (date)\n")
+                                 "- **order start date** (date)\n")
         by = {a["name"]: a for a in sem["attributes"]}
         self.assertEqual(by["month__start"], {"name": "month__start", "type": "timestamp", "type_full": "timestamp(0)",
                                               "description": "Calendar month (Jan = 1)."})
@@ -532,7 +532,7 @@ class PlanTests(unittest.TestCase):
             return _finding(fid, "metric_defect", actions=[{"kind": "create_compound_metric",
                                                             "args": {"name": fid, "formula": formula, "join": "outer"}}])
         report = am.check_findings({"findings": [compound("K1", "(100 * [A]) / [B]"), compound("K2", "[A] / ([B] / 100)"),
-                                                 compound("K3", "100 * [lift pct]"),
+                                                 compound("K3", "100 * [margin pct]"),
                                                  compound("K4", "[A] / (ZeroToNull([B]) / 100)"),
                                                  compound("K5", "1 - [A] / [B]")]})
         self.assertEqual(report["problems"], [])
@@ -984,22 +984,22 @@ class MaturityTests(unittest.TestCase):
         self.assertEqual((converted["dates_stored_as_numbers"], converted["dates_without_time_attributes"]), ([], []))
 
     def test_renamed_time_attributes_are_not_numeric_dates(self):
-        # NUSA round 3: Studio time attributes renamed 'month' / 'quarter', described "coded yyyyMM"
+        # seen 2026-11-18: Studio time attributes renamed 'month' / 'quarter', described "coded yyyyMM"
         def ta(base, what):
-            desc = f"Calendar {base} of the promotion IN-STORE START date, coded {what}"
+            desc = f"Calendar {base} of the order START date, coded {what}"
             return [{"name": f"{base}__id", "type": "bigint", "description": desc,
                      "profile": {"values": ["202512", "202601", "202602"] if base == "month" else ["202504", "202601"]}},
                     {"name": f"{base}__start", "type": "timestamp(0)", "description": desc}]
-        attrs = ([{"name": "promotion in-store start date", "type": "date"},
-                  {"name": "promotion in-store end date", "type": "date"}]
+        attrs = ([{"name": "order start date", "type": "date"},
+                  {"name": "order end date", "type": "date"}]
                  + ta("month", "yyyyMM (202601 = Jan 2026)") + ta("quarter", "yyyy0Q (202504 = 2025 Q4)"))
         m = am.maturity_signals({"attributes": attrs, "metrics": []})
         self.assertEqual(m["dates_stored_as_numbers"], [])
-        self.assertEqual(m["dates_without_time_attributes"], ["promotion in-store end date"])
+        self.assertEqual(m["dates_without_time_attributes"], ["order end date"])
         # without descriptions they belong to the only date of the model
         bare = [dict(x, description="") for x in attrs if "end date" not in x["name"]]
-        self.assertTrue(am.has_time_attributes("promotion in-store start date", bare))
-        self.assertFalse(am.has_time_attributes("promotion in-store end date",
+        self.assertTrue(am.has_time_attributes("order start date", bare))
+        self.assertFalse(am.has_time_attributes("order end date",
                                                 [dict(x, description="") for x in attrs]))
         # a plain yyyyMM number with no __start beside it is still a numeric date
         self.assertEqual(am.maturity_signals({"attributes": [attrs[2]], "metrics": []})["dates_stored_as_numbers"],
@@ -2006,7 +2006,7 @@ class RoleTests(unittest.TestCase):
         self.assertEqual(blocked["unanswered"], {"1": ["F9"]})
 
     def test_a_derived_metric_on_a_new_fact_metric_must_follow_phase_3(self):
-        # NUSA F008 (2026-11-18): two new fact metrics and a compound on them, all in an attribute finding (phase 3)
+        # seen 2026-11-18: two new fact metrics and a compound on them, all in an attribute finding (phase 3)
         fm = lambda n: {"kind": "add_column_fact_metric", "args": {"name": n, "column": n, "function": "avg"}}
         comp = {"kind": "create_compound_metric", "args": {"name": "avg discount depth",
                                                            "formula": "1 - [Promo Price Amount] / [list price amount]"}}
@@ -2119,7 +2119,7 @@ class ProbeTests(unittest.TestCase):
                             {"name": "term months", "type": "bigint", "profile": {"distinct_values": 5}}],
              "metrics": [{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
                          {"name": "largest proceeds", "type": "double", "formula": "max(t.csv.{PROCEEDS})"},
-                         {"name": "months delinquent", "type": "double", "formula": "avg(map.csv.{MONTHS})"},
+                         {"name": "days overdue", "type": "double", "formula": "avg(map.csv.{MONTHS})"},
                          {"name": "weighted score", "type": "double", "formula": "score x / score w"},
                          {"name": "active count", "type": "bigint", "formula": "Count(store){~, period}",
                           "description": "Stores open."}]}
@@ -2197,8 +2197,8 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("wrapping changes its value: SUM gives 653.0, CAST(SUM(...)) gives 25047440.54", largest)
         self.assertIn("same value (653.00) in every group of 'region' when filtered to latest flag = Y", largest)
         self.assertNotIn("ignores a filter", largest)                    # the filter keeps every store
-        self.assertTrue(any("reads table 'map.csv'" in x for x in mets["months delinquent"]["issues"]))
-        self.assertEqual(mets["weighted score"]["issues"], [])            # loan-level value, all loans kept: fine
+        self.assertTrue(any("reads table 'map.csv'" in x for x in mets["days overdue"]["issues"]))
+        self.assertEqual(mets["weighted score"]["issues"], [])            # entity-level value, all entities kept: fine
         self.assertTrue(any("one period only" in x for x in mets["active count"]["issues"]))
 
     def test_wrapping_an_average_is_a_note_and_an_empty_column_is_not_a_bypass(self):
@@ -2242,7 +2242,7 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(issues["net sales"], [])
 
     def test_an_average_that_moves_a_little_with_the_filter_does_not_ignore_it(self):
-        # NUSA (18 Nov): 'bill back rate amount' 0.672 unfiltered vs 0.669 filtered was called "same value"
+        # seen 2026-11-18: an average metric at 0.672 unfiltered vs 0.669 filtered was called "same value"
         scope = dict(self.SCOPE, metrics=[{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
                                           {"name": "avg rate", "type": "double", "formula": "avg(t.csv.{RATE})"}])
 
@@ -2266,15 +2266,15 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("ignores a filter that keeps 40%", run("0.672"))       # the identical value: still caught
 
     def test_a_metric_whose_plain_sum_fails_is_isolated_and_reported(self):
-        # NUSA (18 Nov): a compound with a constant failed SELECT SUM(...) with no GROUP BY (MOSAIC_INTERNAL "Invalid
+        # seen 2026-11-18: a compound with a constant failed SELECT SUM(...) with no GROUP BY (MOSAIC_INTERNAL "Invalid
         # node...") while grouped, CAST(SUM) and AVG worked; it took the other metrics of its query down with it
         scope = dict(self.SCOPE, metrics=[{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
-                                          {"name": "lift points", "type": "double", "formula": "(100 * {a}) / {b}"},
+                                          {"name": "margin points", "type": "double", "formula": "(100 * {a}) / {b}"},
                                           {"name": "units", "type": "double", "formula": "sum(t.csv.{UNITS})"}])
         err = 'MOSAIC_INTERNAL: Invalid node. Output column dependencies ([sum::[double]]) not in source plan output ([])'
 
         def answer(sql):
-            if sql.startswith("SELECT SUM(") and '"lift points"' in sql and "GROUP BY" not in sql:
+            if sql.startswith("SELECT SUM(") and '"margin points"' in sql and "GROUP BY" not in sql:
                 return err
             if sql.startswith("SELECT SUM("):
                 cols = re.findall(r"AS (m\d+)", sql)
@@ -2292,20 +2292,20 @@ class ProbeTests(unittest.TestCase):
         mets = {m["name"]: m for m in out["metrics"]}
         self.assertNotIn("error", mets["net sales"])                       # no longer taken down by its neighbour
         self.assertNotIn("error", mets["units"])
-        lift = mets["lift points"]
-        self.assertTrue(lift["error"])
-        self.assertIn("Invalid node", lift["error_text"])
-        self.assertEqual(lift["works"], ["CAST(SUM(...))", "grouped by 'period'", "AVG(...)"])
-        self.assertTrue(any(w.startswith("metric 'lift points': a plain SUM(...) with no GROUP BY fails")
+        pts = mets["margin points"]
+        self.assertTrue(pts["error"])
+        self.assertIn("Invalid node", pts["error_text"])
+        self.assertEqual(pts["works"], ["CAST(SUM(...))", "grouped by 'period'", "AVG(...)"])
+        self.assertTrue(any(w.startswith("metric 'margin points': a plain SUM(...) with no GROUP BY fails")
                             and "These work: CAST(SUM(...)), grouped by 'period', AVG(...)" in w for w in out["warnings"]))
 
     def test_a_constant_times_a_blank_operand_reading_0_is_a_warning(self):
-        # NUSA item 47 (18 Nov, round 3): 'event lift % (points)' = 100 * {Lift PCT} read 0 for statuses where
-        # 'lift pct' is blank; the probe listed only the rewritten metric, so its operand is read for the check
+        # seen 2026-11-18 (a verify round): a points metric = 100 * {Margin PCT} read 0 for groups where
+        # 'margin pct' is blank; the probe listed only the rewritten metric, so its operand is read for the check
         scope = dict(self.SCOPE, metrics=[{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
-                                          {"name": "lift pct", "type": "double", "formula": "{A} / ZeroToNull({B})"},
-                                          {"name": "lift points", "type": "double", "formula": "100 * {Lift PCT}"}])
-        grouped = {"lift pct": [["2024", "0.5"], ["2025", ""]], "lift points": [["2024", "50"], ["2025", "0"]],
+                                          {"name": "margin pct", "type": "double", "formula": "{A} / ZeroToNull({B})"},
+                                          {"name": "margin points", "type": "double", "formula": "100 * {Margin PCT}"}])
+        grouped = {"margin pct": [["2024", "0.5"], ["2025", ""]], "margin points": [["2024", "50"], ["2025", "0"]],
                    "net sales": [["2024", "10"], ["2025", "12"]]}
 
         def answer(sql):
@@ -2320,16 +2320,16 @@ class ProbeTests(unittest.TestCase):
                 return [["g"] + re.findall(r"AS (m\d+)", sql)]
             return self.answer(sql)
         runner = _SqlRunner(answer)
-        out = am.probe_objects(runner, "retail", scope, period="period", attributes=[], metrics=["lift points"])
+        out = am.probe_objects(runner, "retail", scope, period="period", attributes=[], metrics=["margin points"])
         item = out["metrics"][0]
         self.assertEqual(item["groups"]["period"], [["2024", 50.0], ["2025", 0.0]])
-        self.assertTrue(any(x.startswith("reads 0 in 1 group(s) of 'period' where 'lift pct' is blank (2025)")
+        self.assertTrue(any(x.startswith("reads 0 in 1 group(s) of 'period' where 'margin pct' is blank (2025)")
                             for x in item["issues"]))
-        self.assertTrue(any('SUM("lift pct")' in c[1]["query"] and "GROUP BY" in c[1]["query"] for c in runner.calls))
+        self.assertTrue(any('SUM("margin pct")' in c[1]["query"] and "GROUP BY" in c[1]["query"] for c in runner.calls))
         # against the previous round's probe: blank became 0
-        prev = {"metrics": [{"name": "lift points", "groups": {"period": [["2024", 50.0], ["2025", None]]}}]}
+        prev = {"metrics": [{"name": "margin points", "groups": {"period": [["2024", 50.0], ["2025", None]]}}]}
         out = am.probe_objects(_SqlRunner(answer), "retail", scope, period="period", attributes=[],
-                               metrics=["lift points"], previous=prev)
+                               metrics=["margin points"], previous=prev)
         self.assertTrue(any("blank and 0 changed places since the previous probe (by 'period' 2025: blank -> 0)" in w
                             for w in out["warnings"]))
         self.assertEqual(am.blank_zero_changes({"period": [["a", None], ["b", 1.0]]},
@@ -2337,7 +2337,7 @@ class ProbeTests(unittest.TestCase):
                          {"period": ["a: 0 -> blank"]})
 
     def test_metric_only_phases_reuse_profiles_and_join_paths(self):
-        # NUSA (18 Nov): ~120 identical queries re-run after a phase that rewrote one derived metric
+        # seen 2026-11-18: ~120 identical queries re-run after a phase that rewrote one derived metric
         def f(fid, phase, *actions):
             return {"id": fid, "phase": phase, "actions": list(actions)}
         doc = {"findings": [f("F1", 4, {"kind": "create_compound_metric", "args": {"name": "x"}}),
@@ -2970,25 +2970,25 @@ class ReferenceChangeTests(unittest.TestCase):
             self.assertIn("status code__id", json.load(f)["questions"][0]["sql"])
 
     def test_approved_renames_are_replacements_without_an_export(self):
-        # NUSA (18 Nov): two approved F004 renames were reported "no replacement found" and raised N- findings
-        old = {"model": "M", "attributes": [], "metrics": [{"name": "forecasted units"}, {"name": "sales"}]}
-        new = {"model": "M", "attributes": [], "metrics": [{"name": "forecasted incremental units"}, {"name": "sales"}]}
+        # seen 2026-11-18: two approved F004 renames were reported "no replacement found" and raised N- findings
+        old = {"model": "M", "attributes": [], "metrics": [{"name": "planned units"}, {"name": "sales"}]}
+        new = {"model": "M", "attributes": [], "metrics": [{"name": "planned units shipped"}, {"name": "sales"}]}
         findings = {"findings": [
             {"id": "F004", "status": "approved", "applied_phases": [6], "actions": [{"kind": "rename_describe", "args": {
-                "items": [{"object_type": "fact_metric", "current_name": "forecasted units",
-                           "new_name": "forecasted incremental units"}]}}]},
+                "items": [{"object_type": "fact_metric", "current_name": "planned units",
+                           "new_name": "planned units shipped"}]}}]},
             {"id": "F009", "status": "declined", "actions": [{"kind": "rename_describe", "args": {
                 "items": [{"object_type": "fact_metric", "current_name": "sales", "new_name": "gross sales"}]}}]}]}
         renames = am.approved_renames(findings)
-        self.assertEqual(renames, {"forecasted units": ("forecasted incremental units", "F004")})   # declined: no
+        self.assertEqual(renames, {"planned units": ("planned units shipped", "F004")})   # declined: no
         (c,) = am.reference_changes(old, new, renames=renames)
-        self.assertEqual((c["replacement"], c["how"]), ("forecasted incremental units",
+        self.assertEqual((c["replacement"], c["how"]), ("planned units shipped",
                                                         "an approved rename (F004, findings.json)"))
         bank = {"model": "M", "questions": [{"id": "Q3", "question": "q", "level": 1,
-                                             "sql": 'SELECT SUM("forecasted units") FROM {{MODEL}}'}]}
+                                             "sql": 'SELECT SUM("planned units") FROM {{MODEL}}'}]}
         usage = am.apply_reference_changes(bank, [c], round_no=2, apply=True)
         self.assertEqual(usage["unresolved"], [])
-        self.assertIn('"forecasted incremental units"', bank["questions"][0]["sql"])
+        self.assertIn('"planned units shipped"', bank["questions"][0]["sql"])
         self.assertEqual(am.reference_findings([c], usage, 2), [])                 # no N- finding to answer
         (bare,) = am.reference_changes(old, new)
         self.assertIsNone(bare["replacement"])                                       # without findings: as before
@@ -3062,13 +3062,13 @@ class JoinPathTests(unittest.TestCase):
     def test_whole_names_only(self):
         scope = {**self.SCOPE, "metrics": [
             {"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
-            {"name": "loans", "type": "double", "formula": "Count(Loan)"},
+            {"name": "orders", "type": "double", "formula": "Count(Order)"},
             {"name": "age", "type": "double", "formula": "Avg({Loan Age})"}],
-            "attributes": [{"name": "loan", "type": "varchar"}]}
+            "attributes": [{"name": "order", "type": "varchar"}]}
         runner = _ErrRunner(lambda sql: [["n"], ["100"]] if "GROUP BY" not in sql else
                             [["v", "n"], ["L1", "100"], ["L2", "100"]])
         out = am.check_join_paths(runner, "P", scope)
-        self.assertEqual(out["metrics_filtering_flagged"], [{"metric": "loans", "attribute": "loan"}])
+        self.assertEqual(out["metrics_filtering_flagged"], [{"metric": "orders", "attribute": "order"}])
 
     EXPORT = {"model": [{
         "factMetrics": [{"information": {"objectId": "FM", "name": "Net Sales"},
@@ -3190,7 +3190,7 @@ class PhaseGateTests(unittest.TestCase):
              "actions": [], "needs_answer": True}]}
 
     def test_a_spec_only_a_blocked_phase_reads_is_held_back(self):
-        # NUSA (2026-11-18): specs/rename_describe.json was written while phase 6, its only reader, was blocked
+        # seen 2026-11-18: specs/rename_describe.json was written while phase 6, its only reader, was blocked
         rd = {"kind": "rename_describe", "args": {"items": [
             {"object_type": "attribute", "current_name": "region", "description": "Sales region."}]}}
         doc = {"model": "M", "findings": [
@@ -3212,7 +3212,7 @@ class PhaseGateTests(unittest.TestCase):
         self.assertNotIn("files_held", plan)
 
     def test_the_plan_id_follows_the_steps_not_every_finding_field(self):
-        # NUSA (18 Nov): plan after verify-changes changed the id though no script changed
+        # seen 2026-11-18: plan after verify-changes changed the id though no script changed
         doc = self._doc()
         plan = am.build_plan(doc, model_id="MID")
         doc["findings"][0]["decision_note"] = "approved after review"           # no step changes
@@ -3241,7 +3241,7 @@ class PhaseGateTests(unittest.TestCase):
         self.assertIn("nothing is left to run", json.loads(buf.getvalue())["plan_id_note"])
 
     def test_probe_takes_phases_as_a_comma_or_space_list(self):
-        # NUSA (18 Nov): verify-changes' text showed "--phases 3 4 6"; the engine took only "3,4,6"
+        # seen 2026-11-18: verify-changes' text showed "--phases 3 4 6"; the engine took only "3,4,6"
         parser = am.build_parser()
         for argv in (["3,4,6"], ["3", "4", "6"], ["3,", "4", "6"]):
             args = parser.parse_args(["probe", "--project", "p", "--scope", "s.json", "--out", "o.json", "--phases"] + argv)

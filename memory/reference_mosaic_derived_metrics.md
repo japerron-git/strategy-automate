@@ -322,7 +322,7 @@ period); never read it as a total or by deal alone, which return unshifted value
 `,` the metric (`object_reference`) `)` `{~+}` `)` `{~+}` end_of_text; dimty `report_base_level`. The tree
 nests three embedded objects (Sum agg_metric → report-level metric → `previous_month` operator with a
 `form_shortcut`, an int32 constant and the metric). When the metric was created, the date attribute gained
-hidden Day and Week time attributes (Test C's dates have them too, from a Studio publish; `add-time-attributes`
+hidden Day and Week time attributes (dates given time attributes by a Studio publish have them too; `add-time-attributes`
 never adds them). `build_mosaic.py create-time-shift-metric` posts exactly these tokens (checked token for token
 against the capture) and requires the date's Day interval and the function's own interval.
 
@@ -356,14 +356,14 @@ A numeric constant multiplying a fact metric inside a ratio breaks the plain ung
 `(100 * {A}) / {B}` and `({A} * 100) / {B}` fail `SELECT SUM("<metric>") FROM <model>` (no GROUP BY) with
 MOSAIC_INTERNAL "Invalid node. Output column dependencies ([sum::[double]]) not in source plan output ([])".
 Grouped queries, `AVG(...)` and `CAST(SUM(...))` read it. `100 * [ratio metric]` and `100 * ({A} / {B})` work
-ungrouped and return the same values grouped. A constant in a subtraction over compounds (`1 - (...)`, CPR)
-works. Reported to the user as a Mosaic planner defect (probe 5, scratch model; NUSA 'event lift %
-(points)').
+ungrouped and return the same values grouped. A constant in a subtraction over compounds (`1 - (...)`, an annualized rate)
+works. Reported to the user as a Mosaic planner defect (probe 5, 2026-11-18, scratch model, two tenants; first seen
+on a percentage-points metric).
 
-**But a constant times a blank reads 0** (probe 6, 2026-11-18, scratch model, 25 metrics; NUSA round 3).
+**But a constant times a blank reads 0** (probe 6, 2026-11-18, scratch model, 25 metrics; first seen in a verify round).
 `100 * [ratio]` and `100 * ({A} / ZeroToNull({B}))` read 0 in groups where the ratio is blank (B = 0),
-with join outer, inner or default alike: the join type doesn't change it. On NUSA, statuses with no units
-sold read 0 instead of blank.
+with join outer, inner or default alike: the join type doesn't change it. On the model where it was seen, groups with a zero
+denominator read 0 instead of blank.
 
 | Form (A, B fact or compound metrics) | Zero-denominator group | Real 0 (A = 0) | Ungrouped SUM |
 |---|---|---|---|

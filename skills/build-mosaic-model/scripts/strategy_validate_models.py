@@ -266,7 +266,7 @@ def _shown_decimals(value: Any) -> int | None:
 
 def within_display_rounding(a: Any, b: Any, av: float, bv: float) -> bool:
     """Equal once the side shown with 1-3 decimals (a governed metric, rounded by the connector) is taken as
-    rounded: the other side shows more decimals, and they differ by no more than half the 3rd decimal (NUSA, 18 Nov:
+    rounded: the other side shows more decimals, and they differ by no more than half the 3rd decimal (seen 2026-11-18:
     68.473 vs 68.4732590). Whole numbers are not loosened."""
     da, db = _shown_decimals(a), _shown_decimals(b)
     if da is None or db is None or da == db:

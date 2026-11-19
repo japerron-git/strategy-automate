@@ -7131,7 +7131,7 @@ def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[li
 
 def rename_describe_report(writes: list, notes: list[str], dry_run: bool) -> dict[str, Any]:
     """"skipped" holds only items not written (unchanged, renamed already); the rest of the notes (a form described
-    on its attribute, a time attribute) go under "notes", so nothing reads as both written and skipped (NUSA, 18 Nov)."""
+    on its attribute, a time attribute) go under "notes", so nothing reads as both written and skipped (seen 2026-11-18)."""
     skipped = [n for n in notes if n.endswith(": unchanged") or ": already renamed to " in n]
     return {"ok": True, "dry_run": dry_run, "changed": [w[0] for w in writes], "skipped": skipped,
             "notes": [n for n in notes if n not in skipped]}

@@ -120,7 +120,7 @@ blocks; the parser joins them).
   `(100 * {A}) / {B}` and `({A} * 100) / {B}` return MOSAIC_INTERNAL "Invalid node. Output column dependencies
   ([sum::[double]]) not in source plan output ([])" for `SELECT SUM("<metric>")` with no GROUP BY, on two
   tenants; grouped, `AVG(...)` and `CAST(SUM(...))` read it. `100 * [ratio metric]` and `100 * ({A} / {B})`
-  work ungrouped and give the same values (verified 2026-11-18, probe 5, scratch model; NUSA F015). Write the
+  work ungrouped and give the same values (verified 2026-11-18 on a scratch model, two tenants). Write the
   constant outside the ratio. `probe` now reports a metric whose plain SUM fails (issue + warning naming the
   error and the shapes that work), and probes it alone so the other metrics of its query aren't marked failed.
 - **Form columns have two names.** `get_semantics` lists a form as `<attribute>__<form>` (`month__id`,
@@ -143,8 +143,8 @@ An aggregate over attributes only runs on the attributes' lookup tables — the 
 narrow virtual lookup Mosaic makes per attribute when the model has none — not on the fact rows.
 Aggregates of fact metrics run on the fact. So:
 - `SUM(CASE WHEN <attribute condition> THEN 1 ELSE 0 END)` counted lookup rows: 1 (one matching status)
-  and 12 (promotions) where the fact had 869 and 216 rows. `COUNT(*)` counted fact rows alone, but
-  promotion-table rows (86) once a CASE on an attribute joined the query: never rely on it.
+  and 12 (one table's members) where the fact had 869 and 216 rows. `COUNT(*)` counted fact rows alone, but
+  that table's rows (86) once a CASE on an attribute joined the query: never rely on it.
 - `AVG`/`SUM` of a numeric attribute averages or sums the lookup's values (a mapping table's 01-35
   averaged to 18 where the per-entity answer was 9.6).
 - Queries with attributes only list the lookup's members, including members with no fact rows, and a
@@ -162,21 +162,35 @@ Aggregates of fact metrics run on the fact. So:
   columns inside subqueries, `DATE_DIFF` on real date columns.
 - **Wrapping a metric's aggregate can change its value** (seen on one model, 2026-11-11): for fact
   metrics whose own aggregation is not a sum (a Max on loss amounts, an average on a rate), plain
-  `SUM("<metric>")` returned the governed value (the Max: one loan's amount; the rate's average), while
+  `SUM("<metric>")` returned the governed value (the Max: one entity's amount; the rate's average), while
   `CAST(SUM("<metric>") AS VARCHAR)` returned the per-row sum ($25.0M against $653k). Not reproduced on a
   model whose averages and ratios are derived metrics. `1.0 * SUM("<metric>")` kept the governed average
   there (shown with 1 decimal); `ROUND` is untested. So: read governed values plain, as analysts write
   them (the connector's thousands separators are parsed by the engine), and never wrap a non-sum metric
   in `CAST`; use `CAST` around a metric only when a row-level value is meant.
 - **Averages of an integer-typed metric are truncated** (same model): plain `SUM("<avg metric>")` read
-  FICO 746.87 as 746 and LTV 79.02 as 79 — truncated, not rounded — while `AVG("<avg metric>")` returned 3
+  a score average of 746.87 as 746 and a percentage of 79.02 as 79 — truncated, not rounded — while `AVG("<avg metric>")` returned 3
   decimals. The metric's data type (integer) drops the fraction. Set the metric's type to a decimal; until
   then read it with `AVG(...)`. `probe` compares the two for every raw average metric. `probe` compares the two forms and
   flags a metric whose value changes (a Max or other non-sum aggregation as a warning; an average as a
   note, since that is expected; an empty column, NULL plain and 0 wrapped, as neither).
-- Ratios of summed metrics: `SUM(a) / SUM(b)` on decimals came back with 3 decimals on one model;
-  `1.0 * SUM(a) / SUM(b)` kept full precision. Arithmetic is safe around summed metrics only: for a
-  non-sum metric, read each aggregate plain and divide afterwards.
+- **Number types, and how the connector shows them** (verified live 2026-11-19 on two models; standard Trino
+  typing except where marked):
+  - The connector shows a DOUBLE rounded to 3 decimals with trailing zeros dropped (0.06965 as `0.07`,
+    69651.4737 as `69,651.474`) and a DECIMAL in full at its scale (`0.03375299014623370`). Governed metrics are
+    usually DOUBLE, so they compare at the 3rd decimal (`grade` allows half of it: `within_display_rounding`).
+    For a small ratio that is coarse: 0.0698 and 0.0702 both read `0.07`.
+  - A decimal literal is a DECIMAL: `1.0` is DECIMAL(2,1). `1.0 * <integer>` keeps one decimal, and so does
+    AVG of it: `AVG(1.0 * n)` read 69651.5 for 69651.474. `1.0 * SUM(a) / SUM(b)` over integer counts came back
+    DECIMAL(38,17), full precision. `1.0 * <double>` stays DOUBLE.
+  - Mosaic, not standard Trino: integer / integer returned a DOUBLE (69,651.474, where Trino truncates), and
+    AVG of an integer returns a DOUBLE.
+  - `CAST(SUM("<governed count or compound metric>") AS DOUBLE)` read the governed value: no bypass, unlike
+    `CAST(... AS VARCHAR)` over the non-sum fact metrics above.
+  - So, in SQL the engine checks: an average of a computed integer is `1.0 * SUM(n) / COUNT(n)` (full precision)
+    or `AVG(n)` (3 decimals shown), never `AVG(1.0 * n)` (`check` warns, `run` flags); a ratio of summed
+    integer or decimal metrics is `1.0 * SUM(a) / SUM(b)`. Arithmetic is safe around summed metrics only: for a
+    non-sum metric, read each aggregate plain and divide afterwards.
 - Models with several fact tables (user guidance, not yet tested here): a metric present in several
   facts can be steered to one fact by adding a hint metric from that fact to the query; use one anchor
   per fact table, and say in descriptions which hint metric to add.
@@ -191,7 +205,7 @@ values) as changed, so a data change it can't see in names or formulas still get
 by an expression instead of a plain column, at any level (an outer query over a subquery too), and
 `check --bank` warns about any already in the bank. Seen live: a vintage grouped by
 `CAST(date / 100 AS INTEGER)` returned each year several times (the comparison failed on duplicate
-keys), and FICO bands grouped by a `CASE` timed out. Group by the attribute or its time attribute.
+keys), and score bands grouped by a `CASE` timed out. Group by the attribute or its time attribute.
 Number keys lose their thousands separators before comparison ("2,015" = "2015"). A query that times
 out is graded `timeout`, not `error`: it says the query is slow (or wrongly shaped), not that the model
 answered wrong. The maturity check for summed rates leaves out weighted-average parts (a numerator
@@ -260,13 +274,13 @@ Resolved:
   supported"); the DATE test works there, so `references` keeps it.
 - *Blank dates:* time attributes read a blank date as 1899 (year 1899, month 1899-12); probe warns when a
   time attribute starts far before its date.
-- *Blank groups read as 0 (NUSA item 47, 18 Nov):* a constant times a blank operand evaluates as 0, so
+- *Blank groups read as 0 (verified 2026-11-18):* a constant times a blank operand evaluates as 0, so
   `100 * [ratio]` reads 0 where the ratio is blank. `probe` keeps each metric's grouped values (`groups`,
   by `--period` and by the partner, up to 60 each), reads the operands of a probed derived metric (`{Name}`
   in its formula) when the probe list left them out, and warns when the metric reads 0 in a group where
   every operand is blank. `--previous <last round's probes.json>` also warns when a group went from blank
   to 0 or back (an older probes.json has no `groups`: nothing to compare).
-- *Types with parentheses (NUSA item 48):* get_semantics shows `timestamp(0)` and `decimal(18,2)`; an
+- *Types with parentheses (seen 2026-11-18):* get_semantics shows `timestamp(0)` and `decimal(18,2)`; an
   entry with such a type used to be dropped from scope.json (every time attribute's `__start`). The scope
   keeps the base type in `type` (`timestamp`) and the full one in `type_full`. A time attribute's `__start`
   is kept but not profiled, and probe skips it (its `__id` is probed).
@@ -275,10 +289,34 @@ Resolved:
   <scope_round<N-1>.json>` keeps last round's profiles for attributes with the same name and type, and
   `join-paths --phases` carries the previous join_paths.json forward (`carried`) when no attribute it would
   test is new (`--always` re-runs). A data reload between rounds isn't seen in such a round.
-- *Renamed time attributes (NUSA item 46):* `month__id` with a timestamp `month__start` beside it is a
+- *Renamed time attributes (seen 2026-11-18):* `month__id` with a timestamp `month__start` beside it is a
   Studio time attribute, not a date stored as a number, whatever its description says ("coded yyyyMM").
   It belongs to the date its description names, or to the model's only date. Maturity and the
   time-attribute suggestion read it that way.
+- *Result columns in grading:* `grade` matches a key or measure named `<attribute>__<form>` to the
+  connector's `<attribute> (<form>)` header (and ignores case, quotes and spacing). A key or measure a result
+  doesn't have is an error that names the result's columns, not a blank key. "Duplicate keys" blames grouping
+  by an expression only when that side's SQL does; otherwise it says the key doesn't identify one row.
+  `check --bank` warns when the question SQL, best answer or expected SQL outputs no column named in `key` /
+  `measures` (`output_columns`: aliases, else bare column names; `SELECT *` is not checked).
+- *Snapshot period or event date:* `scope` records `period` for the guessed period attribute: distinct
+  periods per entity on the fact (rows read through the anchor). At least 90% of entities with one period is
+  an `event` date (an order, start or shipment date), at least 1.5 periods per entity on average a `snapshot`,
+  else `mixed`; no entity or anchor is `unknown`. Verified live 2026-11-19 on one model holding both: the
+  reporting period averaged 33 periods per entity (none with one), a first-payment date 1 (all but 5 of 478k
+  entities). `lookups` offers no latest-period lookup for an event date, and `probe` filters an event date
+  on its busiest period. A metric-only verify round reuses the previous round's `period`.
+- *Periods after the run date:* a period after the scope's `generated` date (a plan, forecast or scheduled
+  date) is never "latest": `scope` lists them under `period.after_run_date`, the period lookup flags the
+  latest one not after the run date (`latest_note` says so), and `probe` filters on that one. A data set
+  whose as-of date is earlier than the run date can still hold planned periods between the two; the engine
+  can't see an as-of date it isn't given.
+- *Anchor ties:* when several raw fact metrics are filled on equally many rows, `scope` prefers one not
+  described as empty, unused or deprecated, then the first holding a non-zero value (one `MAX(ABS(...))`
+  query, only on a tie), and records why under `anchor.tie_break`. An all-zero column counts rows but reads
+  nothing, and a reload that leaves it NULL would break every count built on it.
+- *Summed rates:* the maturity check's word list no longer has "term" (a horizon in "long term spend", not a
+  rate); a term stored on every row is still caught by "months" in its name or by the `roles` data check.
 - *Probe list after new attributes:* forms of a probed attribute, time attributes other than (year), and
   numeric attributes with more than 50 values are listed under `not_probed` (`--probe-all-changed`).
 - *Previewing a phase without the tenant:* `set-column-types`, `wire-relationships` and `rename-describe`
@@ -303,8 +341,8 @@ model probably cannot answer.
 - **Verdict:** `pass` (matches the expected value within tolerance), `fail`, `error` (query
   failed), `empty` (no rows on either side), `ungraded` (no expected value). The connector shows a governed
   metric rounded to 3 decimals: when one side shows 1-3 decimals and the other more, they match within half
-  the 3rd decimal (0.0005), whatever the relative tolerance (`within_display_rounding`; NUSA Q23 68.473 vs
-  68.4732590). Whole numbers are not loosened.
+  the 3rd decimal (0.0005), whatever the relative tolerance (`within_display_rounding`; 68.473 vs
+  68.4732590 match). Whole numbers are not loosened.
 - **Expected-value strength:** `reference` (trusted source) > `recomputed` (independent extract) >
   `same_model` (raw columns of the same model — consistency only).
 - **Answer path:** `governed_metric` (a metric answers it directly), `simple_sql` (metrics plus
@@ -448,7 +486,7 @@ blocks included, the spec files and lookup copies), not every finding field: a c
 (a decision note, findings marked verified while other phases still run the same steps) keeps it; `plan`
 says whether it changed and why (`plan_id_note`). The plan also records `engine_commit` (outside the id),
 and every phase script stops before any step when its clone doesn't contain that commit
-(`git merge-base --is-ancestor`), telling the user to `git pull` with no remote name (NUSA, 18 Nov: a clone
+(`git merge-base --is-ancestor`), telling the user to `git pull` with no remote name (seen 2026-11-18: a clone
 two commits behind refused what the plan needed; its remote was `fork`, not `origin`).
 
 **Test outcomes every round, not edits.** Tables and attributes change in too many ways to predict, so
@@ -619,7 +657,7 @@ label column is listed as an attribute that no metric filters on.
   the metric read right through the connector, so it adds no "publish from Studio" step. A column only on a
   lookup table is not yet run live. A derived metric that reads a fact metric the plan adds this way must be
   in phase 4 or later, so it's created after phase 3's republish: `check --findings` and `plan` refuse a
-  finding in phases 1-3 that does this and say to set its `"phase": 4` (NUSA F008, 18 Nov).
+  finding in phases 1-3 that does this and say to set its `"phase": 4` (seen 2026-11-18).
 - **Spec files held back:** a spec file (`specs/*.json`) that only blocked phases read is listed under
   `files_held` in the plan and isn't written into the bundle until those phases are answered (the plugin's
   script writer already skipped them; `plan` now does too).
