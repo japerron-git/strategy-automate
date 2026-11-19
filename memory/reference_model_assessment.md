@@ -260,6 +260,16 @@ Resolved:
   supported"); the DATE test works there, so `references` keeps it.
 - *Blank dates:* time attributes read a blank date as 1899 (year 1899, month 1899-12); probe warns when a
   time attribute starts far before its date.
+- *Blank groups read as 0 (NUSA item 47, 18 Nov):* a constant times a blank operand evaluates as 0, so
+  `100 * [ratio]` reads 0 where the ratio is blank. `probe` keeps each metric's grouped values (`groups`,
+  by `--period` and by the partner, up to 60 each), reads the operands of a probed derived metric (`{Name}`
+  in its formula) when the probe list left them out, and warns when the metric reads 0 in a group where
+  every operand is blank. `--previous <last round's probes.json>` also warns when a group went from blank
+  to 0 or back (an older probes.json has no `groups`: nothing to compare).
+- *Renamed time attributes (NUSA item 46):* `month__id` with a timestamp `month__start` beside it is a
+  Studio time attribute, not a date stored as a number, whatever its description says ("coded yyyyMM").
+  It belongs to the date its description names, or to the model's only date. Maturity and the
+  time-attribute suggestion read it that way.
 - *Probe list after new attributes:* forms of a probed attribute, time attributes other than (year), and
   numeric attributes with more than 50 values are listed under `not_probed` (`--probe-all-changed`).
 - *Previewing a phase without the tenant:* `set-column-types`, `wire-relationships` and `rename-describe`

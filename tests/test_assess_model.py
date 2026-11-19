@@ -926,6 +926,28 @@ class MaturityTests(unittest.TestCase):
             {"name": "month date (month)__id", "type": "bigint"}], "metrics": []})
         self.assertEqual((converted["dates_stored_as_numbers"], converted["dates_without_time_attributes"]), ([], []))
 
+    def test_renamed_time_attributes_are_not_numeric_dates(self):
+        # NUSA round 3: Studio time attributes renamed 'month' / 'quarter', described "coded yyyyMM"
+        def ta(base, what):
+            desc = f"Calendar {base} of the promotion IN-STORE START date, coded {what}"
+            return [{"name": f"{base}__id", "type": "bigint", "description": desc,
+                     "profile": {"values": ["202512", "202601", "202602"] if base == "month" else ["202504", "202601"]}},
+                    {"name": f"{base}__start", "type": "timestamp(0)", "description": desc}]
+        attrs = ([{"name": "promotion in-store start date", "type": "date"},
+                  {"name": "promotion in-store end date", "type": "date"}]
+                 + ta("month", "yyyyMM (202601 = Jan 2026)") + ta("quarter", "yyyy0Q (202504 = 2025 Q4)"))
+        m = am.maturity_signals({"attributes": attrs, "metrics": []})
+        self.assertEqual(m["dates_stored_as_numbers"], [])
+        self.assertEqual(m["dates_without_time_attributes"], ["promotion in-store end date"])
+        # without descriptions they belong to the only date of the model
+        bare = [dict(x, description="") for x in attrs if "end date" not in x["name"]]
+        self.assertTrue(am.has_time_attributes("promotion in-store start date", bare))
+        self.assertFalse(am.has_time_attributes("promotion in-store end date",
+                                                [dict(x, description="") for x in attrs]))
+        # a plain yyyyMM number with no __start beside it is still a numeric date
+        self.assertEqual(am.maturity_signals({"attributes": [attrs[2]], "metrics": []})["dates_stored_as_numbers"],
+                         ["month__id"])
+
     def test_stored_dates_need_valid_values_and_a_second_signal(self):
         def a(name, values, typ="bigint", desc=""):
             return {"name": name, "type": typ, "description": desc,
@@ -2219,6 +2241,43 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(lift["works"], ["CAST(SUM(...))", "grouped by 'period'", "AVG(...)"])
         self.assertTrue(any(w.startswith("metric 'lift points': a plain SUM(...) with no GROUP BY fails")
                             and "These work: CAST(SUM(...)), grouped by 'period', AVG(...)" in w for w in out["warnings"]))
+
+    def test_a_constant_times_a_blank_operand_reading_0_is_a_warning(self):
+        # NUSA item 47 (18 Nov, round 3): 'event lift % (points)' = 100 * {Lift PCT} read 0 for statuses where
+        # 'lift pct' is blank; the probe listed only the rewritten metric, so its operand is read for the check
+        scope = dict(self.SCOPE, metrics=[{"name": "net sales", "type": "double", "formula": "sum(t.csv.{NET SALES})"},
+                                          {"name": "lift pct", "type": "double", "formula": "{A} / ZeroToNull({B})"},
+                                          {"name": "lift points", "type": "double", "formula": "100 * {Lift PCT}"}])
+        grouped = {"lift pct": [["2024", "0.5"], ["2025", ""]], "lift points": [["2024", "50"], ["2025", "0"]],
+                   "net sales": [["2024", "10"], ["2025", "12"]]}
+
+        def answer(sql):
+            names = re.findall(r'SUM\("([^"]+)"\) AS (m\d+)', sql)
+            if sql.startswith('SELECT CAST("period" AS VARCHAR) AS g'):
+                rows = [[g] + [dict(grouped[n])[g] for n, _ in names] for g in ("2024", "2025")]
+                return [["g"] + [m for _, m in names]] + rows
+            if sql.startswith("SELECT SUM(") or sql.startswith("SELECT CAST(SUM("):
+                cols = re.findall(r"AS (m\d+)", sql)
+                return [cols, ["50"] * len(cols)]
+            if sql.startswith('SELECT CAST("') and "AS g" in sql:
+                return [["g"] + re.findall(r"AS (m\d+)", sql)]
+            return self.answer(sql)
+        runner = _SqlRunner(answer)
+        out = am.probe_objects(runner, "retail", scope, period="period", attributes=[], metrics=["lift points"])
+        item = out["metrics"][0]
+        self.assertEqual(item["groups"]["period"], [["2024", 50.0], ["2025", 0.0]])
+        self.assertTrue(any(x.startswith("reads 0 in 1 group(s) of 'period' where 'lift pct' is blank (2025)")
+                            for x in item["issues"]))
+        self.assertTrue(any('SUM("lift pct")' in c[1]["query"] and "GROUP BY" in c[1]["query"] for c in runner.calls))
+        # against the previous round's probe: blank became 0
+        prev = {"metrics": [{"name": "lift points", "groups": {"period": [["2024", 50.0], ["2025", None]]}}]}
+        out = am.probe_objects(_SqlRunner(answer), "retail", scope, period="period", attributes=[],
+                               metrics=["lift points"], previous=prev)
+        self.assertTrue(any("blank and 0 changed places since the previous probe (by 'period' 2025: blank -> 0)" in w
+                            for w in out["warnings"]))
+        self.assertEqual(am.blank_zero_changes({"period": [["a", None], ["b", 1.0]]},
+                                               {"period": [["a", 0.0], ["b", None], ["c", None]]}),
+                         {"period": ["a: 0 -> blank"]})
 
     def test_needs_an_anchor(self):
         with self.assertRaises(SystemExit):

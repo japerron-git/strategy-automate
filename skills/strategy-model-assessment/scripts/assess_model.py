@@ -688,11 +688,42 @@ _HELPER_METRIC = re.compile(r"\b(numerator|denominator|helper)\s*$", re.I)
 TIME_INTERVALS = ("year", "quarter", "month", "week", "day")
 
 
-def has_time_attributes(name: str, all_names: list[str]) -> bool:
-    """Studio's time attributes show on the connector as '<date> (<interval>)__id / __start / __desc'."""
+def time_attribute_columns(attrs: list) -> dict[str, list[dict]]:
+    """Studio time attributes by name: '<t>__id' with a timestamp '<t>__start' beside it (and often '<t>__desc').
+    Their __id is a yyyyMM-style number by design, not a date stored as a number. Takes attribute dicts; a list
+    of names finds none (no types)."""
+    by = {(a.get("name") or "").lower(): a for a in attrs if isinstance(a, dict)}
+    out: dict[str, list[dict]] = {}
+    for n, a in by.items():
+        if not n.endswith("__id"):
+            continue
+        base = n[:-len("__id")]
+        start = by.get(base + "__start")
+        if start and (start.get("type") or "").lower().startswith(("timestamp", "date")):
+            out[base] = [x for x in (a, start, by.get(base + "__desc")) if x]
+    return out
+
+
+def has_time_attributes(name: str, all_names: list) -> bool:
+    """Studio's time attributes show on the connector as '<date> (<interval>)__id / __start / __desc'. Renamed ones
+    ('month__id', NUSA) belong to the date their descriptions name, or to the only date when the model has one.
+    all_names: attribute names, or attribute dicts (needed for renamed time attributes)."""
+    names = [(n.get("name") or "") if isinstance(n, dict) else n for n in all_names]
     pre = name.lower() + " ("
-    return any(n.lower().startswith(pre) and n.lower().endswith(")__id")
-               and n.lower()[len(pre):-len(")__id")] in TIME_INTERVALS for n in all_names)
+    if any(n.lower().startswith(pre) and n.lower().endswith(")__id")
+           and n.lower()[len(pre):-len(")__id")] in TIME_INTERVALS for n in names):
+        return True
+    renamed = {b: cols for b, cols in time_attribute_columns(all_names).items()
+               if not re.search(r" \((" + "|".join(TIME_INTERVALS) + r")\)$", b)}
+    if not renamed:
+        return False
+    texts = [" ".join((c.get("description") or "") for c in cols).lower() for cols in renamed.values()]
+    if any(name.lower() in t for t in texts):
+        return True
+    dates = [a for a in all_names if isinstance(a, dict) and "__" not in (a.get("name") or "")
+             and (a.get("type") or "").lower() in ("date", "timestamp")]
+    named_elsewhere = [d for d in dates if any((d.get("name") or "").lower() in t for t in texts)]
+    return len(dates) == 1 and dates[0].get("name", "").lower() == name.lower() and not named_elsewhere
 
 
 def date_pattern(attr: dict) -> str:
@@ -721,8 +752,10 @@ def maturity_signals(scope: dict) -> dict[str, Any]:
     # A date stored as a number (yyyyMM, yyyyMMdd) is a defect whatever parents it has: converted to a date it
     # takes time attributes (year, quarter, month intervals) that group correctly and enable time-intelligence
     # metrics; lookups for its parents are the fallback when it can't be converted.
-    integer_dates = [a["name"] for a in attrs if looks_like_integer_date(a)]
-    text_dates = [a["name"] for a in attrs if (a.get("type") or "").lower() in _TEXT_TYPES and looks_like_stored_date(a)]
+    time_cols = {c["name"].lower() for cols in time_attribute_columns(attrs).values() for c in cols}
+    integer_dates = [a["name"] for a in attrs if looks_like_integer_date(a) and a["name"].lower() not in time_cols]
+    text_dates = [a["name"] for a in attrs if (a.get("type") or "").lower() in _TEXT_TYPES and looks_like_stored_date(a)
+                  and a["name"].lower() not in time_cols]
     summed_nonadditive = [m["name"] for m in metrics if m.get("formula") and
                           re.match(r"^sum\(", m["formula"].strip(), re.I) and _SUMMED_NONADDITIVE.search(_words(m["name"]))
                           and not _weighted_part(m)]
@@ -746,7 +779,7 @@ def maturity_signals(scope: dict) -> dict[str, Any]:
             "dates_without_time_attributes": [a["name"] for a in attrs if "__" not in a["name"]
                                               and (a.get("type", "").lower() in ("date", "timestamp")
                                                    or looks_like_stored_date(a))
-                                              and not has_time_attributes(a["name"], [x["name"] for x in attrs])],
+                                              and not has_time_attributes(a["name"], attrs)],
             "summed_rates_scores_or_ages": summed_nonadditive,
             "metrics_stored_as_text": text_metrics,
             "note": "estimate from names, descriptions and formulas; confirm during the assessment"}
@@ -1133,9 +1166,35 @@ def _metric_table(m: dict) -> str:
     return hit.group(1).strip().lower() if hit else ""
 
 
+PROBE_GROUPS_KEPT = 60   # grouped values kept per metric and grouping, for the blank/0 checks (item 47)
+_OPERAND = re.compile(r"\{([^{}~+]+)\}")
+
+
+def formula_operands(formula: str, metric_names: list[str]) -> list[str]:
+    """Metrics a derived metric's formula reads ({Lift PCT} -> 'lift pct'), by the model's own names."""
+    by = {n.casefold(): n for n in metric_names}
+    return list(dict.fromkeys(by[x.strip().casefold()] for x in _OPERAND.findall(formula or "")
+                              if x.strip().casefold() in by))
+
+
+def blank_zero_changes(groups: dict[str, list], previous: dict[str, list]) -> dict[str, list[str]]:
+    """Groups whose value went from blank to 0 or from 0 to blank between two probes of one metric."""
+    out: dict[str, list[str]] = {}
+    for dim, rows in (groups or {}).items():
+        before = {str(g): v for g, v in (previous or {}).get(dim) or []}
+        for g, v in rows:
+            if str(g) not in before:
+                continue
+            was = before[str(g)]
+            if (was is None and v == 0) or (was == 0 and v is None):
+                out.setdefault(dim, []).append(f"{g}: {'blank' if was is None else '0'} -> {'blank' if v is None else '0'}")
+    return out
+
+
 def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list[str] | None = None,
                   metrics: list[str] | None = None, period: str = "", split: str = "", filter_spec: str = "",
                   where: str = "", max_values: int = PROBE_MAX_VALUES, batch: int = 6,
+                  previous: dict | None = None,
                   log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
     model = scope["model"]
     anchor = (scope.get("anchor") or {}).get("metric")
@@ -1349,6 +1408,10 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
                                           f"data type ({m.get('type') or '?'}) drops the fraction. Set the metric's "
                                           f"type to a decimal, or read it with AVG(...) until then")
             groups_t = [(r.get("g"), _num(r.get(key))) for r in by_t or []]
+            grouped = {d: [[g, _num(r.get(key))] for r in rows[:PROBE_GROUPS_KEPT] for g in [r.get("g")]]
+                       for d, rows in (("period", by_t), ("partner", by_p)) if rows}
+            if grouped:
+                item["groups"] = grouped
             filled_t = [v for _, v in groups_t if v not in (None, 0)]
             groups_f = [(r.get("g"), _num(r.get(key))) for r in by_f or []]
             f_total = _num(ftot[0].get(key)) if ftot else None
@@ -1391,6 +1454,46 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
                                       f"the facts (fine if it is another fact table)")
             warnings += [f"metric '{n}': {x}" for x in item["issues"]]
             met_out.append(item)
+
+    # Blank groups read as 0 (NUSA item 47): a constant times a blank operand evaluates as 0 in Mosaic, so
+    # 100 * [ratio] reads 0 where the ratio is blank. Compare each derived metric's groups with its operands'
+    # (read here when the probe list left them out), and with the previous round's probe of the same metric.
+    dims = {"period": period, "partner": partner}
+    probed = {it["name"]: it for it in met_out if it.get("groups")}
+    operands = {n: formula_operands(mets_by[n].get("formula") or "", list(mets_by)) for n in probed}
+    missing = [o for ops in operands.values() for o in ops if o not in probed]
+    ref_groups: dict[str, dict[str, list]] = {n: probed[n]["groups"] for n in probed}
+    for chunk in [list(dict.fromkeys(missing))[i:i + max(batch, 1)]
+                  for i in range(0, len(set(missing)), max(batch, 1))]:
+        plain = ", ".join(f"SUM({quote_ident(n)}) AS m{i}" for i, n in enumerate(chunk))
+        rows_by = {"period": rows_of(ask(f"SELECT CAST({quote_ident(period)} AS VARCHAR) AS g, {plain} FROM {M}{base} "  # nosec B608
+                                         f"GROUP BY 1")) if period else None,
+                   "partner": rows_of(ask(f"SELECT CAST({quote_ident(partner)} AS VARCHAR) AS g, {plain} "  # nosec B608
+                                          f"FROM {M}{fcond or base} GROUP BY 1")) if partner else None}
+        for i, n in enumerate(chunk):
+            ref_groups[n] = {d: [[r.get("g"), _num(r.get(f"m{i}"))] for r in rows[:PROBE_GROUPS_KEPT]]
+                             for d, rows in rows_by.items() if rows}
+    prev_items = {m.get("name"): m for m in (previous or {}).get("metrics") or []}
+    for n, it in probed.items():
+        ops = operands.get(n) or []
+        for dim, rows in it["groups"].items():
+            op_vals = [{str(g): v for g, v in (ref_groups.get(o) or {}).get(dim) or []} for o in ops]
+            if not ops or any(not (ref_groups.get(o) or {}).get(dim) for o in ops):
+                continue
+            hit = [str(g) for g, v in rows if v == 0 and all(ov.get(str(g)) is None for ov in op_vals)]
+            if hit:
+                it["issues"].append(f"reads 0 in {len(hit)} group(s) of '{dims[dim]}' where {', '.join(repr(o) for o in ops)} "
+                                    f"{'is' if len(ops) == 1 else 'are'} blank ({', '.join(hit[:5])}"
+                                    f"{', ...' if len(hit) > 5 else ''}): a constant times a blank operand reads 0 in "
+                                    f"Mosaic. Rebuild it so those groups stay blank, or say in its description that 0 "
+                                    f"means no data")
+                warnings.append(f"metric '{n}': {it['issues'][-1]}")
+        changes = blank_zero_changes(it["groups"], (prev_items.get(n) or {}).get("groups") or {})
+        if changes:
+            text = "; ".join(f"by '{dims[d]}' {', '.join(c[:5])}{', ...' if len(c) > 5 else ''}" for d, c in changes.items())
+            it["issues"].append(f"blank and 0 changed places since the previous probe ({text}): a rewritten formula "
+                                f"changed how groups with no data read")
+            warnings.append(f"metric '{n}': {it['issues'][-1]}")
     return {"version": 4, "model": model, "generated": time.strftime("%Y-%m-%d"), "anchor": anchor,
             "total_rows": total, "entities": ent_total,
             "filter": {"attribute": filt or None, "value": filt_value, "rows": filt_rows, "entities": ent_filtered},
@@ -2883,7 +2986,7 @@ def lookup_suggestions(scope: dict, *, period: str = "", max_code_values: int = 
             if "__" in a["name"] or (_distinct(a) or 0) < 2:
                 continue
             is_date = a.get("type", "").lower() in ("date", "timestamp")
-            if not (is_date or looks_like_stored_date(a)) or has_time_attributes(a["name"], names):
+            if not (is_date or looks_like_stored_date(a)) or has_time_attributes(a["name"], attrs):
                 continue
             pattern = "" if is_date else date_pattern(a)
             month_grain = pattern == "yyyyMM"
@@ -5343,6 +5446,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--where", default="")
     sp.add_argument("--max-values", type=int, default=PROBE_MAX_VALUES)
     sp.add_argument("--batch", type=int, default=6)
+    sp.add_argument("--previous", help="the previous round's probes.json: a metric whose groups went from blank to 0 "
+                                       "(or back) is a warning (verify-changes)")
 
     sp = sub.add_parser("question-sql", help="rewrite a question's governed SQL, keeping the earlier version")
     sp.add_argument("--bank", required=True)
@@ -5593,7 +5698,7 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
             attrs, not_probed = trim_probe_list(attrs, scope)
         out = probe_objects(runner(), args.project, scope, attributes=attrs, metrics=mets, period=args.period,
                             split=args.split, filter_spec=args.filter, where=args.where, max_values=args.max_values,
-                            batch=args.batch, log=log)
+                            batch=args.batch, previous=_load_json(args.previous) if args.previous else None, log=log)
         if type_checks:
             out["type_checks"] = type_checks
         if not_probed:
