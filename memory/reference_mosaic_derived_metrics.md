@@ -357,8 +357,29 @@ A numeric constant multiplying a fact metric inside a ratio breaks the plain ung
 MOSAIC_INTERNAL "Invalid node. Output column dependencies ([sum::[double]]) not in source plan output ([])".
 Grouped queries, `AVG(...)` and `CAST(SUM(...))` read it. `100 * [ratio metric]` and `100 * ({A} / {B})` work
 ungrouped and return the same values grouped. A constant in a subtraction over compounds (`1 - (...)`, CPR)
-works. So put the constant outside the ratio. Reported to the user as a Mosaic planner defect (probe 5,
-scratch model; NUSA 'event lift % (points)').
+works. Reported to the user as a Mosaic planner defect (probe 5, scratch model; NUSA 'event lift %
+(points)').
+
+**But a constant times a blank reads 0** (probe 6, 2026-11-18, scratch model, 25 metrics; NUSA round 3).
+`100 * [ratio]` and `100 * ({A} / ZeroToNull({B}))` read 0 in groups where the ratio is blank (B = 0),
+with join outer, inner or default alike: the join type doesn't change it. On NUSA, statuses with no units
+sold read 0 instead of blank.
+
+| Form (A, B fact or compound metrics) | Zero-denominator group | Real 0 (A = 0) | Ungrouped SUM |
+|---|---|---|---|
+| `{A} / ZeroToNull({B})` (no constant) | blank | 0 | works |
+| `(100 * {A}) / {B}`, `({A} * 100) / {B}` | blank | 0 | **fails** (probe 5) |
+| `100 * [ratio]`, `100 * ({A} / ZeroToNull({B}))` | **0** | 0 | works |
+| `{A} / ({B} / 100)` | blank | 0 | **fails** |
+| `ZeroToNull(100 * [ratio])` | blank | **blank** | works |
+| **`{A} / (ZeroToNull({B}) / 100)`** | blank | 0 | works |
+
+Use `[A] / (ZeroToNull([B]) / 100)` for a percentage in points: the only form that keeps blank groups
+blank and real zeros 0 and reads ungrouped. Its values equal `100 * [ratio]` everywhere else (by year:
+191.804, 659.101, ...; total 2,169.099). The failing shapes have a constant applied straight to a metric
+inside a ratio; wrapping that metric in ZeroToNull avoids the defect. `create-compound-metric` takes
+`ZeroToNull(...)` and `NullToZero(...)` (tree function `zero_to_null`, verified: read back as
+`ZeroToNull({...})`), and `check --findings` warns on the other shapes.
 
 ## 1. Compound metric — ratio of two metrics
 

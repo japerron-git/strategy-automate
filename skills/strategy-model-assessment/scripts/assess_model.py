@@ -4227,6 +4227,12 @@ def compound_formula_problem(formula: str) -> str | None:
     return build_mosaic.compound_formula_problem(formula)
 
 
+def compound_constant_warnings(formula: str) -> list[str]:
+    """Constants Mosaic reads badly in this formula (build_mosaic.compound_constant_warnings)."""
+    import build_mosaic
+    return build_mosaic.compound_constant_warnings(formula)
+
+
 def time_shift_period(function: str) -> str:
     """'PreviousMonth' / 'MonthToDate' -> 'month'."""
     return re.sub(r"^Previous|ToDate$", "", function).lower()
@@ -5238,6 +5244,8 @@ def check_findings(doc: dict) -> dict[str, Any]:
                 bad = compound_formula_problem(str(cargs["formula"])) if cargs.get("formula") else None
                 if bad:
                     problems.append(f"{fid}: compound '{cargs.get('name')}': {bad}")
+                warnings.extend(f"{fid}: compound '{cargs.get('name')}': {w}" for w in
+                                compound_constant_warnings(str(cargs.get("formula") or "")))
                 if cargs.get("join") not in (None, "", "outer", "inner"):
                     problems.append(f"{fid}: compound '{cargs.get('name')}': join must be outer or inner")
                 elif warn := compound_join_warning(fid, cargs):

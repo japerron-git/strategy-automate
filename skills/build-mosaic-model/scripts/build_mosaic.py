@@ -5206,8 +5206,8 @@ DESCRIPTION_MAX = 250   # longer descriptions are cut in the UI (memory/feedback
 _TREE_OPS = {"+": "plus", "-": "minus", "*": "times", "/": "divide"}
 _OBJECT_ID = _re.compile(r"[0-9A-Fa-f]{32}")
 # One-argument functions a compound tree takes, by the name written in a formula -> the tree's
-# EnumFunction name (null_to_zero read back from Studio metrics; zero_to_null by the same naming,
-# probe 6 checks it live).
+# EnumFunction name (null_to_zero read back from Studio metrics; zero_to_null verified live by probe 6,
+# 2026-11-18: created, read back as ZeroToNull({...}), queried).
 TREE_FUNCTIONS = {"zerotonull": "zero_to_null", "nulltozero": "null_to_zero"}
 _ARITH_TOKEN = _re.compile(r"\s*(?:(?P<fn>(?i:ZeroToNull|NullToZero))\s*\("
                            r"|(?P<ref>\[[^\]]+\])|(?P<num>\d+(?:\.\d+)?)|(?P<op>[()+\-*/])"
@@ -5327,6 +5327,38 @@ def compound_metric_body(name: str, tree: dict, *, description: str = "", join: 
     if fmt_values:
         body["format"] = {"header": [], "values": list(fmt_values)}
     return body
+
+
+def compound_constant_warnings(formula: str) -> list[str]:
+    """Constants placed where Mosaic reads them badly (memory/reference_mosaic_derived_metrics.md §0f, probes 5-6,
+    verified live 2026-11-18). Offline: only the syntax is read. An unreadable formula gives no warnings
+    (compound_formula_problem reports it)."""
+    if compound_formula_problem(formula):
+        return []
+    tree = compound_metric_tree(formula, lambda raw: {"objectId": raw, "subType": "metric", "name": raw})
+    out: list[str] = []
+
+    def walk(node: dict, in_divide: bool) -> None:
+        kids = node.get("children") or []
+        fn = node.get("function")
+        if fn in ("times", "divide") and len(kids) == 2:
+            consts = [k for k in kids if k.get("type") == "constant"]
+            others = [k for k in kids if k.get("type") != "constant"]
+            if consts and others:
+                other = others[0]
+                if other.get("type") == "object_reference" and in_divide:
+                    out.append("a constant applied straight to a metric inside a ratio ((100 * [A]) / [B], "
+                               "[A] / ([B] / 100)) fails SELECT SUM(...) with no GROUP BY (MOSAIC_INTERNAL "
+                               "'Invalid node'); wrap the metric: [A] / (ZeroToNull([B]) / 100)")
+                elif fn == "times" and other.get("type") in ("object_reference", "operator"):
+                    out.append("a constant times a blank reads 0: groups where the other side is blank (a ratio "
+                               "with no data) read 0, not blank. To keep them blank and real zeros 0, divide "
+                               "instead: [A] / (ZeroToNull([B]) / 100)")
+        for k in kids:
+            walk(k, in_divide or fn == "divide")
+
+    walk(tree, False)
+    return list(dict.fromkeys(out))
 
 
 def _metric_operand_index(fact_metrics: list, derived_metrics: list) -> dict:

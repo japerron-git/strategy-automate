@@ -486,6 +486,24 @@ class PlanTests(unittest.TestCase):
         self.assertEqual([p.split(":")[0] for p in plan["problems"] if "[name]" in p], ["C1"])   # reported once
         self.assertEqual([w.split(":")[0] for w in plan["warnings"] if "has no join" in w], ["C1", "C2"])
 
+    def test_constants_mosaic_reads_badly_are_warned(self):
+        # probes 5-6 (18 Nov): a constant on a metric inside a ratio fails an ungrouped SUM; a constant times a
+        # blank reads 0; [A] / (ZeroToNull([B]) / 100) does neither
+        def compound(fid, formula):
+            return _finding(fid, "metric_defect", actions=[{"kind": "create_compound_metric",
+                                                            "args": {"name": fid, "formula": formula, "join": "outer"}}])
+        report = am.check_findings({"findings": [compound("K1", "(100 * [A]) / [B]"), compound("K2", "[A] / ([B] / 100)"),
+                                                 compound("K3", "100 * [lift pct]"),
+                                                 compound("K4", "[A] / (ZeroToNull([B]) / 100)"),
+                                                 compound("K5", "1 - [A] / [B]")]})
+        self.assertEqual(report["problems"], [])
+        by = {w.split(":")[0]: w for w in report["warnings"] if "constant" in w}
+        self.assertIn("fails SELECT SUM(...) with no GROUP BY", by["K1"])
+        self.assertIn("fails SELECT SUM(...) with no GROUP BY", by["K2"])
+        self.assertIn("a constant times a blank reads 0", by["K3"])
+        self.assertNotIn("K4", by)
+        self.assertNotIn("K5", by)
+
     def test_time_shift_metric_is_planned_with_its_reading_rule(self):
         args = {"name": "Revenue (previous month)", "function": "PreviousMonth", "time_attribute": "order date",
                 "periods": 1, "source_metric": "Revenue", "description": "Group by order date (month)."}
