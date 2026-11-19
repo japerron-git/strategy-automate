@@ -294,6 +294,18 @@ class CompoundTreeTests(unittest.TestCase):
         self.assertEqual(tree("[metric:Net Sales] * 2")["children"][0]["target"]["objectId"], _oid("6"))
         self.assertEqual(tree("[fact_metric:Net Sales] * 2")["children"][0]["target"]["subType"], "fact_metric")
 
+    def test_zero_to_null_and_null_to_zero_are_one_argument_operators(self):
+        tree = self.tree("100 * ([Net Sales] / zerotonull([Returns] - [Units Sold]))")
+
+        self.assertEqual(tree["children"][1]["children"][1], {"type": "operator", "function": "zero_to_null", "children": [
+            {"type": "operator", "function": "minus", "children": [self.ref(RETURNS), self.ref(UNITS)]}]})
+        self.assertEqual(self.tree("NullToZero([Returns])"),
+                         {"type": "operator", "function": "null_to_zero", "children": [self.ref(RETURNS)]})
+        for formula in ("ZeroToNull([Returns]", "ZeroToNull()", "Foo([Returns])"):
+            with self.subTest(formula=formula), self.assertRaises(SystemExit), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.tree(formula)
+
     def test_unreadable_formulas_stop(self):
         for formula in ("[Net Sales] * 0.5", "[Unknown] - [Returns]", "([Net Sales] - [Returns]",
                         "[Net Sales] -", "100 * 2", "[Net Sales] % 2"):

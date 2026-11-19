@@ -5205,7 +5205,12 @@ def cmd_create_transformation(m: MSTR, args):
 DESCRIPTION_MAX = 250   # longer descriptions are cut in the UI (memory/feedback_mosaic_ship_bar.md)
 _TREE_OPS = {"+": "plus", "-": "minus", "*": "times", "/": "divide"}
 _OBJECT_ID = _re.compile(r"[0-9A-Fa-f]{32}")
-_ARITH_TOKEN = _re.compile(r"\s*(?:(?P<ref>\[[^\]]+\])|(?P<num>\d+(?:\.\d+)?)|(?P<op>[()+\-*/])"
+# One-argument functions a compound tree takes, by the name written in a formula -> the tree's
+# EnumFunction name (null_to_zero read back from Studio metrics; zero_to_null by the same naming,
+# probe 6 checks it live).
+TREE_FUNCTIONS = {"zerotonull": "zero_to_null", "nulltozero": "null_to_zero"}
+_ARITH_TOKEN = _re.compile(r"\s*(?:(?P<fn>(?i:ZeroToNull|NullToZero))\s*\("
+                           r"|(?P<ref>\[[^\]]+\])|(?P<num>\d+(?:\.\d+)?)|(?P<op>[()+\-*/])"
                            r"|(?P<id>[0-9A-Fa-f]{32})(?![0-9A-Za-z]))")
 
 
@@ -5218,7 +5223,8 @@ def _check_description(text: str) -> str:
 
 def compound_metric_tree(formula: str, resolve) -> dict:
     """Arithmetic over metrics → expression tree (§0): `[A] - [B]`, `([A] + [B]) / [C]`,
-    `[A] * 100`, `-[A]`. Operands are `[name]`, `[objectId]`, `[fact_metric:name]`,
+    `[A] * 100`, `-[A]`, `[A] / ZeroToNull([B])` (ZeroToNull and NullToZero take one argument).
+    Operands are `[name]`, `[objectId]`, `[fact_metric:name]`,
     `[metric:name]`, or a bare 32-character objectId (the old space-separated syntax).
     Constants are whole numbers (the tree's int64 variant; write 0.5 as 1 / 2).
     resolve(text) returns the operand's {"objectId", "subType", "name"}."""
@@ -5227,7 +5233,7 @@ def compound_metric_tree(formula: str, resolve) -> dict:
         mt = _ARITH_TOKEN.match(s, pos)
         if not mt or mt.end() == pos:
             die(f"formula: cannot read '{s[pos:pos + 20]}' (operands are [metric name] or an objectId; "
-                f"operators + - * / and parentheses)")
+                f"operators + - * / and parentheses; functions ZeroToNull(...) and NullToZero(...))")
         pos = mt.end()
         toks.append(mt)
     if not toks:
@@ -5243,6 +5249,12 @@ def compound_metric_tree(formula: str, resolve) -> dict:
             die("formula ends after an operator")
         t = toks[i]
         i += 1
+        if t.group("fn"):
+            node = expr()
+            if peek() != ")":
+                die(f"formula: missing ) after {t.group('fn')}(")
+            i += 1
+            return {"type": "operator", "function": TREE_FUNCTIONS[t.group("fn").lower()], "children": [node]}
         if t.group("ref") or t.group("id"):
             raw = t.group("ref")[1:-1].strip() if t.group("ref") else t.group("id")
             return {"type": "object_reference", "target": resolve(raw)}
@@ -8229,7 +8241,8 @@ def build_parser():
     sp.add_argument("--name", required=True)
     sp.add_argument("--formula", required=True,
                     help="operands [metric name], [objectId], [fact_metric:name] or [metric:name] (bare "
-                         "objectIds also work); operators + - * / and parentheses; whole-number constants")
+                         "objectIds also work); operators + - * / and parentheses; whole-number constants; "
+                         "ZeroToNull(...) and NullToZero(...)")
     sp.add_argument("--join", choices=["inner", "outer"],
                     help="formulaJoinType. outer keeps a group when one operand has no rows for it (the "
                          "blank operand counts as 0); the default (inner) drops that group from results")
