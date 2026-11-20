@@ -6783,11 +6783,53 @@ def type_family(data_type: Any) -> str:
     return "number" if t else ""
 
 
-def source_table_plan(model: dict, key_attribute: str, key_column: str, columns: list[dict],
-                      new_attributes: list[tuple[str, str]], table: str, *, key_form: str = "") -> dict:
+def _name_key(text: Any) -> str:
+    """Letters and digits only, lowercased: 'promo_offer', 'Promo Offer' and 'PROMOOFFER' are one name."""
+    return _re.sub(r"[^0-9a-z]", "", str(text or "").lower())
+
+
+def _id_form_type(model: dict, idform: dict) -> tuple[Any, str]:
+    """(the ID form's data type, where it came from): the form's own dataType, else the type of the column it
+    reads on the model's tables. (None, '') when neither is known."""
+    if idform.get("dataType"):
+        return idform["dataType"], "the ID form"
+    tables = {(t.get("information") or {}).get("objectId"): t for t in model.get("tables") or []}
+    for e in idform.get("expressions") or []:
+        expr = e.get("expression") or {}
+        names = [t.get("value") for t in expr.get("tokens") or [] if t.get("type") == "column_reference"] or \
+                [expr.get("text")]
+        for tref in e.get("tables") or []:
+            t = tables.get(tref.get("objectId")) or {}
+            for c in (t.get("physicalTable") or {}).get("columns") or []:
+                if _name_key(c.get("columnName")) in {_name_key(n) for n in names if n} and c.get("dataType"):
+                    return c["dataType"], f"column {c.get('columnName')} of {(t.get('information') or {}).get('name')}"
+    return None, ""
+
+
+def _id_form_columns(model: dict, idform: dict) -> list[str]:
+    """Column names the ID form reads on the model's tables (its expression text or column tokens)."""
+    out = []
+    for e in idform.get("expressions") or []:
+        expr = e.get("expression") or {}
+        out += [t.get("value") for t in expr.get("tokens") or [] if t.get("type") == "column_reference"]
+        if expr.get("text"):
+            out.append(expr["text"])
+    return [str(c) for c in out if c]
+
+
+def source_table_plan(model: dict, key_attribute: str, columns: list[dict], table: str, *,
+                      key_column: str = "", new_attributes: list[tuple[str, str]] | None = None,
+                      key_form: str = "", retype_key: bool = False) -> dict:
     """Checks and the writes add-source-table makes, from the model export and the table's columns
-    ([{name, dataType}]). Pure: no I/O. Dies on anything that would make a table that can't join or attributes
-    that clash. -> {key, key_id_form, key_column, key_type_change, attributes: [(column, name)], reused}."""
+    ([{name, dataType}]). Pure: no I/O. Only the key attribute is needed:
+    - the join form is the attribute's ID form (a table joins an attribute only on it);
+    - the key column is the table column named like the attribute, its ID form, or the column the ID form reads
+      on the model's tables (letters and digits compared, case ignored), unless key_column names it;
+    - its type must be in the ID form's type family (number, text, date), or nothing is written (retype_key
+      types it like the ID form in the table body instead);
+    - every other column becomes an attribute named from the column (new_attributes picks and names them).
+    Dies on anything that would make a table that can't join or attributes that clash.
+    -> {key, key_id_form, key_column, key_type, key_type_change, attributes: [(column, name)], reused}."""
     by_name = {(a.get("information") or {}).get("name", "").casefold(): a for a in model.get("attributes") or []}
     key = by_name.get(key_attribute.casefold())
     if key is None:
@@ -6802,19 +6844,45 @@ def source_table_plan(model: dict, key_attribute: str, key_column: str, columns:
             f"'{idform.get('name')}', not '{key_form}' (its other forms: {others}). Map the key column to the ID "
             f"form only if it holds the same values")
     cols = {str(c.get("name") or "").casefold(): c for c in columns}
-    if key_column.casefold() not in cols:
-        die(f"'{table}' has no column '{key_column}'; its columns: {[c.get('name') for c in columns]}")
-    kcol = cols[key_column.casefold()]
-    want, have = type_family(idform.get("dataType")), type_family(kcol.get("dataType"))
+    listed = [c.get("name") for c in columns]
+    if key_column:
+        if key_column.casefold() not in cols:
+            die(f"'{table}' has no column '{key_column}'; its columns: {listed}")
+        kcol = cols[key_column.casefold()]
+    else:
+        wanted = {_name_key(key_attribute), _name_key(idform.get("name"))} | \
+                 {_name_key(c) for c in _id_form_columns(model, idform)}
+        wanted.discard("")
+        wanted.discard("id")
+        hits = [c for c in columns if _name_key(c.get("name")) in wanted]
+        if len(hits) != 1:
+            die(f"can't tell which column of '{table}' holds '{key_attribute}': "
+                + (f"{[c.get('name') for c in hits]} all match" if hits else
+                   f"none of {listed} is named like the attribute, its ID form '{idform.get('name')}' or "
+                   f"{_id_form_columns(model, idform)}") + "; name it with --key-column")
+        kcol = hits[0]
+    want, source = _id_form_type(model, idform)
+    have = kcol.get("dataType")
+    if not want:
+        die(f"can't read the type of '{key_attribute}''s ID form, so the key column's type can't be checked; "
+            f"stopping before any write")
     change = None
-    if want and have and want != have:
-        change = {"column": kcol["name"], "from": kcol.get("dataType"), "to": idform.get("dataType")}
+    if type_family(want) != type_family(have):
+        if not retype_key:
+            die(f"the key column '{kcol.get('name')}' is {type_family(have) or have} but '{key_attribute}''s ID form "
+                f"is {type_family(want)} ({source}): they wouldn't join. Load the column with the right type, or "
+                f"pass --retype-key to type it like the ID form in the model")
+        change = {"column": kcol["name"], "from": have, "to": want}
     taken = {(o.get("information") or {}).get("name", "").casefold(): kind
              for kind in ("attributes", "factMetrics", "metrics") for o in model.get(kind) or []}
+    if new_attributes is None:
+        new_attributes = [(str(c.get("name")), friendly_col(str(c.get("name")))) for c in columns if c is not kcol]
     attrs, reused = [], []
     for col, name in new_attributes:
         if col.casefold() not in cols:
-            die(f"'{table}' has no column '{col}' for attribute '{name}'; its columns: {[c.get('name') for c in columns]}")
+            die(f"'{table}' has no column '{col}' for attribute '{name}'; its columns: {listed}")
+        if cols[col.casefold()] is kcol:
+            die(f"'{col}' is the key column; it maps onto '{key_attribute}', not a new attribute")
         if name.casefold() == key_attribute.casefold():
             die(f"'{name}' is the key attribute itself")
         kind = taken.get(name.casefold())
@@ -6824,12 +6892,14 @@ def source_table_plan(model: dict, key_attribute: str, key_column: str, columns:
                 reused.append(name)   # made by an earlier run on this table
                 attrs.append((cols[col.casefold()]["name"], name))
                 continue
-            die(f"'{name}' is already an attribute that doesn't read '{table}'; pick another name")
+            die(f"'{name}' is already an attribute that doesn't read '{table}'; name the column's attribute with "
+                f"--attribute {col}=<another name>")
         if kind:
-            die(f"'{name}' is already the name of a {kind[:-1]}; pick another name")
+            die(f"'{name}' is already the name of a {kind[:-1]}; name the column's attribute with "
+                f"--attribute {col}=<another name>")
         attrs.append((cols[col.casefold()]["name"], name))
-    return {"key": key, "key_id_form": idform, "key_column": kcol["name"], "key_type_change": change,
-            "attributes": attrs, "reused": reused}
+    return {"key": key, "key_id_form": idform, "key_column": kcol["name"], "key_type": {"column": have,
+            "id_form": want, "from": source}, "key_type_change": change, "attributes": attrs, "reused": reused}
 
 
 def cmd_add_source_table(m: MSTR, args):
@@ -6844,12 +6914,12 @@ def cmd_add_source_table(m: MSTR, args):
     if not r.ok:
         die(f"export model: {format_mstr_error(r)}")
     model = (r.json().get("model") or [{}])[0]
-    new_attrs = []
+    new_attrs: list[tuple[str, str]] | None = [] if args.attributes else None
     for pair in args.attributes or []:
         col, sep, name = str(pair).partition("=")
         if not sep or not col.strip() or not name.strip():
             die(f"--attribute takes COLUMN=NAME, not '{pair}'")
-        new_attrs.append((col.strip(), name.strip()))
+        new_attrs.append((col.strip(), name.strip()))   # type: ignore[union-attr]
     existing = [t for t in model.get("tables") or []
                 if (t.get("information") or {}).get("name", "").casefold() == args.table.casefold()]
     table_body = None
@@ -6865,8 +6935,8 @@ def cmd_add_source_table(m: MSTR, args):
             die(f"could not read '{args.namespace}'.'{args.table}' from the data source: check the names with "
                 f"list-namespaces and list-tables --match")
         columns = [{"name": c["columnName"], "dataType": c["dataType"]} for c in table_body["physicalTable"]["columns"]]
-    plan = source_table_plan(model, args.key_attribute, args.key_column, columns, new_attrs, args.table,
-                             key_form=args.key_form or "")
+    plan = source_table_plan(model, args.key_attribute, columns, args.table, key_column=args.key_column or "",
+                             new_attributes=new_attrs, key_form=args.key_form or "", retype_key=args.retype_key)
     change = plan["key_type_change"]
     if change and table_body is not None:   # type the key column like the attribute's ID form, or it can't join
         to = copy.deepcopy(change["to"])
@@ -6879,15 +6949,16 @@ def cmd_add_source_table(m: MSTR, args):
                 c["dataType"] = to   # sourceDataType stays: the warehouse type
         table_body["physicalTable"]["pipeline"] = json.dumps(pipe)
     elif change:
-        die(f"the key column '{change['column']}' of the existing table is {change['from']}, the key's ID form "
-            f"{change['to']}: retype it with set-column-types first")
+        die(f"the key column '{change['column']}' of the table already in the model is {change['from']}, the key's "
+            f"ID form {change['to']}: retype it with set-column-types first")
     key = plan["key"]
     key_ref = {"objectId": key["information"]["objectId"], "subType": "attribute", "name": key["information"]["name"]}
     if args.dry_run:
         print(json.dumps({"ok": True, "dry_run": True, "table": args.table, "new_table": table_body is not None,
                           "table_body": table_body, "key_attribute": key_ref,
                           "key_id_form": plan["key_id_form"].get("name"), "key_column": plan["key_column"],
-                          "key_type_change": change, "set_lookup": bool(args.set_lookup),
+                          "key_type": plan["key_type"], "key_type_change": change,
+                          "set_lookup": bool(args.set_lookup),
                           "attributes": [{"column": c, "name": n, "reused": n in plan["reused"]}
                                          for c, n in plan["attributes"]],
                           "relationships": [f"{n} (parent) -> {key_ref['name']} (child) via {args.table}"
@@ -8673,11 +8744,16 @@ def build_parser():
     sp.add_argument("--instance-id", help="data source id, instead of --instance")
     sp.add_argument("--namespace", help="schema as the data source's catalog names it (list-namespaces)")
     sp.add_argument("--table", required=True, help="table name as the data source has it; also the model table's name")
-    sp.add_argument("--key-column", required=True, help="the table's column holding the key attribute's ID values")
-    sp.add_argument("--key-attribute", required=True, help="existing attribute the table describes")
-    sp.add_argument("--key-form", help="the form the key column matches, to check it is the attribute's ID form")
+    sp.add_argument("--key-attribute", required=True,
+                    help="existing attribute the table describes; the table joins it on its ID form")
+    sp.add_argument("--key-column", help="the table's column holding the ID form's values (default: the column named "
+                                         "like the attribute, its ID form, or the column the ID form reads)")
+    sp.add_argument("--key-form", help="optional check: the form the key column holds must be the ID form")
+    sp.add_argument("--retype-key", action="store_true",
+                    help="type a key column of another type family like the ID form (default: stop)")
     sp.add_argument("--attribute", dest="attributes", action="append", metavar="COLUMN=NAME",
-                    help="a new attribute read from one column, related to the key (parent). Repeatable")
+                    help="only these columns become attributes, with these names (default: every other column, "
+                         "named from the column). Repeatable")
     sp.add_argument("--set-lookup", action="store_true",
                     help="make the new table the key attribute's lookup table (only when it holds every key value)")
     sp.add_argument("--dry-run", action="store_true", help="read and check only; print the table body and the plan")

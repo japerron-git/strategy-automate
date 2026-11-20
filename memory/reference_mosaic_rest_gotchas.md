@@ -36,9 +36,13 @@ shapes `build` uses: the pipeline table body (`_make_pipeline_table_body`), the 
 `(table, column)` expression on it (`_add_table_expression_to_form`, read with `showExpressionAs=tokens`), and
 each new attribute created on the table, all in one changeset (a table no attribute reads can't be committed).
 The relationships (new attribute = parent, key = child, via the new table) go in a second changeset through
-`put_relationships_merged`. The key column must hold the ID form's values (a table joins an attribute on its ID
-form); a key column of another type family is typed like the ID form in the table body (`sourceDataType`
-kept). `--set-lookup` makes the table the key's lookup (`attributeLookupTable`, `autoDetectLookupTable: false`);
+`put_relationships_merged`. The only input it needs is the key attribute: the table joins it on its ID form
+(picked from the export; `--key-form` only checks it), the key column is the one named like the attribute, its
+ID form or the column the ID form reads (letters and digits compared; `--key-column` when none or several
+match), and every other column becomes an attribute named from the column (`--attribute COLUMN=NAME` picks
+and names them). The key column's type family (number, text, date) must match the ID form's (its `dataType`,
+else the column it reads on the model's tables), or it stops before any write; `--retype-key` types it like the
+ID form in the table body instead (`sourceDataType` kept). `--set-lookup` makes the table the key's lookup (`attributeLookupTable`, `autoDetectLookupTable: false`);
 the default keeps the current one. Republish, publish from Studio and re-certify afterwards. To verify live
 (scratch probe 8): the commit on a published model, the key's lookup table after it, whether a REST republish
 loads the rows, and the new attribute's values through the connector.
