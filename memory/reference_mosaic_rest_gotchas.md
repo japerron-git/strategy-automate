@@ -30,6 +30,19 @@ Verified against a Strategy ONE Library Modeling Service in 2026. These rules ca
 - The outer `physicalTable.columns` list is a separate flat array with `{information:{name}, dataType, columnName}` — **no top-level `id`** — while the inner pipeline `rootTable.children[].columns` uses `{id, name, dataType, sourceDataType}`. Both the outer and the inner pipeline `columns` must be present.
 - When the pipeline shape misbehaves on a tenant, the fallback is the object form via clone-and-remap — see `reference_strategy_object_cloning.md`.
 
+## Adding a data-source table to an existing model (`add-source-table`; not yet run live)
+`build_mosaic.py add-source-table` adds a table from a data source to a published model as a lookup, with the
+shapes `build` uses: the pipeline table body (`_make_pipeline_table_body`), the key attribute's ID form given a
+`(table, column)` expression on it (`_add_table_expression_to_form`, read with `showExpressionAs=tokens`), and
+each new attribute created on the table, all in one changeset (a table no attribute reads can't be committed).
+The relationships (new attribute = parent, key = child, via the new table) go in a second changeset through
+`put_relationships_merged`. The key column must hold the ID form's values (a table joins an attribute on its ID
+form); a key column of another type family is typed like the ID form in the table body (`sourceDataType`
+kept). `--set-lookup` makes the table the key's lookup (`attributeLookupTable`, `autoDetectLookupTable: false`);
+the default keeps the current one. Republish, publish from Studio and re-certify afterwards. To verify live
+(scratch probe 8): the commit on a published model, the key's lookup table after it, whether a REST republish
+loads the rows, and the new attribute's values through the connector.
+
 ## Changing a column's type in an existing model (verified 2026-10-30)
 `PATCH /api/model/dataModels/{mid}/tables/{tid}` with `{"physicalTable": ...}`, inside a changeset: set the new
 `dataType` (and `format`, e.g. `yyyyMM`, for a date read from integers) on the column in BOTH

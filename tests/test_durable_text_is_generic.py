@@ -22,6 +22,7 @@ DENIED = {
     "903311a2b5ee8c14550a", "da4ab0f0d6f7dde4b5a9", "7659cc14e913d7f7ab15", "6574a2e9f8d202fc5078",
     "e301b224f5c9e1a4c9cd", "43d82b6ac6044d964d99", "404d5354e1c637808355", "5a6f1f9a3dab726fea4e",
     "fe6ac0fc4e0b3216bb7b", "c0c50bed4a1c470e55ab", "be95381026ffd61d5ef6", "a422f17a8e8d23185ea9",
+    "fedb24c98f783a5d2256", "7184ac8f50f806e9a8af", "5412aaa4d5736fdb2d24",
 }
 _WORD = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 

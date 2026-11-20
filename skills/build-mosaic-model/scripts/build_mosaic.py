@@ -6771,6 +6771,202 @@ def formula_attribute_body(name: str, tokens: list[dict], table_ref: dict, *, de
             "displays": {"reportDisplays": shown, "browseDisplays": list(shown)}}
 
 
+_TYPE_FAMILIES = {"text": ("char", "text", "string", "varchar", "utf8"), "date": ("date", "time")}
+
+
+def type_family(data_type: Any) -> str:
+    """'text', 'date' or 'number' for a dataType dict or name: what decides whether two key columns can join."""
+    t = str((data_type or {}).get("type") if isinstance(data_type, dict) else data_type or "").lower()
+    for family, words in _TYPE_FAMILIES.items():
+        if any(w in t for w in words):
+            return family
+    return "number" if t else ""
+
+
+def source_table_plan(model: dict, key_attribute: str, key_column: str, columns: list[dict],
+                      new_attributes: list[tuple[str, str]], table: str, *, key_form: str = "") -> dict:
+    """Checks and the writes add-source-table makes, from the model export and the table's columns
+    ([{name, dataType}]). Pure: no I/O. Dies on anything that would make a table that can't join or attributes
+    that clash. -> {key, key_id_form, key_column, key_type_change, attributes: [(column, name)], reused}."""
+    by_name = {(a.get("information") or {}).get("name", "").casefold(): a for a in model.get("attributes") or []}
+    key = by_name.get(key_attribute.casefold())
+    if key is None:
+        die(f"no attribute '{key_attribute}' in the model")
+    forms = key.get("forms") or []
+    idform = next((f for f in forms if f.get("category") == "ID" or f.get("id") == _ID_FORM), None)
+    if idform is None:
+        die(f"'{key_attribute}' has no ID form to join on")
+    if key_form and key_form.casefold() not in {str(idform.get("name") or "").casefold(), "id"}:
+        others = [f.get("name") for f in forms if f is not idform]
+        die(f"a table joins an attribute on its ID form, which for '{key_attribute}' is "
+            f"'{idform.get('name')}', not '{key_form}' (its other forms: {others}). Map the key column to the ID "
+            f"form only if it holds the same values")
+    cols = {str(c.get("name") or "").casefold(): c for c in columns}
+    if key_column.casefold() not in cols:
+        die(f"'{table}' has no column '{key_column}'; its columns: {[c.get('name') for c in columns]}")
+    kcol = cols[key_column.casefold()]
+    want, have = type_family(idform.get("dataType")), type_family(kcol.get("dataType"))
+    change = None
+    if want and have and want != have:
+        change = {"column": kcol["name"], "from": kcol.get("dataType"), "to": idform.get("dataType")}
+    taken = {(o.get("information") or {}).get("name", "").casefold(): kind
+             for kind in ("attributes", "factMetrics", "metrics") for o in model.get(kind) or []}
+    attrs, reused = [], []
+    for col, name in new_attributes:
+        if col.casefold() not in cols:
+            die(f"'{table}' has no column '{col}' for attribute '{name}'; its columns: {[c.get('name') for c in columns]}")
+        if name.casefold() == key_attribute.casefold():
+            die(f"'{name}' is the key attribute itself")
+        kind = taken.get(name.casefold())
+        if kind == "attributes":
+            exprs = [e for f in by_name[name.casefold()].get("forms") or [] for e in f.get("expressions") or []]
+            if any(str(t.get("name") or "").casefold() == table.casefold() for e in exprs for t in e.get("tables") or []):
+                reused.append(name)   # made by an earlier run on this table
+                attrs.append((cols[col.casefold()]["name"], name))
+                continue
+            die(f"'{name}' is already an attribute that doesn't read '{table}'; pick another name")
+        if kind:
+            die(f"'{name}' is already the name of a {kind[:-1]}; pick another name")
+        attrs.append((cols[col.casefold()]["name"], name))
+    return {"key": key, "key_id_form": idform, "key_column": kcol["name"], "key_type_change": change,
+            "attributes": attrs, "reused": reused}
+
+
+def cmd_add_source_table(m: MSTR, args):
+    """Add a table from a data source to an existing model as a lookup: the table, the key attribute's ID form
+    read on it, and each new attribute (one column each) related to the key through it (key = child). Two
+    changesets: the table with the key's expression and the new attributes (a table no attribute reads can't be
+    committed), then the relationships. Re-running reuses what an earlier run made. Republish afterwards (and
+    publish from Studio, as after other attribute changes) for the rows to load."""
+    m.login(identity=True)
+    mid = args.model_id
+    r = m.post(f"/api/model/dataModels/{mid}/export")
+    if not r.ok:
+        die(f"export model: {format_mstr_error(r)}")
+    model = (r.json().get("model") or [{}])[0]
+    new_attrs = []
+    for pair in args.attributes or []:
+        col, sep, name = str(pair).partition("=")
+        if not sep or not col.strip() or not name.strip():
+            die(f"--attribute takes COLUMN=NAME, not '{pair}'")
+        new_attrs.append((col.strip(), name.strip()))
+    existing = [t for t in model.get("tables") or []
+                if (t.get("information") or {}).get("name", "").casefold() == args.table.casefold()]
+    table_body = None
+    if existing:
+        tinfo = existing[0]["information"]
+        columns = [{"name": c.get("columnName") or (c.get("information") or {}).get("name"),
+                    "dataType": c.get("dataType")} for c in (existing[0].get("physicalTable") or {}).get("columns") or []]
+        print(f"  = table '{tinfo['name']}' is already in the model ({tinfo['objectId']}): reused", file=sys.stderr)
+    else:
+        ds_id = args.instance_id or resolve_instance_id(m, args.instance)
+        table_body = _make_pipeline_table_body(m, ds_id, args.namespace, args.table)
+        if table_body is None:
+            die(f"could not read '{args.namespace}'.'{args.table}' from the data source: check the names with "
+                f"list-namespaces and list-tables --match")
+        columns = [{"name": c["columnName"], "dataType": c["dataType"]} for c in table_body["physicalTable"]["columns"]]
+    plan = source_table_plan(model, args.key_attribute, args.key_column, columns, new_attrs, args.table,
+                             key_form=args.key_form or "")
+    change = plan["key_type_change"]
+    if change and table_body is not None:   # type the key column like the attribute's ID form, or it can't join
+        to = copy.deepcopy(change["to"])
+        for c in table_body["physicalTable"]["columns"]:
+            if c["columnName"] == change["column"]:
+                c["dataType"] = to
+        pipe = json.loads(table_body["physicalTable"]["pipeline"])
+        for c in pipe["rootTable"]["children"][0]["columns"]:
+            if c["name"] == change["column"]:
+                c["dataType"] = to   # sourceDataType stays: the warehouse type
+        table_body["physicalTable"]["pipeline"] = json.dumps(pipe)
+    elif change:
+        die(f"the key column '{change['column']}' of the existing table is {change['from']}, the key's ID form "
+            f"{change['to']}: retype it with set-column-types first")
+    key = plan["key"]
+    key_ref = {"objectId": key["information"]["objectId"], "subType": "attribute", "name": key["information"]["name"]}
+    if args.dry_run:
+        print(json.dumps({"ok": True, "dry_run": True, "table": args.table, "new_table": table_body is not None,
+                          "table_body": table_body, "key_attribute": key_ref,
+                          "key_id_form": plan["key_id_form"].get("name"), "key_column": plan["key_column"],
+                          "key_type_change": change, "set_lookup": bool(args.set_lookup),
+                          "attributes": [{"column": c, "name": n, "reused": n in plan["reused"]}
+                                         for c, n in plan["attributes"]],
+                          "relationships": [f"{n} (parent) -> {key_ref['name']} (child) via {args.table}"
+                                            for _, n in plan["attributes"]]}, indent=2, default=str))
+        return
+    cs = open_cs(m)
+    try:
+        if table_body is not None:
+            r = m.post(f"/api/model/dataModels/{mid}/tables", json=table_body)
+            tid = (_json_or(r, {}).get("information") or {}).get("objectId") if r.ok else None
+            if not tid:
+                die(f"add table: {format_mstr_error(r)}")
+            tname = args.table
+        else:
+            tid, tname = tinfo["objectId"], tinfo["name"]
+        table_ref = {"objectId": tid, "subType": "logical_table", "name": tname}
+        rr = m.get(f"/api/model/dataModels/{mid}/attributes/{key_ref['objectId']}", params={"showExpressionAs": "tokens"})
+        if not rr.ok:
+            die(f"read '{key_ref['name']}': {format_mstr_error(rr)}")
+        cur = rr.json()
+        forms = cur.get("forms") or []
+        if not _add_table_expression_to_form(forms, tid, tname, plan["key_column"]):
+            die(f"'{key_ref['name']}' has no ID form to add the table to")
+        patch: dict[str, Any] = {"forms": forms}
+        if args.set_lookup:
+            for f in forms:
+                if f.get("category") == "ID" or f.get("id") == _ID_FORM:
+                    f["lookupTable"] = table_ref
+            patch.update({"attributeLookupTable": table_ref, "autoDetectLookupTable": False})
+        r = m.patch(f"/api/model/dataModels/{mid}/attributes/{key_ref['objectId']}", json=patch)
+        if not r.ok:
+            die(f"map '{plan['key_column']}' to '{key_ref['name']}': {format_mstr_error(r)}")
+        made = {}
+        for col, name in plan["attributes"]:
+            if name in plan["reused"]:
+                continue
+            body = formula_attribute_body(name, [{"type": "column_reference", "value": col}], table_ref,
+                                          description=f"From {tname}.{col}.")
+            r = m.post(f"/api/model/dataModels/{mid}/attributes", json=body)
+            aid = (_json_or(r, {}).get("information") or {}).get("objectId") if r.ok else None
+            if not aid:
+                die(f"create attribute '{name}': {format_mstr_error(r)}")
+            made[name] = aid
+        commit_cs(m, cs)
+        cs = ""
+    finally:
+        if cs:
+            discard_cs(m, cs)
+    ids = dict(made)
+    if plan["reused"]:
+        r = m.post(f"/api/model/dataModels/{mid}/export")
+        for a in ((r.json().get("model") or [{}])[0].get("attributes") or []) if r.ok else []:
+            if (a.get("information") or {}).get("name") in plan["reused"]:
+                ids[a["information"]["name"]] = a["information"]["objectId"]
+    rels = [{"parent": {"objectId": ids[n], "subType": "attribute"}, "child": {"objectId": key_ref["objectId"],
+             "subType": "attribute"}, "relationshipType": "one_to_many",
+             "relationshipTable": {"objectId": tid, "subType": "logical_table"}} for _, n in plan["attributes"] if n in ids]
+    added = 0
+    if rels:
+        cs2 = open_cs(m)
+        try:
+            ok, added, _total, err = put_relationships_merged(m, mid, key_ref["objectId"], rels, cs2)
+            if not ok:
+                die(f"relationships into '{key_ref['name']}': {err} (the table and attributes are committed; "
+                    f"re-run to retry)")
+            commit_cs(m, cs2)
+            cs2 = ""
+        finally:
+            if cs2:
+                discard_cs(m, cs2)
+    after = m.get(f"/api/model/dataModels/{mid}/attributes/{key_ref['objectId']}")
+    lookup = ((after.json() if after.ok else {}).get("attributeLookupTable") or {}).get("name")
+    print(json.dumps({"ok": True, "table_id": tid, "table": tname, "new_table": table_body is not None,
+                      "key_attribute": key_ref["name"], "key_column": plan["key_column"],
+                      "key_type_change": change, "key_lookup_table": lookup,
+                      "attributes": ids, "relationships_added": added,
+                      "next": "republish (publish), publish from Studio, re-certify"}, indent=2, default=str))
+
+
 def cmd_create_formula_attribute(m: MSTR, args):
     """Create (or, with --update, rewrite) an attribute whose ID form is a formula over the table's columns.
     One changeset. Republish afterwards for it to hold data. Prefer a lookup table where one can do the job."""
@@ -8469,6 +8665,23 @@ def build_parser():
                                    "of --attribute")
     sp.add_argument("--dry-run", action="store_true", help="print the request bodies; open no changeset")
 
+    sp = sub.add_parser("add-source-table",
+                        help="add a data-source table to a model as a lookup: key mapped onto an existing attribute, "
+                             "new attributes related to it")
+    sp.add_argument("--model-id", required=True)
+    sp.add_argument("--instance", help="data source name (list-datasources)")
+    sp.add_argument("--instance-id", help="data source id, instead of --instance")
+    sp.add_argument("--namespace", help="schema as the data source's catalog names it (list-namespaces)")
+    sp.add_argument("--table", required=True, help="table name as the data source has it; also the model table's name")
+    sp.add_argument("--key-column", required=True, help="the table's column holding the key attribute's ID values")
+    sp.add_argument("--key-attribute", required=True, help="existing attribute the table describes")
+    sp.add_argument("--key-form", help="the form the key column matches, to check it is the attribute's ID form")
+    sp.add_argument("--attribute", dest="attributes", action="append", metavar="COLUMN=NAME",
+                    help="a new attribute read from one column, related to the key (parent). Repeatable")
+    sp.add_argument("--set-lookup", action="store_true",
+                    help="make the new table the key attribute's lookup table (only when it holds every key value)")
+    sp.add_argument("--dry-run", action="store_true", help="read and check only; print the table body and the plan")
+
     sp = sub.add_parser("remove-relationships",
         help="Remove parent-child relationships by attribute name (each child's list is PUT back without them, the "
              "others kept). One changeset; republish and re-certify afterwards.")
@@ -8737,6 +8950,7 @@ def main():
             "add-column-attribute": cmd_create_formula_attribute,
             "add-column-fact-metric": cmd_add_column_fact_metric,
             "add-time-attributes": cmd_add_time_attributes,
+            "add-source-table": cmd_add_source_table,
             "show-forms": cmd_show_forms,
             "remove-relationships": cmd_remove_relationships,
             "export-model": cmd_export_model,
