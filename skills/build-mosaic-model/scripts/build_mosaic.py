@@ -5538,7 +5538,8 @@ def guided_count_tokens(entity: dict, id_form_name: str, base: dict) -> list[dic
     """`Count<Distinct=True, MetricID=[base], Null=False>([Entity]@[ID form]){~+}`: entities counted on the rows
     of the base metric's fact table, whatever the query groups or filters by. Without the guide a distinct count
     reads the entity's lookup table when the query involves no fact (seen live 2026-11-20: 514 customers in the
-    table vs 2 on the fact). Copied token for token from a metric built in Studio (2026-11-20)."""
+    table vs 2 on the fact). Copied token for token from a metric built in Studio; the engine-written metric read
+    the same as Studio's in every query shape (verified live 2026-11-20)."""
     if "Count" in AGG_FUNCTION_IDS:
         head = {"type": "function", "value": "Count",
                 "target": {"objectId": AGG_FUNCTION_IDS["Count"], "subType": "function", "name": "Count"}}

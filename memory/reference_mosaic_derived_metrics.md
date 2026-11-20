@@ -234,7 +234,8 @@ describe each. **To count the entities on a fact whatever the query, guide it wi
 read back token for token: `MetricID` is an `other` token, the fact metric an `object_reference`, the entity an
 `object_at_form` with `attributeForm` = the ID form). It read 2 with no grouping, by status, by the entity's
 parent and per entity (1 each). `create-conditional-metric --count-attribute <entity> --base-metric <fact
-metric>` writes it (engine-written form: probe 7b). Choose a base metric filled on every fact row (the scope's
+metric>` writes it (verified live 2026-11-20, probe 7b: the engine-written metric read the same as Studio's in
+every shape above). Choose a base metric filled on every fact row (the scope's
 anchor). **`Count` of an attribute ignores an attribute dimty
 unit on `[Period]`** (both `Distinct=True` and `False`) unless the counted attribute is related to the period
 attribute. **`Count` of a fact metric keeps it**: `Count<UseLookupForAttributes=False>([M]) {~+}` plus a
