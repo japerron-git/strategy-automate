@@ -4690,9 +4690,12 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         elif not a.get("attribute") and (a.get("and") or a.get("level_rule")):
             problems.append(f"{kind}: args.and and args.level_rule need a filter (args.attribute and args.elements); "
                             f"without one, give neither")
+        if a.get("base_metric") and (not a.get("count_attribute") or a.get("attribute")):
+            problems.append(f"{kind}: args.base_metric guides an unfiltered count_attribute count only")
         argv = base + ["create-conditional-metric", "--model-id", model_id, "--name", str(a.get("name", ""))]
         opt(argv, "--source-metric", "source_metric")
         opt(argv, "--count-attribute", "count_attribute")
+        opt(argv, "--base-metric", "base_metric")
         if a.get("attribute") or a.get("elements"):
             argv += ["--attribute", str(a.get("attribute", "")), "--elements"] + _arg_list(a.get("elements"))
         for cond in a.get("and") or []:
@@ -4864,6 +4867,25 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
             if r.get("type", "one_to_many") not in RELATIONSHIP_TYPES:
                 problems.append(f"{kind}: type '{r.get('type')}' is not one of {', '.join(RELATIONSHIP_TYPES)}")
         argv = base + ["wire-relationships", "--model-id", model_id, "--hints", RELATIONSHIP_HINTS]
+        return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
+    if kind == "add_lookup_table" and a.get("source_table"):
+        # the table already sits in a data source: build_mosaic.py add-source-table adds it (verified live 2026-11-20)
+        need("key_attribute")
+        st = a.get("source_table")
+        if not isinstance(st, dict) or not all(st.get(k) for k in ("datasource", "namespace", "table")):
+            problems.append(f"{kind}: args.source_table is {{datasource, namespace, table}} as the data source names "
+                            f"them (list-datasources, list-namespaces)")
+            st = {}
+        if a.get("new_forms") or a.get("extends_table"):
+            problems.append(f"{kind}: new_forms and extends_table aren't supported for a source_table yet; add the "
+                            f"forms in Studio after this step")
+        argv = base + ["add-source-table", "--model-id", model_id, "--instance", str(st.get("datasource", "")),
+                       "--namespace", str(st.get("namespace", "")), "--table", str(st.get("table", "")),
+                       "--key-attribute", str(a.get("key_attribute", ""))]
+        if a.get("key_column"):
+            argv += ["--key-column", str(a["key_column"])]
+        for name in a.get("new_attributes") or []:
+            argv += ["--attribute", f"{name}={name}"]
         return {"dry_run": argv + ["--dry-run"], "apply": argv, "manual": None, "problems": problems}
     if kind == "add_lookup_table":
         need("csv", "key_attribute")
@@ -5361,7 +5383,8 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                             continue
                         c = {**c, "manual": " ".join(f"{i}. {w.rstrip('.')}." for i, w in enumerate(work, 1))}
                 retype = None
-                if kind == "add_lookup_table":
+                from_source = kind == "add_lookup_table" and bool((action.get("args") or {}).get("source_table"))
+                if kind == "add_lookup_table" and not from_source:   # add-source-table checks the key's type itself
                     largs = action.get("args") or {}
                     key = str(largs.get("key_column") or largs.get("key_attribute") or "")
                     t = retyped_to.get(key.casefold()) or retyped_to.get(str(largs.get("key_attribute") or "").casefold())
@@ -5376,7 +5399,7 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                                             "matched loosely."]}
                 first = (f["id"], "risks") not in noted          # a finding's risks show on its first step only
                 noted.add((f["id"], "risks"))
-                if kind == "add_lookup_table":   # all of a phase's lookups become one checklist step
+                if kind == "add_lookup_table" and not from_source:   # a phase's CSV lookups: one checklist step
                     if lookup_at is None:
                         lookup_at = len(steps)
                     lookups.append((action.get("args") or {}, bool(retype)))

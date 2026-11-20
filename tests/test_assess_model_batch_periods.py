@@ -316,3 +316,42 @@ class PlanNameTests(unittest.TestCase):
                                                       "names": {"month": "Month"}}}
         plan = am.build_plan({"findings": [_f("F1", "attribute", [ta])]}, model_id="MID")
         self.assertTrue(any("intervals not in args.intervals" in p for p in plan["problems"]))
+
+
+class GuidedCountPlanTests(unittest.TestCase):
+    def test_a_base_metric_goes_on_the_command(self):
+        cm = {"kind": "create_conditional_metric", "args": {"name": "active customers", "count_attribute": "customer",
+                                                             "base_metric": "net sales"}}
+        plan = am.build_plan({"findings": [_f("F1", "missing_metric", [cm])]}, model_id="MID")
+        self.assertEqual(plan["problems"], [])
+        argv = plan["phases"][0]["steps"][0]["apply"]["argv"]
+        self.assertEqual(argv[argv.index("--base-metric") + 1], "net sales")
+        cm["args"].update(attribute="region", elements=["East"])
+        self.assertTrue(any("base_metric guides an unfiltered" in p for p in
+                            am.build_plan({"findings": [_f("F1", "missing_metric", [cm])]}, model_id="MID")["problems"]))
+
+
+class SourceTableLookupPlanTests(unittest.TestCase):
+    def test_a_lookup_from_a_data_source_is_a_command_step(self):
+        st = {"kind": "add_lookup_table", "args": {"key_attribute": "store", "new_attributes": ["format group"],
+                                                   "source_table": {"datasource": "DW", "namespace": "SALES",
+                                                                    "table": "STORE_LOOKUP"}}}
+        csv = {"kind": "add_lookup_table", "args": {"csv": "lookups/region.csv", "key_attribute": "region"}}
+        plan = am.build_plan({"findings": [_f("F1", "lookup", [st, csv])]}, model_id="MID")
+        self.assertEqual(plan["problems"], [])
+        steps = plan["phases"][0]["steps"]
+        cmd_step = next(s for s in steps if s["apply"])
+        self.assertEqual(cmd_step["apply"]["argv"][2:], [
+            "add-source-table", "--model-id", "MID", "--instance", "DW", "--namespace", "SALES", "--table",
+            "STORE_LOOKUP", "--key-attribute", "store", "--attribute", "format group=format group"])
+        self.assertEqual(cmd_step["dry_run"]["argv"][-1], "--dry-run")
+        checklist = next(s for s in steps if s["manual"])
+        self.assertEqual(checklist["title"], "Add 1 lookup table")      # only the CSV one
+        self.assertIn("region.csv", checklist["manual"])
+
+    def test_a_source_table_needs_its_names_and_no_forms(self):
+        st = {"kind": "add_lookup_table", "args": {"key_attribute": "store", "new_forms": ["store name"],
+                                                   "source_table": {"datasource": "DW", "table": "T"}}}
+        problems = am.build_plan({"findings": [_f("F1", "lookup", [st])]}, model_id="MID")["problems"]
+        self.assertTrue(any("{datasource, namespace, table}" in p for p in problems))
+        self.assertTrue(any("new_forms and extends_table aren't supported" in p for p in problems))

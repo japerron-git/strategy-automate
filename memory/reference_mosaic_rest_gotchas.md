@@ -30,7 +30,7 @@ Verified against a Strategy ONE Library Modeling Service in 2026. These rules ca
 - The outer `physicalTable.columns` list is a separate flat array with `{information:{name}, dataType, columnName}` — **no top-level `id`** — while the inner pipeline `rootTable.children[].columns` uses `{id, name, dataType, sourceDataType}`. Both the outer and the inner pipeline `columns` must be present.
 - When the pipeline shape misbehaves on a tenant, the fallback is the object form via clone-and-remap — see `reference_strategy_object_cloning.md`.
 
-## Adding a data-source table to an existing model (`add-source-table`; not yet run live)
+## Adding a data-source table to an existing model (`add-source-table`; verified live 2026-11-20, probe 8)
 `build_mosaic.py add-source-table` adds a table from a data source to a published model as a lookup, with the
 shapes `build` uses: the pipeline table body (`_make_pipeline_table_body`), the key attribute's ID form given a
 `(table, column)` expression on it (`_add_table_expression_to_form`, read with `showExpressionAs=tokens`), and
@@ -43,9 +43,12 @@ match), and every other column becomes an attribute named from the column (`--at
 and names them). The key column's type family (number, text, date) must match the ID form's (its `dataType`,
 else the column it reads on the model's tables), or it stops before any write; `--retype-key` types it like the
 ID form in the table body instead (`sourceDataType` kept). `--set-lookup` makes the table the key's lookup (`attributeLookupTable`, `autoDetectLookupTable: false`);
-the default keeps the current one. Republish, publish from Studio and re-certify afterwards. To verify live
-(scratch probe 8): the commit on a published model, the key's lookup table after it, whether a REST republish
-loads the rows, and the new attribute's values through the connector.
+the default keeps the current one. Republish and re-certify afterwards. Live (2026-11-20, a 907-key lookup
+added to a published 3-table model from the same Snowflake data source): both changesets committed; the key
+kept the fact table as its lookup; a REST republish alone loaded the rows (no Studio publish), though
+publishStatus never confirmed; the new attribute matched the source CSV for every key; fact rows unchanged; a
+64-bit integer key column joined the 32-bit integer ID form. The data source's table list (`list-tables`) was
+empty for that schema while the table could be read directly (`describe-table`): check with the direct read.
 
 ## Changing a column's type in an existing model (verified 2026-10-30)
 `PATCH /api/model/dataModels/{mid}/tables/{tid}` with `{"physicalTable": ...}`, inside a changeset: set the new

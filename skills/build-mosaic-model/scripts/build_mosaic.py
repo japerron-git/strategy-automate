@@ -3589,7 +3589,11 @@ def _mosaic_publish_verified(m: MSTR, model_id: str, *, poll_seconds: int = 180,
         polls = 0
         started = next_beat = time.time()
         next_beat += HEARTBEAT_S
-        ever_tables = False
+        # when publishStatus last listed a table: the "unconfirmed" stops count from then. A list that shows up and
+        # then goes away is no longer proof the job runs (seen live 2026-11-20, twice: {"status": 1} at every
+        # heartbeat, no early stop, while the data had loaded).
+        tables_at = 0.0
+        listing = False
         probe_note = "not yet asked"
         while time.time() < deadline:
             polls += 1
@@ -3627,14 +3631,20 @@ def _mosaic_publish_verified(m: MSTR, model_id: str, *, poll_seconds: int = 180,
                 js = {"raw": js}
             st = js.get("status")
             tbl = [t for t in (js.get("tables") or []) if isinstance(t, dict)]
-            ever_tables = ever_tables or bool(tbl)
             now = time.time()
+            if bool(tbl) != listing:   # say when the table list appears or goes, which heartbeats can miss
+                listing = bool(tbl)
+                print(f"  ... publishStatus {'lists' if tbl else 'no longer lists'} tables ({int(now - started)}s): "
+                      f"{json.dumps(js)[:160]}", file=sys.stderr, flush=True)
+            if tbl:
+                tables_at = now
+            quiet = now - max(started, tables_at)   # seconds without a listed table
             if now >= next_beat:
                 next_beat = now + HEARTBEAT_S
                 print(f"  ... still waiting for the publish ({int(now - started)}s of {poll_seconds}s): publishStatus "
                       f"{json.dumps(js)[:160]}"
                       + (f"; query check: {probe_note}" if probe_decides else ""), file=sys.stderr, flush=True)
-            if probe_decides and unconfirmed_after and not ever_tables and now - started >= unconfirmed_after \
+            if probe_decides and unconfirmed_after and quiet >= unconfirmed_after \
                     and not (isinstance(st, int) and st < 0) and not js.get("code"):
                 keep_instance = True      # the job may still be running: deleting the instance could abort it
                 print(f"  ! publish NOT CONFIRMED: after {unconfirmed_after}s publishStatus has listed no table (last "
@@ -3643,10 +3653,10 @@ def _mosaic_publish_verified(m: MSTR, model_id: str, *, poll_seconds: int = 180,
                       f"data in the connector before relying on it (a first build does not stop this way).",
                       file=sys.stderr, flush=True)
                 return
-            if not probe_decides and not ever_tables and now - started >= NO_TABLES_REPUBLISH_S \
+            if not probe_decides and quiet >= NO_TABLES_REPUBLISH_S \
                     and not (isinstance(st, int) and st < 0) and not js.get("code"):
                 keep_instance = True      # the job may still be running: deleting the instance could abort it
-                print(f"  ! publish NOT CONFIRMED: publishStatus has listed no table for {NO_TABLES_REPUBLISH_S}s "
+                print(f"  ! publish NOT CONFIRMED: publishStatus has listed no table for {int(quiet)}s "
                       f"(last {json.dumps(js)[:120]}), and on a republish the model already answers with its old data, "
                       f"so nothing here can tell when the load ends. This tenant does this on small models even after "
                       f"the load finished. Stopped waiting; check the new data in the connector before relying on it.",
@@ -5524,6 +5534,31 @@ def conditional_metric_tokens(function: str, source: dict, filter_id: str = "", 
     return tokens + [{"type": "end_of_text", "value": ""}]
 
 
+def guided_count_tokens(entity: dict, id_form_name: str, base: dict) -> list[dict]:
+    """`Count<Distinct=True, MetricID=[base], Null=False>([Entity]@[ID form]){~+}`: entities counted on the rows
+    of the base metric's fact table, whatever the query groups or filters by. Without the guide a distinct count
+    reads the entity's lookup table when the query involves no fact (seen live 2026-11-20: 514 customers in the
+    table vs 2 on the fact). Copied token for token from a metric built in Studio (2026-11-20)."""
+    if "Count" in AGG_FUNCTION_IDS:
+        head = {"type": "function", "value": "Count",
+                "target": {"objectId": AGG_FUNCTION_IDS["Count"], "subType": "function", "name": "Count"}}
+    else:
+        head = {"type": "function", "value": "Count"}
+    eq = {"type": "function", "value": "="}
+    return [head, {"type": "character", "value": "<"},
+            {"type": "identifier", "value": "Distinct"}, dict(eq), {"type": "boolean", "value": "True"},
+            {"type": "character", "value": ","},
+            {"type": "other", "value": "MetricID"}, dict(eq),
+            {"type": "object_reference", "value": f"[{base['name']}]", "target": base},
+            {"type": "character", "value": ","},
+            {"type": "identifier", "value": "Null"}, dict(eq), {"type": "boolean", "value": "False"},
+            {"type": "character", "value": ">"}, {"type": "character", "value": "("},
+            {"type": "object_at_form", "value": f"[{entity['name']}]@[{id_form_name}]", "target": entity,
+             "attributeForm": {"objectId": _ID_FORM}},
+            {"type": "character", "value": ")"}] + \
+        [{"type": "character", "value": c} for c in "{~+}"] + [{"type": "end_of_text", "value": ""}]
+
+
 def level_rule_unit(attribute: dict, rule: str) -> dict:
     """dimty unit that makes the metric read the latest/first value of a period-type attribute
     (LEVEL_RULE_AGGREGATIONS). A metric with its own unit keeps the rule under a filter; a
@@ -5829,9 +5864,11 @@ def cmd_create_conditional_metric(m: MSTR, args):
     What it aggregates (exactly one):
       --source-metric F [--function Sum|Avg|Count]   Fn(<fact metric>); Count counts fact rows
       --count-attribute A                            Count<Distinct=True>(<attribute>)
-    Without --attribute and --elements it has no filter: the create alone, one changeset (a plain distinct count
-    of an entity with --count-attribute, read on the fact rows; memory/reference_mosaic_derived_metrics.md
-    rule 3). --and, --level-rule and --replace need a filter.
+    Without --attribute and --elements it has no filter: the create alone, one changeset. An unfiltered
+    --count-attribute count reads the fact rows only when the query involves the fact (grouping or filtering by
+    a fact attribute); otherwise the entity's own table (seen live 2026-11-20). --base-metric guides it to a fact
+    metric's rows always (Count<Distinct=True, MetricID=[base], Null=False>). --and, --level-rule and --replace
+    need a filter.
     Optional level rule: --level-rule last|first|last_lookup|first_lookup with
     --level-attribute P (a period-type attribute) makes the metric read the latest/first
     period's value — needed on periodic-snapshot facts, where a filtered metric over a
@@ -5880,13 +5917,24 @@ def cmd_create_conditional_metric(m: MSTR, args):
             "metric isn't verified")
     if not filtered and getattr(args, "replace", False):
         die("--replace needs a filter: rewriting a metric without one isn't verified")
+    base_name = getattr(args, "base_metric", None)
+    if base_name and (not count_attr or filtered):
+        die("--base-metric guides an unfiltered --count-attribute count (a filtered count already reads the fact)")
     description = _check_description(getattr(args, "description", "") or "")
     fmt_preset = getattr(args, "format", None)
 
     m.login(identity=True)
     mp = f"/api/model/dataModels/{args.model_id}"
+    base = None
+    id_form_name = "ID"
     if count_attr:
         source = resolve_model_object_ref(m, args.model_id, "attributes", "attribute", count_attr)
+        if base_name:
+            base = resolve_model_object_ref(m, args.model_id, "factMetrics", "fact_metric", base_name)
+            r = m.get(f"{mp}/attributes/{source['objectId']}")
+            if not r.ok: die(f"read '{source['name']}': {format_mstr_error(r)}")
+            id_form_name = next((f.get("name") for f in (_json_or(r, {}).get("forms") or [])
+                                 if f.get("category") == "ID" or f.get("id") == _ID_FORM), None) or "ID"
     else:
         source = resolve_model_object_ref(m, args.model_id, "factMetrics", "fact_metric", source_name)
     conditions = [(resolve_model_object_ref(m, args.model_id, "attributes", "attribute", args.attribute),
@@ -5933,8 +5981,12 @@ def cmd_create_conditional_metric(m: MSTR, args):
     distinct = bool(count_attr)
 
     def body(filter_id=""):
-        return conditional_metric_body(args.name, function, source, fmt_values, description,
-                                       filter_id=filter_id, distinct=distinct, level=level)
+        out = conditional_metric_body(args.name, function, source, fmt_values, description,
+                                      filter_id=filter_id, distinct=distinct, level=level)
+        if base is not None:   # entities on the base metric's fact rows, whatever the query involves
+            out["expression"] = {"text": f"Count({{{source['name']}}})",
+                                 "tokens": guided_count_tokens(source, id_form_name, base)}
+        return out
 
     filter_body = embedded_filter_body(conditions) if filtered else None
     if getattr(args, "dry_run", False):
@@ -6878,9 +6930,15 @@ def source_table_plan(model: dict, key_attribute: str, columns: list[dict], tabl
     if new_attributes is None:
         new_attributes = [(str(c.get("name")), friendly_col(str(c.get("name")))) for c in columns if c is not kcol]
     attrs, reused = [], []
+    by_key = {}
+    for c in columns:
+        by_key.setdefault(_name_key(c.get("name")), []).append(c)
     for col, name in new_attributes:
-        if col.casefold() not in cols:
-            die(f"'{table}' has no column '{col}' for attribute '{name}'; its columns: {listed}")
+        if col.casefold() not in cols:   # 'results loaded' finds RESULTS_LOADED: letters and digits compared
+            same = by_key.get(_name_key(col)) or []
+            if len(same) != 1:
+                die(f"'{table}' has no column '{col}' for attribute '{name}'; its columns: {listed}")
+            col = str(same[0].get("name"))
         if cols[col.casefold()] is kcol:
             die(f"'{col}' is the key column; it maps onto '{key_attribute}', not a new attribute")
         if name.casefold() == key_attribute.casefold():
@@ -7577,8 +7635,11 @@ def cmd_add_time_attributes(m: MSTR, args):
             discard_cs(m, cs)
             raise
     print(json.dumps({"ok": True, "dry_run": bool(args.dry_run), "changed": [w[0] for w in writes],
-                      "skipped": notes, "next": "republish, then the intervals show on the connector as "
-                                                "'<attribute> (<interval>)__id / __start / __desc'"}, indent=2))
+                      "skipped": notes, "next": "republish (seen 2026-11-20: values showed after a REST republish "
+                                                "alone), then each interval shows on the connector as '<its name>__id "
+                                                "/ __start / __desc' (default name '<attribute> (<Interval>)'). A "
+                                                "Studio publish also adds the date's other intervals, hidden"},
+                     indent=2))
 
 
 def _display_ids(entries) -> list[str]:
@@ -8646,6 +8707,10 @@ def build_parser():
     sp.add_argument("--attribute",
                     help="attribute to filter on: name (case-insensitive) or objectId. Leave out with --elements for "
                          "a metric with no filter (a plain distinct count with --count-attribute)")
+    sp.add_argument("--base-metric",
+                    help="with --count-attribute and no filter: count the entities on this fact metric's rows "
+                         "(Count<MetricID=...>), whatever the query groups or filters by. Without it an unfiltered "
+                         "count reads the entity's own table when the query involves no fact")
     sp.add_argument("--elements", nargs="+",
                     help="attribute ID-form values to keep (IN list); quote values that contain spaces")
     sp.add_argument("--and", dest="and_conditions", action="append", nargs="+", metavar="ATTR_OR_VALUE",

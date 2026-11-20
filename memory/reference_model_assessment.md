@@ -728,7 +728,11 @@ label column is listed as an attribute that no metric filters on.
   where more decimals matter. Check the column's range before choosing: a derived metric's format can't be
   changed by these commands after it is created.
 
-`args` use the CLI option names without dashes (`source_metric`, `count_attribute`,
+`add_lookup_table` with `source_table: {datasource, namespace, table}` (a lookup the user loaded into a data
+source) runs `add-source-table` instead of joining the phase's CSV checklist: `key_attribute`, optional
+`key_column`, `new_attributes` (matched to columns by letters and digits); no `new_forms` or `extends_table`
+yet. The key's type is checked by the command, so no retype step follows.
+`args` use the CLI option names without dashes (`source_metric`, `count_attribute`, `base_metric`,
 `attribute`, `elements`, `and` as a list of lists, `level_rule`, `level_attribute`, `formula`,
 `join`, `format`, `description`, `replace`, `kind`, `object_id`, `json_file`, `spec`; for
 `add_lookup_table`: `csv`, `key_attribute`, `new_attributes`, `new_forms`; for `change_column_type`:
@@ -739,15 +743,19 @@ for `create_weighted_average`: `name`, exactly one of `value_attribute` / `value
 `replace: true` rewrites the derived metric of the same name in place, keeping its objectId. Only
 `create_conditional_metric` and `create_compound_metric` take it (`plan` reports it as a problem on any other
 kind); without it an existing name stops the step, dry run included.
-`create_conditional_metric` without `attribute` and `elements` has no filter: with `count_attribute` it is a
-plain distinct count of an entity on the fact rows (the create alone, one changeset; `and`, `level_rule` and
-`replace` need a filter). Not yet run live without a filter (scratch probe 7). `add_time_attributes` takes
+`create_conditional_metric` without `attribute` and `elements` has no filter (the create alone, one changeset;
+`and`, `level_rule` and `replace` need a filter; run live 2026-11-20, probe 7). With `count_attribute` alone it
+counts the entity's table unless the query involves the fact; with `base_metric` (a fact metric filled on every
+row, e.g. the scope's anchor) it counts the entities on that fact always: the default for "number of
+customers / accounts / stores" questions, named like "active customers"
+(`reference_mosaic_derived_metrics.md` §0d rule 3). `add_time_attributes` takes
 `attribute`, `intervals` and optional `names` (`{"year": "Year"}`; default '<attribute> (Year)'): a name held by
 another attribute or time attribute stops the command, dry run included, and an existing time attribute is never
 renamed. **Names through the phases:** `plan` moves a `rename_describe` item that frees a name an earlier phase
 creates (a time attribute's name, a new metric's or attribute's `name`) into a rename step at the start of that
 phase (`specs/rename_free_names_phase_<n>.json`), and reports a name created twice or renamed onto a created
-name. Custom time-attribute names: not yet run live (scratch probe 7).
+name. Custom time-attribute names: verified live 2026-11-20 (probe 7): created under the given name, values after a
+REST republish alone; a later Studio publish adds the date's other intervals, hidden, under default names.
 `create_time_shift_metric` (`name`, `function` PreviousDay/Week/Month/Quarter/Year or Month/Quarter/
 YearToDate, `time_attribute` = the base date attribute, `source_metric`, optional `periods` (Previous* only,
 default 1), `aggregation` (default Sum), `description`, `format`, `replace`) runs `build_mosaic.py

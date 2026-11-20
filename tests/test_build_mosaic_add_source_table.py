@@ -288,3 +288,11 @@ class AddSourceTableFlowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AttributeColumnMatchTests(unittest.TestCase):
+    def test_a_reviewed_name_finds_its_column(self):
+        cols = COLUMNS + [{"name": "REGION_NAME", "dataType": {"type": "utf8_char"}}]
+        plan = bm.source_table_plan(_model(), "Store", cols, "STORE_LOOKUP",
+                                    new_attributes=[("format group", "format group")])
+        self.assertEqual(plan["attributes"], [("FORMAT_GROUP", "format group")])

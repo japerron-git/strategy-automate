@@ -364,3 +364,52 @@ class UnfilteredCountTests(unittest.TestCase):
             with self.subTest(kw=kw), self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
                 bm.cmd_create_conditional_metric(fake, args)
             self.assertEqual(_writes(fake), [])
+
+
+class GuidedCountTests(unittest.TestCase):
+    """--base-metric: the shape a Studio-built 'active customers' metric has (read 2026-11-20)."""
+
+    def test_tokens_match_the_studio_shape(self):
+        entity = {"objectId": "E" * 32, "subType": "attribute", "name": "Customer ID"}
+        base = {"objectId": "B" * 32, "subType": "fact_metric", "name": "Sales Quantity"}
+        toks = bm.guided_count_tokens(entity, "Planning Customer ID", base)
+        self.assertEqual([(t["type"], t["value"]) for t in toks], [
+            ("function", "Count"), ("character", "<"), ("identifier", "Distinct"), ("function", "="),
+            ("boolean", "True"), ("character", ","), ("other", "MetricID"), ("function", "="),
+            ("object_reference", "[Sales Quantity]"), ("character", ","), ("identifier", "Null"), ("function", "="),
+            ("boolean", "False"), ("character", ">"), ("character", "("),
+            ("object_at_form", "[Customer ID]@[Planning Customer ID]"), ("character", ")"),
+            ("character", "{"), ("character", "~"), ("character", "+"), ("character", "}"), ("end_of_text", "")])
+        self.assertEqual(toks[8]["target"], base)
+        self.assertEqual((toks[15]["target"], toks[15]["attributeForm"]), (entity, {"objectId": bm._ID_FORM}))
+
+    def _routes(self):
+        routes = _routes()
+        routes[("GET", f"{MP}/attributes/{ATTR['objectId']}")] = _Resp(200, {"forms": [
+            {"id": bm._ID_FORM, "category": "ID", "name": "Region Code"}]})
+        return routes
+
+    def test_the_create_writes_the_guided_count(self):
+        fake = _FakeMSTR(self._routes())
+        args = _args(source_metric=None, count_attribute="Region", attribute=None, elements=None, function=None,
+                     name="Active Regions", base_metric="revenue")
+        with contextlib.redirect_stdout(io.StringIO()):
+            bm.cmd_create_conditional_metric(fake, args)
+        body = next(kw for method, path, kw, _ in fake.calls if method == "POST" and path == f"{MP}/metrics")["json"]
+        values = [t["value"] for t in body["expression"]["tokens"]]
+        self.assertIn("MetricID", values)
+        self.assertIn("[Region]@[Region Code]", values)
+        self.assertNotIn("UseLookupForAttributes", values)
+        self.assertEqual(_writes(fake), [("POST", "/api/model/changesets"), ("POST", f"{MP}/metrics"),
+                                         ("POST", "/api/model/changesets/CS1/commit")])
+
+    def test_a_base_metric_needs_an_unfiltered_count(self):
+        for kw in ({"count_attribute": None, "source_metric": "revenue"},
+                   {"attribute": "Region", "elements": ["East"]}):
+            base = dict(source_metric=None, count_attribute="Region", attribute=None, elements=None, function=None,
+                        name="Active Regions", base_metric="revenue")
+            base.update(kw)
+            fake = _FakeMSTR(self._routes())
+            with self.subTest(kw=kw), self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                bm.cmd_create_conditional_metric(fake, _args(**base))
+            self.assertEqual(_writes(fake), [])

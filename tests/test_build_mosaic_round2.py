@@ -657,6 +657,23 @@ class PublishTests(unittest.TestCase):
         self.assertIn("tables loaded", err.getvalue())
         self.assertEqual(len(calls(m, "DELETE")), 1)
 
+    def test_a_table_list_that_goes_away_still_stops_unconfirmed(self):
+        # seen live (2026-11-20, twice, a 4-table republish): {"status": 1} at every heartbeat and no early stop: a
+        # table list early on had turned the stop off for good, while the data had already loaded
+        seq = iter([Resp(200, {"status": 1, "tables": [{"status": "loading"}]})] * 2 + [Resp(200, {"status": 1})] * 500)
+        routes = publish_routes(lambda call: next(seq))
+        routes[("POST", r"/api/v2/cubes/M/instances")] = Resp(200, {"result": {}})     # answers: a republish
+        m = make_m(routes)
+        err = io.StringIO()
+        with mock.patch.object(bm.time, "time", side_effect=[i * 5.0 for i in range(2000)]), \
+             mock.patch.object(bm.time, "sleep"), contextlib.redirect_stderr(err):
+            bm._mosaic_publish_verified(m, "M", poll_seconds=600, poll_interval=0.01)
+        out = err.getvalue()
+        self.assertIn("publishStatus lists tables", out)
+        self.assertIn("publishStatus no longer lists tables", out)
+        self.assertIn("publish NOT CONFIRMED", out)
+        self.assertLess(len(calls(m, "GET", r"/api/dataModels/M/publishStatus")), 40)    # ~2 min after the list went
+
     def test_schema_comparison_error_fails_fast(self):
         m = make_m(publish_routes(Resp(200, {"status": 1, "tables": [{"status": "schema_comparison_error"}]})))
         started = time.monotonic()

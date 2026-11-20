@@ -224,7 +224,18 @@ accepted inside a level cluster:
 - the average = tree `divide` of the two (§0) with `formulaJoinType: "outer"` (rule 7).
 
 **3. Counting entities.** `Count<Distinct=True, UseLookupForAttributes=False>([attribute:Entity]) {~+}` counts
-distinct entities, with or without an embedded filter. **`Count` of an attribute ignores an attribute dimty
+distinct entities, with or without an embedded filter. **Which entities depends on the query** (verified live
+2026-11-20, an entity table of 514 members, 2 of them on the fact): without a filter it counts the fact's
+entities only when the query groups or filters by an attribute reached through the fact (2 per status); with
+no grouping, or grouped by the entity's own parents, it counts the entity's table (514). Both are right
+answers to different questions ("customers in the data" vs "customers in the master list"), so name and
+describe each. **To count the entities on a fact whatever the query, guide it with a base metric**:
+`Count<Distinct=True, MetricID=[<fact metric>], Null=False>([Entity]@[<its ID form>]) {~+}` (built in Studio,
+read back token for token: `MetricID` is an `other` token, the fact metric an `object_reference`, the entity an
+`object_at_form` with `attributeForm` = the ID form). It read 2 with no grouping, by status, by the entity's
+parent and per entity (1 each). `create-conditional-metric --count-attribute <entity> --base-metric <fact
+metric>` writes it (engine-written form: probe 7b). Choose a base metric filled on every fact row (the scope's
+anchor). **`Count` of an attribute ignores an attribute dimty
 unit on `[Period]`** (both `Distinct=True` and `False`) unless the counted attribute is related to the period
 attribute. **`Count` of a fact metric keeps it**: `Count<UseLookupForAttributes=False>([M]) {~+}` plus a
 `[Period]` unit counts the snapshot rows in the selected period, which equals entities per period.
