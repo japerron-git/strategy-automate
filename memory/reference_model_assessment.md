@@ -739,6 +739,15 @@ for `create_weighted_average`: `name`, exactly one of `value_attribute` / `value
 `replace: true` rewrites the derived metric of the same name in place, keeping its objectId. Only
 `create_conditional_metric` and `create_compound_metric` take it (`plan` reports it as a problem on any other
 kind); without it an existing name stops the step, dry run included.
+`create_conditional_metric` without `attribute` and `elements` has no filter: with `count_attribute` it is a
+plain distinct count of an entity on the fact rows (the create alone, one changeset; `and`, `level_rule` and
+`replace` need a filter). Not yet run live without a filter (scratch probe 7). `add_time_attributes` takes
+`attribute`, `intervals` and optional `names` (`{"year": "Year"}`; default '<attribute> (Year)'): a name held by
+another attribute or time attribute stops the command, dry run included, and an existing time attribute is never
+renamed. **Names through the phases:** `plan` moves a `rename_describe` item that frees a name an earlier phase
+creates (a time attribute's name, a new metric's or attribute's `name`) into a rename step at the start of that
+phase (`specs/rename_free_names_phase_<n>.json`), and reports a name created twice or renamed onto a created
+name. Custom time-attribute names: not yet run live (scratch probe 7).
 `create_time_shift_metric` (`name`, `function` PreviousDay/Week/Month/Quarter/Year or Month/Quarter/
 YearToDate, `time_attribute` = the base date attribute, `source_metric`, optional `periods` (Previous* only,
 default 1), `aggregation` (default Sum), `description`, `format`, `replace`) runs `build_mosaic.py

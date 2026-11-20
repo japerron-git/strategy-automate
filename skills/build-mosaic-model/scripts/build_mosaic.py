@@ -5829,6 +5829,9 @@ def cmd_create_conditional_metric(m: MSTR, args):
     What it aggregates (exactly one):
       --source-metric F [--function Sum|Avg|Count]   Fn(<fact metric>); Count counts fact rows
       --count-attribute A                            Count<Distinct=True>(<attribute>)
+    Without --attribute and --elements it has no filter: the create alone, one changeset (a plain distinct count
+    of an entity with --count-attribute, read on the fact rows; memory/reference_mosaic_derived_metrics.md
+    rule 3). --and, --level-rule and --replace need a filter.
     Optional level rule: --level-rule last|first|last_lookup|first_lookup with
     --level-attribute P (a period-type attribute) makes the metric read the latest/first
     period's value — needed on periodic-snapshot facts, where a filtered metric over a
@@ -5869,8 +5872,14 @@ def cmd_create_conditional_metric(m: MSTR, args):
     for c in extra:
         if len(c) < 2:
             die(f"--and {' '.join(c)}: give an attribute and at least one element value")
-    if not args.elements:
-        die("--elements needs at least one value")
+    filtered = bool(args.attribute or args.elements)
+    if filtered and not (args.attribute and args.elements):
+        die("--attribute and --elements go together: both for a filter, neither for a plain count or total")
+    if not filtered and (extra or level_rule):
+        die("--and and --level-rule need a filter (--attribute and --elements); a level rule on an unfiltered "
+            "metric isn't verified")
+    if not filtered and getattr(args, "replace", False):
+        die("--replace needs a filter: rewriting a metric without one isn't verified")
     description = _check_description(getattr(args, "description", "") or "")
     fmt_preset = getattr(args, "format", None)
 
@@ -5881,7 +5890,7 @@ def cmd_create_conditional_metric(m: MSTR, args):
     else:
         source = resolve_model_object_ref(m, args.model_id, "factMetrics", "fact_metric", source_name)
     conditions = [(resolve_model_object_ref(m, args.model_id, "attributes", "attribute", args.attribute),
-                   list(args.elements))]
+                   list(args.elements))] if filtered else []
     for c in extra:
         conditions.append((resolve_model_object_ref(m, args.model_id, "attributes", "attribute", c[0]), c[1:]))
     level = None
@@ -5927,9 +5936,11 @@ def cmd_create_conditional_metric(m: MSTR, args):
         return conditional_metric_body(args.name, function, source, fmt_values, description,
                                        filter_id=filter_id, distinct=distinct, level=level)
 
-    filter_body = embedded_filter_body(conditions)
+    filter_body = embedded_filter_body(conditions) if filtered else None
     if getattr(args, "dry_run", False):
-        if target_id:
+        if not filtered:
+            plan = [{"step": "create", "method": "POST", "path": f"{mp}/metrics", "params": q, "body": body()}]
+        elif target_id:
             plan = [
                 {"step": "embed filter", "method": "POST", "path": f"{mp}/metrics/{target_id}/embeddedObjects",
                  "params": {"showExpressionAs": "tree"}, "body": filter_body},
@@ -5950,6 +5961,7 @@ def cmd_create_conditional_metric(m: MSTR, args):
         print(json.dumps(out, indent=2))
         return
     cs = open_cs(m)
+    filter_id = None
     try:
         if target_id:
             metric_id = target_id
@@ -5957,6 +5969,11 @@ def cmd_create_conditional_metric(m: MSTR, args):
             r = m.post(f"{mp}/metrics", params=q, json=body())
             if not r.ok: die(f"create metric: {format_mstr_error(r)}")
             metric_id = r.json()["information"]["objectId"]
+        if not filtered:   # a plain count or total: the create alone (step (a) of the filtered path)
+            commit_cs(m, cs)
+            print(json.dumps({"ok": True, "metric_id": metric_id, "embedded_filter_id": None, "filter": None},
+                             indent=2))
+            return
         r = m.post(f"{mp}/metrics/{metric_id}/embeddedObjects", params={"showExpressionAs": "tree"},
                    json=filter_body)
         if not r.ok: die(f"embed filter: {format_mstr_error(r)}")
@@ -7160,13 +7177,22 @@ TIME_INTERVALS = ("year", "quarter", "month", "week", "day")   # seen live on a 
 
 
 def time_attribute_items(args) -> list[dict]:
-    """--attribute A --intervals year,quarter,month and/or --spec {items: [{attribute, intervals}]}."""
+    """--attribute A --intervals year,quarter,month [--name year=Year ...] and/or --spec {items: [{attribute,
+    intervals, names: {interval: name}}]}. Without a name an interval is named as Studio names it."""
     items = []
     if getattr(args, "spec", None):
         items += list((_load_json_arg(None, args.spec) or {}).get("items") or [])
+    names = {}
+    for pair in getattr(args, "names", None) or []:
+        interval, sep, label = str(pair).partition("=")
+        if not sep or not interval.strip() or not label.strip():
+            die(f"add-time-attributes: --name takes INTERVAL=NAME (e.g. year=Year), not '{pair}'")
+        names[interval.strip().lower()] = label.strip()
     if getattr(args, "attribute", None):
         items.append({"attribute": args.attribute, "intervals": [x.strip() for x in (args.intervals or "").split(",")
-                                                                   if x.strip()]})
+                                                                   if x.strip()], "names": names})
+    elif names:
+        die("add-time-attributes: --name goes with --attribute (in a --spec, give each item its own names)")
     if not items:
         die("add-time-attributes: give --attribute and --intervals, or --spec")
     for it in items:
@@ -7174,6 +7200,10 @@ def time_attribute_items(args) -> list[dict]:
         if not it.get("attribute") or not it.get("intervals") or bad:
             die(f"add-time-attributes: each item needs an attribute and intervals from {', '.join(TIME_INTERVALS)}"
                 + (f" (unknown: {bad})" if bad else ""))
+        it["names"] = {str(k).lower(): str(v) for k, v in (it.get("names") or {}).items()}
+        stray = sorted(set(it["names"]) - {str(x).lower() for x in it["intervals"]})
+        if stray:
+            die(f"add-time-attributes: '{it['attribute']}': names given for intervals not added: {stray}")
     return items
 
 
@@ -7181,9 +7211,15 @@ def _smart_type(entry: dict) -> str:
     return str(entry.get("smartAttributeType") or (entry.get("definition") or {}).get("smartAttributeType") or "")
 
 
-def time_attribute_body(attr: dict, intervals: list[str]) -> tuple[dict | None, list[str], list[str]]:
+def time_attribute_body(attr: dict, intervals: list[str], names: dict | None = None,
+                        taken: set | None = None) -> tuple[dict | None, list[str], list[str]]:
     """-> (PUT body or None when nothing to add, added types, problems). The PUT replaces the whole set, so the
-    existing smart attributes go in again with their objectId."""
+    existing smart attributes go in again with their objectId. `names` ({interval: name}) names the new ones;
+    without it they are named as Studio names them, '<attribute> (<Interval>)'. A name in `taken` (every
+    attribute and time attribute of the model, casefolded) is a problem; new names are added to it. An existing
+    time attribute keeps its name: renaming one changes every connector column of its forms."""
+    names = {str(k).lower(): v for k, v in (names or {}).items()}
+    taken = taken if taken is not None else set()
     name = (attr.get("information") or {}).get("name") or "?"
     key_id = (attr.get("keyForm") or {}).get("id")
     key = next((f for f in attr.get("forms") or [] if f.get("id") == key_id), (attr.get("forms") or [{}])[0])
@@ -7195,12 +7231,27 @@ def time_attribute_body(attr: dict, intervals: list[str]) -> tuple[dict | None, 
     have = {_smart_type(e) for e in existing}
     wanted = [f"{str(x).lower()}_interval" for x in intervals]
     added = [w for w in wanted if w not in have]
+    kept = [w.replace("_interval", "") for w in wanted if w in have and w.replace("_interval", "") in names]
+    if kept:
+        return None, [], [f"'{name}' already has {', '.join(kept)}: an existing time attribute isn't renamed here "
+                          f"(it changes every connector column of its forms); drop its name"]
     if not added:
         return None, [], []
+    problems = []
+    new_names = {}
+    for t in added:
+        short = t.replace("_interval", "")
+        label = names.get(short) or f"{name} ({short.capitalize()})"   # Studio names them '<attribute> (Year)'
+        if label.casefold() in taken:
+            problems.append(f"'{label}' (the {short} time attribute of '{name}') is already the name of an attribute "
+                            f"or time attribute: rename that one first, or pick another name")
+        taken.add(label.casefold())
+        new_names[t] = label
+    if problems:
+        return None, [], problems
     def entry(t, e=None):
-        label = t.replace("_interval", "").capitalize()             # Studio names them '<attribute> (Year)'
         out = {"subType": "attribute_smart",
-               "name": (e or {}).get("name") or ((e or {}).get("information") or {}).get("name") or f"{name} ({label})",
+               "name": (e or {}).get("name") or ((e or {}).get("information") or {}).get("name") or new_names[t],
                "definition": {"smartAttributeType": t, "parameters": [], "ascending": (e or {}).get("ascending", True)}}
         if e and ((e.get("information") or {}).get("objectId") or e.get("objectId")):
             out["objectId"] = (e.get("information") or {}).get("objectId") or e.get("objectId")
@@ -7218,15 +7269,20 @@ def cmd_add_time_attributes(m: MSTR, args):
         die(f"export model: {format_mstr_error(r)}")
     model = (r.json().get("model") or [{}])[0]
     by_name = {}
+    taken: set = set()   # every attribute and time attribute name: a new time attribute can't reuse one
     for a in model.get("attributes") or []:
         by_name[(a.get("information") or {}).get("name", "").casefold()] = a
+        taken.add((a.get("information") or {}).get("name", "").casefold())
+        for e in a.get("smartAttributes") or []:
+            taken.add(str(e.get("name") or (e.get("information") or {}).get("name") or "").casefold())
+    taken.discard("")
     writes, notes, problems = [], [], []
     for it in items:
         a = next((by_name[c] for c in attribute_name_candidates(it["attribute"]) if c in by_name), None)
         if a is None:
             problems.append(f"attribute '{it['attribute']}' not found")
             continue
-        body, added, probs = time_attribute_body(a, it["intervals"])
+        body, added, probs = time_attribute_body(a, it["intervals"], it.get("names"), taken)
         problems += probs
         aname, aid = a["information"]["name"], a["information"]["objectId"]
         if body is None and not probs:
@@ -8320,9 +8376,10 @@ def build_parser():
     what.add_argument("--count-attribute",
                       help="attribute whose distinct elements to count (customers, patients, accounts...): "
                            "name or objectId")
-    sp.add_argument("--attribute", required=True,
-                    help="attribute to filter on: name (case-insensitive) or objectId")
-    sp.add_argument("--elements", required=True, nargs="+",
+    sp.add_argument("--attribute",
+                    help="attribute to filter on: name (case-insensitive) or objectId. Leave out with --elements for "
+                         "a metric with no filter (a plain distinct count with --count-attribute)")
+    sp.add_argument("--elements", nargs="+",
                     help="attribute ID-form values to keep (IN list); quote values that contain spaces")
     sp.add_argument("--and", dest="and_conditions", action="append", nargs="+", metavar="ATTR_OR_VALUE",
                     help="another condition, ANDed: the attribute (name or objectId) then its ID-form values. "
@@ -8405,7 +8462,11 @@ def build_parser():
     sp.add_argument("--model-id", required=True)
     sp.add_argument("--attribute", help="date attribute (name as the connector shows it, or the model's)")
     sp.add_argument("--intervals", default="year,quarter,month", help="comma-separated: " + ", ".join(TIME_INTERVALS))
-    sp.add_argument("--spec", help="JSON {items: [{attribute, intervals: [...]}]} instead of --attribute")
+    sp.add_argument("--name", dest="names", action="append", metavar="INTERVAL=NAME",
+                    help="name a new time attribute (e.g. year=Year; default '<attribute> (Year)'). Repeatable. "
+                         "It must not be the name of another attribute or time attribute")
+    sp.add_argument("--spec", help="JSON {items: [{attribute, intervals: [...], names: {interval: name}}]} instead "
+                                   "of --attribute")
     sp.add_argument("--dry-run", action="store_true", help="print the request bodies; open no changeset")
 
     sp = sub.add_parser("remove-relationships",

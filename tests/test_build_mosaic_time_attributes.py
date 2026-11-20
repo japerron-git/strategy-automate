@@ -55,3 +55,37 @@ class TimeAttributeBodyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TimeAttributeNameTests(unittest.TestCase):
+    def test_a_new_interval_takes_the_given_name(self):
+        body, added, problems = bm.time_attribute_body(_attr("Start Date", "date", ["month"]), ["year", "month"],
+                                                       {"year": "Year"}, {"start date", "start date (month)"})
+        self.assertEqual((added, problems), (["year_interval"], []))
+        self.assertEqual([e["name"] for e in body["smartAttributes"]], ["Start Date (Month)", "Year"])
+
+    def test_a_name_another_attribute_holds_is_refused(self):
+        taken = {"year", "start date"}
+        body, _, problems = bm.time_attribute_body(_attr("Start Date", "date"), ["year"], {"year": "Year"}, taken)
+        self.assertIsNone(body)
+        self.assertIn("'Year' (the year time attribute of 'Start Date') is already the name", problems[0])
+
+    def test_two_new_names_in_one_run_collide(self):
+        taken = set()
+        self.assertIsNotNone(bm.time_attribute_body(_attr("A", "date"), ["year"], {"year": "Year"}, taken)[0])
+        self.assertIsNone(bm.time_attribute_body(_attr("B", "date"), ["year"], {"year": "Year"}, taken)[0])
+
+    def test_an_existing_time_attribute_is_not_renamed(self):
+        body, _, problems = bm.time_attribute_body(_attr("D", "date", ["year"]), ["year"], {"year": "Year"})
+        self.assertIsNone(body)
+        self.assertIn("isn't renamed here", problems[0])
+
+    def test_name_option(self):
+        class A:
+            spec, attribute, intervals, names = None, "Start Date", "year,month", ["year=Year", "month = Month"]
+        self.assertEqual(bm.time_attribute_items(A())[0]["names"], {"year": "Year", "month": "Month"})
+        for bad in (["year"], ["week=Week"]):
+            class B:
+                spec, attribute, intervals, names = None, "Start Date", "year", bad
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                bm.time_attribute_items(B())

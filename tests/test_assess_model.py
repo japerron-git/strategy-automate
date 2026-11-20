@@ -1587,9 +1587,11 @@ class SourceChangeAndLookupStepTests(unittest.TestCase):
         self.assertEqual([st["kind"] for st in steps], ["change_column_type", "add_lookup_table", "change_column_type"])
         merged = steps[1]
         self.assertEqual((merged["finding"], merged["title"]), ("F2, F3", "Add 3 lookup tables"))
-        self.assertIn("(1) ignore/apply/model/lookups/status_lookup.csv -> key 'status'; attributes: status group; forms: status description.",
+        self.assertIn("(1) ignore/apply/model/lookups/status_lookup.csv: map key column 'status' to the existing attribute 'status'; "
+                      "attributes: status group; forms: status description.",
                       merged["manual"])
-        self.assertIn("(2) ignore/apply/model/lookups/region_lookup.csv -> key 'region'; forms: region name; key column typed like 'region'.",
+        self.assertIn("(2) ignore/apply/model/lookups/region_lookup.csv: map key column 'region' to the existing attribute 'region'; "
+                      "forms: region name; key column typed like 'region'.",
                       merged["manual"])
         self.assertIn("set by the commands right after this step", merged["manual"])
         self.assertEqual(merged["risks"], ["map to the existing attribute"])

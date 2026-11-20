@@ -247,3 +247,72 @@ class SummedRateWordTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── plan: Studio publish after lookups, unfiltered counts, names through the phases ───────────────────────
+
+def _f(fid, category, actions, **kw):
+    return {"id": fid, "title": f"title {fid}", "category": category, "impact": "high", "effort": "small",
+            "status": "approved", "tests": [], "actions": actions, **kw}
+
+
+class PlanNameTests(unittest.TestCase):
+    def test_a_phase_that_adds_lookup_tables_asks_for_a_studio_publish(self):
+        lk = {"kind": "add_lookup_table", "args": {"csv": "lookups/region.csv", "key_attribute": "region",
+                                                   "new_attributes": ["region group"]}}
+        plan = am.build_plan({"findings": [_f("F1", "lookup", [lk])]}, model_id="MID")
+        after = [a["what"] for a in plan["phases"][0]["after"]]
+        self.assertTrue(any("Publish the model from Studio" in w for w in after))
+
+    def test_an_unfiltered_distinct_count_is_planned(self):
+        cm = {"kind": "create_conditional_metric", "args": {"name": "customer count", "count_attribute": "customer"}}
+        plan = am.build_plan({"findings": [_f("F1", "missing_metric", [cm])]}, model_id="MID")
+        self.assertEqual(plan["problems"], [])
+        argv = plan["phases"][0]["steps"][0]["apply"]["argv"]
+        self.assertIn("--count-attribute", argv)
+        self.assertNotIn("--attribute", argv)
+        cm["args"]["level_rule"] = "last"
+        self.assertTrue(any("need a filter" in p for p in
+                            am.build_plan({"findings": [_f("F1", "missing_metric", [cm])]}, model_id="MID")["problems"]))
+        cm["args"].pop("level_rule")
+        cm["args"]["attribute"] = "region"
+        self.assertTrue(any("go together" in p for p in
+                            am.build_plan({"findings": [_f("F1", "missing_metric", [cm])]}, model_id="MID")["problems"]))
+
+    def test_a_rename_that_frees_a_name_runs_before_the_phase_that_needs_it(self):
+        ta = {"kind": "add_time_attributes", "args": {"attribute": "start date", "intervals": ["year", "month"],
+                                                      "names": {"year": "Year"}}}
+        rn = {"kind": "rename_describe", "args": {"items": [
+            {"object_type": "attribute", "current_name": "year", "new_name": "Legacy Year"},
+            {"object_type": "attribute", "current_name": "region", "description": "Sales region."}]}}
+        plan = am.build_plan({"findings": [_f("F1", "attribute", [ta]), _f("F2", "description", [rn])]},
+                             model_id="MID", bundle_dir="b")
+        self.assertEqual(plan["problems"], [])
+        by_phase = {ph["phase"]: ph["steps"] for ph in plan["phases"]}
+        first = by_phase[3][0]
+        self.assertEqual((first["kind"], first["finding"]), ("rename_describe", "F2"))
+        self.assertIn("frees 'year' for the year time attribute of 'start date' (F1)", first["risks"][0])
+        self.assertEqual(by_phase[3][1]["kind"], "add_time_attributes")
+        files = plan["files"]
+        self.assertEqual(files["b/specs/rename_free_names_phase_3.json"]["items"],
+                         [{"object_type": "attribute", "current_name": "year", "new_name": "Legacy Year"}])
+        self.assertEqual(files["b/specs/rename_describe.json"]["items"],
+                         [{"object_type": "attribute", "current_name": "region", "description": "Sales region."}])
+        self.assertEqual(files["b/specs/time_attributes.json"]["items"][0]["names"], {"year": "Year"})
+
+    def test_a_rename_onto_a_created_name_and_a_name_created_twice_are_problems(self):
+        ta = {"kind": "add_time_attributes", "args": {"attribute": "start date", "intervals": ["year"],
+                                                      "names": {"year": "Year"}}}
+        rn = {"kind": "rename_describe", "args": {"items": [
+            {"object_type": "attribute", "current_name": "fiscal year", "new_name": "year"}]}}
+        cm = {"kind": "create_compound_metric", "args": {"name": "Year", "formula": "[a] / [b]"}}
+        plan = am.build_plan({"findings": [_f("F1", "attribute", [ta]), _f("F2", "description", [rn]),
+                                           _f("F3", "missing_metric", [cm])]}, model_id="MID")
+        self.assertTrue(any("'Year' is created twice" in p for p in plan["problems"]))
+        self.assertTrue(any("renames 'fiscal year' to 'year'" in p for p in plan["problems"]))
+
+    def test_time_attribute_names_must_match_intervals(self):
+        ta = {"kind": "add_time_attributes", "args": {"attribute": "d", "intervals": ["year"],
+                                                      "names": {"month": "Month"}}}
+        plan = am.build_plan({"findings": [_f("F1", "attribute", [ta])]}, model_id="MID")
+        self.assertTrue(any("intervals not in args.intervals" in p for p in plan["problems"]))

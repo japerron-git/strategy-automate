@@ -108,6 +108,11 @@ MERGED_NOTES = {"source_change": "Source change done in the phase {phase} rebuil
                                           "derived metrics built on it"}
 TIME_ATTRIBUTES_SPEC = "specs/time_attributes.json"     # under the plan's bundle dir (see bundle_path)
 RENAME_DESCRIBE_SPEC = "specs/rename_describe.json"
+FREE_NAMES_SPEC = "specs/rename_free_names_phase_{phase}.json"   # renames moved ahead of a step that needs the name
+# kinds that create an object named args.name (the attributes and metrics a plan adds)
+NAMED_CREATE_KINDS = ("create_conditional_metric", "create_compound_metric", "create_level_metric",
+                      "create_weighted_average", "create_formula_attribute", "add_column_attribute",
+                      "create_time_shift_metric", "add_column_fact_metric")
 # A republish of a large model runs well past publish's 180 s default; the wait ends as soon as every table is done.
 PUBLISH_WAIT = ["--poll-seconds", "1800"]
 DESCRIPTION_LIMIT = 250
@@ -3698,7 +3703,8 @@ def lookups_checklist(items: list[tuple[dict, bool]]) -> str:
     lines = []
     for i, (a, retyped) in enumerate(items, 1):
         key = a.get("key_attribute") or "<key attribute>"
-        bits = [f"{a.get('csv') or '<csv file>'} -> key '{key}'"
+        col = a.get("key_column") or key
+        bits = [f"{a.get('csv') or '<csv file>'}: map key column '{col}' to the existing attribute '{key}'"
                 + (f" (REPLACES the data of existing table '{a['extends_table']}', keeping "
                    f"{', '.join(a.get('keep_columns') or [])})" if a.get("extends_table") else "")]
         if a.get("new_attributes"):
@@ -3713,8 +3719,9 @@ def lookups_checklist(items: list[tuple[dict, bool]]) -> str:
             bits.append(f"load with {_format_text(a['load_format'])}")
         lines.append(f"({i}) " + "; ".join(bits) + ".")
     head = (f"{'Add these ' + str(len(items)) + ' lookup tables, each the same way' if len(items) > 1 else 'Add this lookup table'}"
-            f": add the CSV as a new table; map its key column to the EXISTING attribute named (keep it: "
-            f"deleting or replacing it deletes the derived metrics that filter on it); create the listed attributes "
+            f": add the CSV as a new table; map its key column to the EXISTING attribute given for it below (keep "
+            f"that attribute: deleting or replacing it deletes the derived metrics that filter on it); create the "
+            f"listed attributes "
             f"as attributes of their own, related to the key, since metrics filter on them; add the listed forms as "
             f"forms of the key (display only); check the key attribute uses the new table as its lookup "
             f"(auto-detection may keep the fact table); load each file with its table's import settings (shown per "
@@ -4674,13 +4681,20 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
                             f"step would run as a plain create; drop it, or delete the object first")
 
     if kind == "create_conditional_metric":
-        need("name", "attribute", "elements")
+        need("name")
         if bool(a.get("source_metric")) == bool(a.get("count_attribute")):
             problems.append(f"{kind}: give exactly one of args.source_metric or args.count_attribute")
+        if bool(a.get("attribute")) != bool(a.get("elements")):
+            problems.append(f"{kind}: args.attribute and args.elements go together (both for a filter, neither "
+                            f"for a plain count or total)")
+        elif not a.get("attribute") and (a.get("and") or a.get("level_rule")):
+            problems.append(f"{kind}: args.and and args.level_rule need a filter (args.attribute and args.elements); "
+                            f"without one, give neither")
         argv = base + ["create-conditional-metric", "--model-id", model_id, "--name", str(a.get("name", ""))]
         opt(argv, "--source-metric", "source_metric")
         opt(argv, "--count-attribute", "count_attribute")
-        argv += ["--attribute", str(a.get("attribute", "")), "--elements"] + _arg_list(a.get("elements"))
+        if a.get("attribute") or a.get("elements"):
+            argv += ["--attribute", str(a.get("attribute", "")), "--elements"] + _arg_list(a.get("elements"))
         for cond in a.get("and") or []:
             if not isinstance(cond, list) or len(cond) < 2:
                 problems.append(f"{kind}: each args.and entry is [attribute, value, ...]")
@@ -4779,6 +4793,13 @@ def action_commands(action: dict, model_id: str, python: str = "python3") -> dic
         if not a.get("attribute") or not a.get("intervals") or bad:
             problems.append(f"{kind}: args need attribute and intervals from {', '.join(TIME_INTERVALS)}"
                             + (f" (unknown: {bad})" if bad else ""))
+        names = a.get("names")
+        if names is not None and not isinstance(names, dict):
+            problems.append(f"{kind}: args.names is {{interval: name}}, e.g. {{\"year\": \"Year\"}}")
+        elif names:
+            stray = sorted(set(str(k).lower() for k in names) - {str(x).lower() for x in a.get("intervals") or []})
+            if stray:
+                problems.append(f"{kind}: args.names names intervals not in args.intervals: {stray}")
         return {"dry_run": [], "apply": [], "manual": None, "problems": problems}
     if kind == "rename_describe":
         items = a.get("items")
@@ -4947,10 +4968,54 @@ def form_base_name(name: str) -> str:
 
 # step kinds whose result reached the connector only after a publish from Studio (see build_plan)
 STUDIO_PUBLISH_KINDS = ("wire_relationships", "remove_relationships", "add_time_attributes", "add_column_attribute",
-                        "create_formula_attribute")   # not add_column_fact_metric: its data showed after the REST publish
+                        "create_formula_attribute",   # not add_column_fact_metric: its data showed after the REST publish
+                        "add_lookup_table")   # maps a key onto an attribute and adds forms or attributes: a change of
+#                                               attributes, like add_column_attribute (assumed; not seen otherwise)
 # patch_model_object targets that are model structure, like the kinds above (an attribute's outer-join setting, a
 # table). Derived and fact metrics are left out: their changes have reached the connector after the REST publish.
 STUDIO_PUBLISH_OBJECT_KINDS = ("attribute", "table")
+
+
+def free_names_ahead(ordered: list[dict], merged: dict[str, list[dict]], problems: list[str]) -> dict[int, list[dict]]:
+    """Names through the phases. A step that creates an object under a name another object holds needs that
+    object renamed first; renames run in phase 6, after the phases that create. Each rename that frees a name an
+    earlier phase creates is moved out of merged['rename_describe'] into {phase: [items]}, to run at the start of
+    that phase. A name created twice, or taken by a rename's new name, is a problem. Names the model holds that no
+    rename frees are left to each command's dry run, which checks the model."""
+    created: dict[str, tuple[int, str]] = {}   # casefolded name -> (phase, what creates it)
+    for f in ordered:
+        for a in f.get("actions") or []:
+            kind, args, phase = a.get("kind"), a.get("args") or {}, action_phase(f, a)
+            names = []
+            if kind in NAMED_CREATE_KINDS and args.get("name"):
+                names.append((str(args["name"]), f"{kind} '{args['name']}' ({f['id']})"))
+            if kind == "add_time_attributes" and isinstance(args.get("names"), dict):
+                names += [(str(v), f"the {k} time attribute of '{args.get('attribute')}' ({f['id']})")
+                          for k, v in args["names"].items() if v]
+            for n, what in names:
+                if n.casefold() in created and created[n.casefold()][1] != what:
+                    problems.append(f"'{n}' is created twice: by {created[n.casefold()][1]} and by {what}")
+                created.setdefault(n.casefold(), (phase or 0, what))
+    rename_phase = MERGED_KINDS["rename_describe"]
+    early: dict[int, list[dict]] = {}
+    for c in merged.get("rename_describe") or []:
+        keep = []
+        for it in c.get("items") or []:
+            if not isinstance(it, dict):
+                keep.append(it)
+                continue
+            cur, new = str(it.get("current_name") or ""), str(it.get("new_name") or "")
+            if new and new.casefold() in created and new.casefold() != cur.casefold():
+                problems.append(f"{c['finding']}: rename_describe renames '{cur}' to '{new}', the name "
+                                f"{created[new.casefold()][1]} creates; pick another name")
+            hit = created.get(cur.casefold()) if new and new.casefold() != cur.casefold() else None
+            if hit and hit[0] < rename_phase:
+                early.setdefault(hit[0], []).append(dict(it, finding=c["finding"], needed_by=hit[1]))
+            else:
+                keep.append(it)
+        c["items"] = keep
+    merged["rename_describe"] = [c for c in merged.get("rename_describe") or [] if c.get("items")]
+    return early
 
 
 def needs_studio_publish(step: dict) -> bool:
@@ -5085,6 +5150,20 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
              "title": "Declare attribute relationships", "kind": "wire_relationships",
              "dry_run": cmd(argv + ["--dry-run"]), "apply": cmd(argv), "manual": None,
              "risks": ["The dry run lists any relationship it cannot wire (unknown attribute or table) and why."]})
+    early_renames = free_names_ahead(ordered, merged, problems)
+    for phase, moved in sorted(early_renames.items()):
+        spec = FREE_NAMES_SPEC.format(phase=phase)
+        files[bundle_path(bundle, spec)] = {"items": [{k: v for k, v in it.items() if k not in ("finding", "needed_by")}
+                                                      for it in moved]}
+        argv = [python, BUILD_SCRIPT, "rename-describe", "--model-id", mid, "--spec", bundle_path(bundle, spec)]
+        merged_steps.setdefault(phase, []).insert(0, {
+            "finding": ", ".join(dict.fromkeys(it["finding"] for it in moved)),
+            "title": "Rename first, to free names this phase uses", "kind": "rename_describe",
+            "dry_run": cmd(argv + ["--dry-run"]), "apply": cmd(argv), "manual": None,
+            "risks": [f"Moved ahead from phase {MERGED_KINDS['rename_describe']}: "
+                      + "; ".join(f"'{it['current_name']}' -> '{it['new_name']}' frees '{it['current_name']}' for "
+                                  f"{it['needed_by']}" for it in moved)
+                      + ". Takes effect at once (no republish); derived metrics refer to objects by id."]})
     if merged["rename_describe"]:
         items = [dict(it, finding=c["finding"]) for c in merged["rename_describe"] for it in c.get("items") or []
                  if isinstance(it, dict)]
@@ -5126,8 +5205,9 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                        "they refer to objects by id."]})
     if merged["add_time_attributes"]:
         tas = merged["add_time_attributes"]
-        files[bundle_path(bundle, TIME_ATTRIBUTES_SPEC)] = {"items": [{"attribute": c.get("attribute"), "intervals": c.get("intervals")}
-                                                 for c in tas]}
+        files[bundle_path(bundle, TIME_ATTRIBUTES_SPEC)] = {"items": [
+            {"attribute": c.get("attribute"), "intervals": c.get("intervals"),
+             **({"names": c["names"]} if c.get("names") else {})} for c in tas]}
         argv = [python, BUILD_SCRIPT, "add-time-attributes", "--model-id", mid, "--spec",
                 bundle_path(bundle, TIME_ATTRIBUTES_SPEC)]
         merged_steps.setdefault(MERGED_KINDS["add_time_attributes"], []).append(

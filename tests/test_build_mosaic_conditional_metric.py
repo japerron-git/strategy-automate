@@ -323,3 +323,44 @@ class ExistingNameTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnfilteredCountTests(unittest.TestCase):
+    """A plain distinct count (no filter): the create alone, step (a) of the filtered path, in one changeset."""
+
+    def _count(self, **kw):
+        return _args(source_metric=None, count_attribute="Region", attribute=None, elements=None, function=None,
+                     name="Region Count", **kw)
+
+    def test_create_and_commit_only(self):
+        fake = _FakeMSTR(_routes())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            bm.cmd_create_conditional_metric(fake, self._count())
+        self.assertEqual(_writes(fake), [("POST", "/api/model/changesets"), ("POST", f"{MP}/metrics"),
+                                         ("POST", "/api/model/changesets/CS1/commit")])
+        body = next(kw for method, path, kw, _ in fake.calls if method == "POST" and path == f"{MP}/metrics")["json"]
+        self.assertNotIn("conditionality", body)
+        values = [t["value"] for t in body["expression"]["tokens"]]
+        self.assertEqual(values[:9], ["Count", "<", "Distinct", "=", "True", ",", "UseLookupForAttributes", "=", "False"])
+        self.assertEqual(json.loads(out.getvalue()), {"ok": True, "metric_id": METRIC_ID, "embedded_filter_id": None,
+                                                      "filter": None})
+
+    def test_dry_run_lists_the_create_alone(self):
+        fake = _FakeMSTR(_routes())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            bm.cmd_create_conditional_metric(fake, self._count(dry_run=True))
+        self.assertEqual([p["step"] for p in json.loads(out.getvalue())["plan"]], ["create"])
+        self.assertEqual(_writes(fake), [])
+
+    def test_half_a_filter_or_a_rule_without_one_is_refused(self):
+        for kw in ({"attribute": "Region"}, {"elements": ["East"]}, {"level_rule": "last", "level_attribute": "Region"},
+                   {"and_conditions": [["Region", "East"]]}, {"replace": True}):
+            fake = _FakeMSTR(_routes())
+            args = self._count()
+            for k, v in kw.items():
+                setattr(args, k, v)
+            with self.subTest(kw=kw), self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                bm.cmd_create_conditional_metric(fake, args)
+            self.assertEqual(_writes(fake), [])
