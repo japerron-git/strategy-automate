@@ -298,7 +298,10 @@ Resolved:
   NULL` too, and `HAVING` alike; `> x` drops them. The filter is pushed down and evaluated with a blank read as
   0. Right: CASE buckets in the SELECT, or `ORDER BY ... LIMIT n` in the subquery (it stops the push-down; then
   `<` and `>` both read right). A conditional metric filtered the same way was right. `check --bank` warns
-  (`compound_filter_lint`, compound metrics from scope.json formulas).
+  (`compound_filter_lint`, compound metrics from scope.json formulas). Also seen (2026-11-20, not reproduced
+  here): the same filter on a ratio of two conditional metrics failed with MOSAIC_INTERNAL "Binder Error:
+  Referenced column ... not found in FROM clause" (the pushed SQL held `TRY_CAST(SUM(..)) / TRY_CAST(SUM(..))`);
+  the CASE-bucket shape avoids it too.
 - *The connector lags a publish* (seen 2026-11-20): right after a publish or certify, a column get_semantics
   lists (new time attributes' `<date> (month)__id`, then `month__id`) failed with MOSAIC_SQL_COLUMN_NOT_FOUND
   for about a minute, then worked as a bare column, in WHERE and in GROUP BY. Re-ask such a query once after a
