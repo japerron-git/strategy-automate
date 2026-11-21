@@ -1274,10 +1274,54 @@ def blank_zero_changes(groups: dict[str, list], previous: dict[str, list]) -> di
     return out
 
 
+def _probe_cross_check(ask, rows_of, M: str, N: str, A: str, base: str, fcond: str, partner: str, n: str,
+                       filt: str, item: dict, listed: float | None, with_rows: float | None) -> dict[str, Any]:
+    """item 32's check: the same attribute asked the old way (full value lists, summed here) next to the one-row
+    checks, so a full assessment shows whether they agree on its model. Only with probe --cross-check."""
+    def total(sql: str) -> float | None:
+        r = rows_of(ask(sql))
+        return None if r is None else sum(_num(x.get("n")) or 0 for x in r)
+    v = f"CAST({N} AS VARCHAR) AS v"
+    listing = rows_of(ask(f"SELECT {v} FROM {M}{base} GROUP BY 1"))  # nosec B608  # identifiers are quoted
+    alone = rows_of(ask(f"SELECT {v}, CAST(COUNT({A}) AS VARCHAR) AS n FROM {M}{base} GROUP BY 1"))  # nosec B608
+    lists: dict[str, Any] = {"listed": None, "with_rows": None, "kept": {}, "lost_rows": False, "lookup_only": []}
+    if listing is not None and alone is not None:
+        with_data = {str(r.get("v")) for r in alone if (_num(r.get("n")) or 0) > 0 and not _blank(r.get("v"))}
+        names = {str(r.get("v")) for r in listing if not _blank(r.get("v"))}
+        lists.update(listed=float(len(names)), with_rows=float(len(with_data)),
+                     lookup_only=sorted(names - with_data))
+        lists["kept"]["alone"] = sum(_num(r.get("n")) or 0 for r in alone)
+    if fcond and n != filt:
+        lists["kept"]["filtered"] = total(f"SELECT {v}, CAST(COUNT({A}) AS VARCHAR) AS n FROM {M}{fcond} GROUP BY 1")  # nosec B608
+    if partner and n != partner:
+        P = quote_ident(partner)
+        lists["kept"]["partner"] = total(f"SELECT CAST({P} AS VARCHAR) AS p, {v}, CAST(COUNT({A}) AS VARCHAR) AS n "  # nosec B608
+                                         f"FROM {M}{base} GROUP BY 1, 2")
+    one_row = {"listed": listed, "with_rows": with_rows,
+               "kept": {k: (item["shapes"].get(label) or {}).get("rows") for k, label in
+                        (("alone", "alone"), ("filtered", next((x for x in item["shapes"] if x.startswith("filtered")), "")),
+                         ("partner", next((x for x in item["shapes"] if x.startswith("grouped with")), "")))
+                        if k in lists["kept"]}}
+    shapes = {k: (item["shapes"].get(lbl) or {}).get("expected") for k, lbl in
+              (("alone", "alone"), ("filtered", next((x for x in item["shapes"] if x.startswith("filtered")), "")),
+               ("partner", next((x for x in item["shapes"] if x.startswith("grouped with")), "")))}
+    lists["lost_rows"] = any(kv is not None and shapes.get(k) is not None and kv < shapes[k] - 0.5
+                             for k, kv in lists["kept"].items())
+    diffs = [f"{k}: one-row {one_row[k]} vs lists {lists[k]}" for k in ("listed", "with_rows")
+             if one_row[k] is not None and lists[k] is not None and abs(one_row[k] - lists[k]) > 0.5]
+    diffs += [f"rows kept {k}: one-row {one_row['kept'].get(k)} vs lists {lists['kept'][k]}"
+              for k in lists["kept"] if one_row["kept"].get(k) is None or lists["kept"][k] is None
+              or abs(one_row["kept"][k] - lists["kept"][k]) > 0.5]
+    if sorted(item.get("lookup_only_values") or []) != lists["lookup_only"] and not any(
+            str(x).startswith("(") for x in item.get("lookup_only_values") or []):
+        diffs.append(f"lookup-only values: one-row {item.get('lookup_only_values')} vs lists {lists['lookup_only']}")
+    return {"agree": not diffs, "differences": diffs, "one_row": one_row, "lists": lists}
+
+
 def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list[str] | None = None,
                   metrics: list[str] | None = None, period: str = "", split: str = "", filter_spec: str = "",
                   where: str = "", max_values: int = PROBE_MAX_VALUES, batch: int = 6,
-                  previous: dict | None = None,
+                  previous: dict | None = None, cross_check: bool = False,
                   log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
     model = scope["model"]
     anchor = (scope.get("anchor") or {}).get("metric")
@@ -1430,6 +1474,12 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
                 shown = ", ".join(only_lookup[:12]) + (f" and {len(only_lookup) - 12} more" if len(only_lookup) > 12 else "")
                 count = len(only_lookup) if listed_r and not only_lookup[0].startswith("(") else listed - with_rows
                 item["issues"].append(f"{count:,.0f} value(s) only in its lookup (listed, but no fact rows): {shown}")
+        if cross_check:
+            item["cross_check"] = _probe_cross_check(ask, rows_of, M, N, A, base, fcond, partner, n, filt, item,
+                                                     listed, with_rows)
+            if not item["cross_check"]["agree"]:
+                warnings.append(f"attribute '{n}': cross-check: the one-row checks and the full lists disagree "
+                                f"({'; '.join(item['cross_check']['differences'])}): send probes.json to the dev chat")
         if (a.get("type") or "").lower() in _NUMERIC and not _CODE_LIKE.search(_words(n)) \
                 and not looks_like_integer_date(a) and total:
             cr = rows_of(ask(f"SELECT CAST(COUNT({N}) AS VARCHAR) AS n FROM {M}{base}"))  # nosec B608
@@ -1609,7 +1659,13 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             it["issues"].append(f"blank and 0 changed places since the previous probe ({text}): a rewritten formula "
                                 f"changed how groups with no data read")
             warnings.append(f"metric '{n}': {it['issues'][-1]}")
+    if cross_check:
+        checked = [a for a in attr_out if "cross_check" in a]
+        cc_summary = {"attributes": len(checked), "agree": sum(1 for a in checked if a["cross_check"]["agree"]),
+                      "with_lost_rows": sum(1 for a in checked if a["cross_check"]["lists"]["lost_rows"]),
+                      "with_lookup_only_values": sum(1 for a in checked if a["cross_check"]["lists"]["lookup_only"])}
     return {"version": 4, "model": model, "generated": time.strftime("%Y-%m-%d"), "anchor": anchor,
+            **({"cross_check": cc_summary} if cross_check else {}),
             "total_rows": total, "entities": ent_total,
             "filter": {"attribute": filt or None, "value": filt_value, "rows": filt_rows, "entities": ent_filtered},
             "partner": partner or None, "gaps": gaps, "pending_queries": pending,
@@ -6108,6 +6164,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--batch", type=int, default=6)
     sp.add_argument("--previous", help="the previous round's probes.json: a metric whose groups went from blank to 0 "
                                        "(or back) is a warning (verify-changes)")
+    sp.add_argument("--cross-check", action="store_true",
+                    help="also ask each attribute's full value lists (the old way) and record under cross_check "
+                         "whether they agree with the one-row checks (item 32; a full assessment's first probe)")
 
     sp = sub.add_parser("question-sql", help="rewrite a question's governed SQL, keeping the earlier version")
     sp.add_argument("--bank", required=True)
@@ -6374,7 +6433,8 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
             attrs, not_probed = trim_probe_list(attrs, scope)
         out = probe_objects(runner(), args.project, scope, attributes=attrs, metrics=mets, period=args.period,
                             split=args.split, filter_spec=args.filter, where=args.where, max_values=args.max_values,
-                            batch=args.batch, previous=_load_json(args.previous) if args.previous else None, log=log)
+                            batch=args.batch, previous=_load_json(args.previous) if args.previous else None,
+                            cross_check=args.cross_check, log=log)
         if type_checks:
             out["type_checks"] = type_checks
         if not_probed:

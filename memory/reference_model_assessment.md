@@ -310,7 +310,9 @@ Resolved:
   lists, lookup-only ones included). `check --bank` warns (`attribute_subquery_lint`). `probe` relies on the
   barrier: each attribute check is one row (groups, values with rows, rows kept) and the values are listed only
   when the counts show listed values without fact rows (item 32; same results as the stored lists on the
-  other tenant's test model: 10 listed / 6 with rows / all rows kept, filtered and partner shapes too).
+  other tenant's test model: 10 listed / 6 with rows / all rows kept, filtered and partner shapes too). Not yet
+  seen on a model that loses rows: `probe --cross-check` also asks the full lists and records agreement under
+  `cross_check` (the plugin runs it at full depth until a run with lost rows agrees; then drop it there).
 - *The connector lags a publish* (seen 2026-11-20): right after a publish or certify, a column get_semantics
   lists (new time attributes' `<date> (month)__id`, then `month__id`) failed with MOSAIC_SQL_COLUMN_NOT_FOUND
   for about a minute, then worked as a bare column, in WHERE and in GROUP BY. Re-ask such a query once after a

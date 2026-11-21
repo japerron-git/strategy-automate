@@ -2230,6 +2230,34 @@ class ProbeTests(unittest.TestCase):
             if " FROM (SELECT " in q and "HAVING" not in q:
                 self.assertRegex(q, r"ORDER BY [\d, ]+ LIMIT \d+\) t$")
 
+    def test_cross_check_agrees_and_counts_lost_rows(self):
+        out = am.probe_objects(_SqlRunner(self.answer), "retail", self.SCOPE, period="period",
+                               attributes=["exit type", "promo flag", "term months"], cross_check=True)
+        self.assertEqual(out["cross_check"], {"attributes": 3, "agree": 3, "with_lost_rows": 1,
+                                              "with_lookup_only_values": 2})
+        exit_type = next(a for a in out["attributes"] if a["name"] == "exit type")["cross_check"]
+        self.assertEqual(exit_type["lists"]["kept"]["filtered"], 250.0)
+        self.assertFalse(any("cross-check" in w for w in out["warnings"]))
+        self.assertNotIn("cross_check", am.probe_objects(_SqlRunner(self.answer), "retail", self.SCOPE,
+                                                         period="period", attributes=["term months"]))
+
+    def test_cross_check_reports_a_disagreement(self):
+        runner = _SqlRunner(self.answer)
+        plain = runner.answer
+
+        def answer(sql):   # the one-row check misses the filtered loss the lists show
+            if sql.startswith("SELECT CAST(COUNT(*) AS VARCHAR) AS groups, CAST(SUM(n)") and '"exit type"' in sql \
+                    and "\"latest flag\" = 'Y'" in sql:
+                return [["groups", "kept"], ["1", "400"]]
+            return plain(sql)
+        runner.answer = answer
+        out = am.probe_objects(runner, "retail", self.SCOPE, period="period", attributes=["exit type"],
+                               cross_check=True)
+        cc = out["attributes"][0]["cross_check"]
+        self.assertFalse(cc["agree"])
+        self.assertIn("rows kept filtered: one-row 400.0 vs lists 250.0", cc["differences"])
+        self.assertTrue(any("cross-check" in w and "dev chat" in w for w in out["warnings"]))
+
     def test_too_many_groups_is_said_not_judged(self):
         runner = _SqlRunner(self.answer)
         plain = runner.answer
