@@ -2094,11 +2094,35 @@ class AnchorTests(unittest.TestCase):
         self.assertNotIn("COUNT(*) AS rows_", var)
 
 
+_ONE_ROW = re.compile(r"^SELECT (?P<outer>.+?) FROM \((?P<inner>SELECT .+) ORDER BY [\d, ]+ LIMIT \d+\) t$", re.S)
+
+
+def _aggregating(answer):
+    """probe's one-row checks (an outer COUNT / SUM over a grouped subquery behind an ORDER BY ... LIMIT barrier),
+    answered from the inner query's rows as the test answers it: the tests keep describing the data as lists."""
+    def wrapped(sql):
+        m = _ONE_ROW.match(sql)
+        if not m:
+            return answer(sql)
+        inner = re.sub(r", COUNT\((\"[^\"]+\")\) AS n", r", CAST(COUNT(\1) AS VARCHAR) AS n", m["inner"])
+        table = answer(inner)
+        rows = [dict(zip(table[0], r)) for r in table[1:]]
+        nonblank = [r for r in rows if not am._blank(r.get("v"))]
+        if " AS listed" in m["outer"]:
+            return [["listed"], [str(len(nonblank))]]
+        n = [am._num(r.get("n")) or 0 for r in rows]
+        out = {"groups": str(len(rows)), "kept": str(sum(n)),
+               "with_rows": str(sum(1 for r in nonblank if (am._num(r.get("n")) or 0) > 0))}
+        cols = [c for c in ("groups", "with_rows", "kept") if f" AS {c}" in m["outer"]]
+        return [cols, [out[c] for c in cols]]
+    return wrapped
+
+
 class _SqlRunner:
     """Answers each query from a function of its SQL (the probe issues many shapes of query)."""
 
     def __init__(self, answer):
-        self.answer, self.calls = answer, []
+        self.answer, self.calls = _aggregating(answer), []
 
     def call(self, tool, args):
         self.calls.append((tool, args))
@@ -2191,6 +2215,34 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(attrs["promo flag"]["lookup_only_values"], ["Unknown"])
         self.assertTrue(any("read from its lookup" in x for x in attrs["months open"]["issues"]))
         self.assertEqual(attrs["term months"]["issues"], [])
+
+    def test_attribute_checks_are_one_row_replies(self):
+        """item 32: a replayed probe saves one-row replies; a value list is asked only when the counts say a listed
+        value has no fact rows (promo flag here), and every outer aggregate sits behind the barrier."""
+        runner = _SqlRunner(self.answer)
+        am.probe_objects(runner, "retail", self.SCOPE, period="period",
+                         attributes=["exit type", "promo flag", "months open", "term months"])
+        sqls = [a["query"] for _, a in runner.calls]
+        listed = {m[1] for q in sqls
+                  if (m := re.match(r'SELECT CAST\("(exit type|promo flag|months open|term months)" AS VARCHAR\) AS v', q))}
+        self.assertEqual(listed, {"exit type", "promo flag", "months open"})   # term months: every value has rows
+        for q in sqls:
+            if " FROM (SELECT " in q and "HAVING" not in q:
+                self.assertRegex(q, r"ORDER BY [\d, ]+ LIMIT \d+\) t$")
+
+    def test_too_many_groups_is_said_not_judged(self):
+        runner = _SqlRunner(self.answer)
+        plain = runner.answer
+
+        def answer(sql):
+            if sql.startswith("SELECT CAST(COUNT(*) AS VARCHAR) AS groups") and '"exit type"' in sql:
+                return [["groups", "with_rows", "kept"], [str(am.PROBE_GROUP_LIMIT), "4", "10"]]
+            return plain(sql)
+        runner.answer = answer
+        out = am.probe_objects(runner, "retail", self.SCOPE, period="period", attributes=["exit type"])
+        issues = out["attributes"][0]["issues"]
+        self.assertTrue(any("too many to check" in i for i in issues), issues)
+        self.assertFalse(any("alone: keeps" in i for i in issues), issues)
 
     def test_metric_checks(self):
         mets = {m["name"]: m for m in self._run()["metrics"]}

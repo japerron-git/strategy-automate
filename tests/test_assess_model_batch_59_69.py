@@ -162,5 +162,28 @@ class PlusMinusTests(unittest.TestCase):
                             bm.compound_constant_warnings("(ZeroToNull([b]) - [a]) / ZeroToNull([c])")))
 
 
+
+class AttributeSubqueryLintTests(unittest.TestCase):
+    """item 32's live checks: an outer aggregate over a subquery grouping attributes alone misreads."""
+    M = '"p"."m"'
+
+    def test_warned(self):
+        for sql in (f'SELECT COUNT(*) FROM (SELECT "status" FROM {self.M} GROUP BY 1) t',
+                    f'SELECT COUNT(*) AS n FROM (SELECT "region", "status" FROM {self.M} GROUP BY 1, 2) t'):
+            with self.subTest(sql=sql):
+                self.assertTrue(any("groups attributes alone" in w for w in am._sql_lint(sql)))
+
+    def test_not_warned(self):
+        for sql in (f'SELECT COUNT(*) FROM (SELECT "status" FROM {self.M} GROUP BY 1 ORDER BY 1 LIMIT 1000) t',
+                    f'SELECT COUNT(*) FROM (SELECT "customer" FROM {self.M} GROUP BY 1 HAVING COUNT("sales") > 0) t',
+                    f'SELECT COUNT(*) FROM (SELECT "customer", SUM("sales") AS s FROM {self.M} GROUP BY 1) t',
+                    f'SELECT "status", SUM("sales") FROM {self.M} WHERE "region" IN '
+                    f'(SELECT "region" FROM {self.M} GROUP BY 1) GROUP BY 1',
+                    f'SELECT v FROM (SELECT "status" AS v FROM {self.M} GROUP BY 1) t',
+                    f'SELECT COUNT(DISTINCT "status") FROM {self.M}'):
+            with self.subTest(sql=sql):
+                self.assertEqual(am.attribute_subquery_lint(sql), [])
+
+
 if __name__ == "__main__":
     unittest.main()

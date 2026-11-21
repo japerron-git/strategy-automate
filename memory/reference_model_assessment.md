@@ -302,6 +302,15 @@ Resolved:
   here): the same filter on a ratio of two conditional metrics failed with MOSAIC_INTERNAL "Binder Error:
   Referenced column ... not found in FROM clause" (the pushed SQL held `TRY_CAST(SUM(..)) / TRY_CAST(SUM(..))`);
   the CASE-bucket shape avoids it too.
+- *An outer aggregate over a subquery that groups attributes alone misreads* (verified live 2026-11-21, both
+  tenants): `SELECT COUNT(*) FROM (SELECT a FROM m GROUP BY 1) t` read 1 on one tenant and the fact's row count
+  on the other (the attribute had 10 and 5 values); `COUNT(v)` in the same query was right on one and not the
+  other. With `ORDER BY 1 LIMIT n` in the subquery both read right, as did a subquery with a metric in it
+  (`... HAVING COUNT(<anchor>) > 0`, the probe's entity count) and `COUNT(DISTINCT a)` (every value the attribute
+  lists, lookup-only ones included). `check --bank` warns (`attribute_subquery_lint`). `probe` relies on the
+  barrier: each attribute check is one row (groups, values with rows, rows kept) and the values are listed only
+  when the counts show listed values without fact rows (item 32; same results as the stored lists on the
+  other tenant's test model: 10 listed / 6 with rows / all rows kept, filtered and partner shapes too).
 - *The connector lags a publish* (seen 2026-11-20): right after a publish or certify, a column get_semantics
   lists (new time attributes' `<date> (month)__id`, then `month__id`) failed with MOSAIC_SQL_COLUMN_NOT_FOUND
   for about a minute, then worked as a bare column, in WHERE and in GROUP BY. Re-ask such a query once after a

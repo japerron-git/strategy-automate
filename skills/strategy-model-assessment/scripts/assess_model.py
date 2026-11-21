@@ -1058,6 +1058,8 @@ def review_roles(runner: Runner, project: str, scope: dict, *, entity: str = "",
 #              a value for one period only without "latest" in its name or description
 
 PROBE_MAX_VALUES = 200
+PROBE_GROUP_LIMIT = 1_000_000   # the ORDER BY ... LIMIT barrier in probe's one-row checks; reaching it = too many groups
+_NONBLANK_V = "v IS NOT NULL AND TRIM(v) <> '' AND LOWER(TRIM(v)) NOT IN ('null', 'none')"   # _blank, in SQL
 _LATEST_WORDS = re.compile(r"\b(latest|current period|as of|point in time|most recent)\b", re.I)
 
 
@@ -1374,35 +1376,60 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
         log(f"probe attribute {n}")
         a, N = attrs_by[n], quote_ident(n)
         item: dict[str, Any] = {"name": n, "issues": [], "shapes": {}}
-        listing = rows_of(ask(f"SELECT CAST({N} AS VARCHAR) AS v FROM {M}{base} GROUP BY 1"))  # nosec B608  # attribute only: the lookup
-        alone = rows_of(ask(f"SELECT CAST({N} AS VARCHAR) AS v, CAST(COUNT({A}) AS VARCHAR) AS n FROM {M}{base} GROUP BY 1"))  # nosec B608
-        shapes = [("alone", alone, total)]
+        # Each check is one row: the connector sums and counts the groups, so a replayed reply is never a long value
+        # list (item 32). The ORDER BY ... LIMIT barrier is needed: without it an outer aggregate over an
+        # attribute-only GROUP BY is pushed down and misreads (COUNT(*) read 1 on one tenant and the fact's row count
+        # on the other; verified live 2026-11-21). The values are listed only when the counts say some are missing.
+        V = "CAST({col} AS VARCHAR) AS v"
+        listed_r = rows_of(ask(f"SELECT CAST(COUNT(CASE WHEN {_NONBLANK_V} THEN 1 END) AS VARCHAR) AS listed FROM "  # nosec B608
+                               f"(SELECT {V.format(col=N)} FROM {M}{base} GROUP BY 1 ORDER BY 1 LIMIT {PROBE_GROUP_LIMIT}) t"))
+        alone_r = rows_of(ask(f"SELECT CAST(COUNT(*) AS VARCHAR) AS groups, CAST(COUNT(CASE WHEN n > 0 AND {_NONBLANK_V} "  # nosec B608
+                              f"THEN 1 END) AS VARCHAR) AS with_rows, CAST(SUM(n) AS VARCHAR) AS kept FROM (SELECT "
+                              f"{V.format(col=N)}, COUNT({A}) AS n FROM {M}{base} GROUP BY 1 ORDER BY 1 LIMIT {PROBE_GROUP_LIMIT}) t"))
+        shapes = [("alone", alone_r, total)]
         if fcond and n != filt:
-            sql = f"SELECT CAST({N} AS VARCHAR) AS v, CAST(COUNT({A}) AS VARCHAR) AS n FROM {M}{fcond} GROUP BY 1"  # nosec B608  # identifiers are quoted; the connector is read-only
+            sql = (f"SELECT CAST(COUNT(*) AS VARCHAR) AS groups, CAST(SUM(n) AS VARCHAR) AS kept FROM (SELECT "  # nosec B608
+                   f"{V.format(col=N)}, COUNT({A}) AS n FROM {M}{fcond} GROUP BY 1 ORDER BY 1 LIMIT {PROBE_GROUP_LIMIT}) t")
             shapes.append((f"filtered to {filt} = {filt_value}", rows_of(ask(sql)), filt_rows))
         if partner and n != partner:
             P = quote_ident(partner)
-            sql = f"SELECT CAST({P} AS VARCHAR) AS p, CAST({N} AS VARCHAR) AS v, CAST(COUNT({A}) AS VARCHAR) AS n FROM {M}{base} GROUP BY 1, 2"  # nosec B608  # identifiers are quoted; the connector is read-only
+            sql = (f"SELECT CAST(COUNT(*) AS VARCHAR) AS groups, CAST(SUM(n) AS VARCHAR) AS kept FROM (SELECT "  # nosec B608
+                   f"CAST({P} AS VARCHAR) AS p, {V.format(col=N)}, COUNT({A}) AS n FROM {M}{base} GROUP BY 1, 2 "
+                   f"ORDER BY 1, 2 LIMIT {PROBE_GROUP_LIMIT}) t")
             shapes.append((f"grouped with {partner}", rows_of(ask(sql)), total))
-        if alone is None and listing is None:
+        if alone_r is None and listed_r is None:
             item["pending" if pending else "error"] = True
             attr_out.append(item)
             continue
         for label, rows, expected in shapes:
-            if rows is None or expected is None:
+            if not rows or expected is None:
                 continue
-            kept = sum(_num(r.get("n")) or 0 for r in rows)
+            groups = _num(rows[0].get("groups")) or 0
+            if groups >= PROBE_GROUP_LIMIT:
+                item["issues"].append(f"{label}: {groups:,.0f} or more groups, too many to check")
+                continue
+            kept = _num(rows[0].get("kept")) or 0
             item["shapes"][label] = {"rows": kept, "expected": expected}
             if kept < expected - 0.5:
                 item["issues"].append(f"{label}: keeps {kept:,.0f} of {expected:,.0f} fact rows ({expected - kept:,.0f} "
                                       f"lost: a key its lookup lacks, often the blank one)")
-        if listing is not None and alone is not None:
-            with_data = {str(r.get("v")) for r in alone if (_num(r.get("n")) or 0) > 0 and not _blank(r.get("v"))}
-            only_lookup = sorted({str(r.get("v")) for r in listing if not _blank(r.get("v"))} - with_data)
+        listed = _num(listed_r[0].get("listed")) if listed_r else None
+        with_rows = _num(alone_r[0].get("with_rows")) if alone_r else None
+        if listed is not None and with_rows is not None:
+            only_lookup: list[str] = []
+            if listed > with_rows:   # some listed values have no fact rows: list both to name them
+                listing = rows_of(ask(f"SELECT {V.format(col=N)} FROM {M}{base} GROUP BY 1"))  # nosec B608  # attribute only: the lookup
+                alone = rows_of(ask(f"SELECT {V.format(col=N)}, CAST(COUNT({A}) AS VARCHAR) AS n FROM {M}{base} GROUP BY 1"))  # nosec B608
+                if listing is not None and alone is not None:
+                    with_data = {str(r.get("v")) for r in alone if (_num(r.get("n")) or 0) > 0 and not _blank(r.get("v"))}
+                    only_lookup = sorted({str(r.get("v")) for r in listing if not _blank(r.get("v"))} - with_data)
+                else:
+                    only_lookup = [f"({listed - with_rows:,.0f} values; listing pending)"]
             item["lookup_only_values"] = only_lookup
             if only_lookup:
                 shown = ", ".join(only_lookup[:12]) + (f" and {len(only_lookup) - 12} more" if len(only_lookup) > 12 else "")
-                item["issues"].append(f"{len(only_lookup)} value(s) only in its lookup (listed, but no fact rows): {shown}")
+                count = len(only_lookup) if listed_r and not only_lookup[0].startswith("(") else listed - with_rows
+                item["issues"].append(f"{count:,.0f} value(s) only in its lookup (listed, but no fact rows): {shown}")
         if (a.get("type") or "").lower() in _NUMERIC and not _CODE_LIKE.search(_words(n)) \
                 and not looks_like_integer_date(a) and total:
             cr = rows_of(ask(f"SELECT CAST(COUNT({N}) AS VARCHAR) AS n FROM {M}{base}"))  # nosec B608
@@ -4149,6 +4176,57 @@ def compound_filter_lint(sql: str, compounds: dict[str, str] | None) -> list[str
             f"SELECT, or put ORDER BY ... LIMIT in the subquery so the filter runs on its result"]
 
 
+_AGG_CALL = re.compile(r"\b(count|sum|avg|min|max|approx_distinct|count_if|stddev\w*|variance)\s*\(", re.I)
+
+
+def _from_subqueries(text: str) -> list[tuple[int, int]]:
+    """(start, end) of each parenthesized SELECT that follows FROM or JOIN; text has its literals blanked."""
+    out = []
+    for m in re.finditer(r"\b(from|join)\s*\(\s*select\b", text, re.I):
+        i, d = text.index("(", m.start()), 0
+        for j in range(i, len(text)):
+            d += {"(": 1, ")": -1}.get(text[j], 0)
+            if d == 0:
+                out.append((i + 1, j))
+                break
+    return out
+
+
+def _top_level(sub: str) -> str:
+    """sub with every nested parenthesized part removed (its own clauses only)."""
+    out, d = [], 0
+    for ch in sub:
+        d += ch == "("
+        if d == 0:
+            out.append(ch)
+        d -= ch == ")" and d > 0
+    return "".join(out)
+
+
+def attribute_subquery_lint(sql: str) -> list[str]:
+    """An outer aggregate over a FROM subquery that groups attributes alone (no aggregate in its SELECT) is
+    pushed down and misreads: SELECT COUNT(*) FROM (SELECT a FROM m GROUP BY 1) t read 1 on one tenant and the
+    fact's row count on the other, where the attribute has 10 and 5 values (verified live 2026-11-21). An
+    ORDER BY ... LIMIT in the subquery stops the push-down; COUNT(DISTINCT a) is the plain alternative."""
+    text = _SQL_LITERAL.sub("''", sql or "")
+    hits = []
+    for a, b in _from_subqueries(text):
+        sub = text[a:b]
+        own = _top_level(sub)
+        if not re.search(r"\bgroup\s+by\b", own, re.I) or re.search(r"\blimit\s+\d+\s*$", own.strip(), re.I):
+            continue
+        if not _AGG_CALL.search(sub):   # no aggregate anywhere in it (a metric in HAVING reads right, live)
+            outside = text[:a - 1] + text[b + 1:]
+            if _AGG_CALL.search(outside):
+                hits.append(" ".join(sub.split())[:80])
+    if not hits:
+        return []
+    return [f"it aggregates over a subquery that groups attributes alone ({'; '.join(hits)}): Mosaic pushes that "
+            f"down and miscounts (COUNT(*) read 1, or the fact's row count); COUNT(DISTINCT <attribute>) counts every "
+            f"value it lists (its lookup, values without fact rows included), or put ORDER BY ... LIMIT in the "
+            f"subquery"]
+
+
 def _mentions(text: str, name: str) -> bool:
     """The query names this column, quoted ("name") or, for a one-word name, bare."""
     low = text.lower()
@@ -4193,7 +4271,7 @@ def _sql_lint(sql: str, shifted: dict[str, dict] | None = None) -> list[str]:
            f"forms), or compute the expression in the subquery's SELECT (e.g. YEAR(MAX(<date>)) AS vintage) and "
            f"group the outer query by that column"] if bad else []
     return (out + form_group_by_lint(sql) + time_shift_sql_lint(sql, shifted) + avg_decimal_lint(sql)
-            + compound_filter_lint(sql, (shifted or {}).get(COMPOUNDS_KEY)))
+            + compound_filter_lint(sql, (shifted or {}).get(COMPOUNDS_KEY)) + attribute_subquery_lint(sql))
 
 
 def output_columns(sql: str) -> list[str | None] | None:
