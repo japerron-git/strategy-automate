@@ -5347,10 +5347,17 @@ def compound_constant_warnings(formula: str) -> list[str]:
         return []
     tree = compound_metric_tree(formula, lambda raw: {"objectId": raw, "subType": "metric", "name": raw})
     out: list[str] = []
+    divide_last: set[int] = set()   # ids of +/- nodes written to divide last (no warning)
 
     def walk(node: dict, in_divide: bool) -> None:
         kids = node.get("children") or []
         fn = node.get("function")
+        if fn == "divide" and len(kids) == 2 and kids[0].get("function") in ("plus", "minus"):
+            # (ZeroToNull([B]) - [A]) / ZeroToNull([B]): the denominator is blank wherever that operand is, so the
+            # result stays blank there (verified live 2026-11-21, scratch probe 9).
+            den = json.dumps(kids[1], sort_keys=True)
+            if any(json.dumps(k, sort_keys=True) == den for k in kids[0].get("children") or []):
+                divide_last.add(id(kids[0]))
         if fn in ("times", "divide") and len(kids) == 2:
             consts = [k for k in kids if k.get("type") == "constant"]
             others = [k for k in kids if k.get("type") != "constant"]
@@ -5364,9 +5371,11 @@ def compound_constant_warnings(formula: str) -> list[str]:
                     out.append("a constant times a blank reads 0: groups where the other side is blank (a ratio "
                                "with no data) read 0, not blank. To keep them blank and real zeros 0, divide "
                                "instead: [A] / (ZeroToNull([B]) / 100)")
-        if fn in ("plus", "minus") and len(kids) == 2 and any(k.get("type") != "constant" for k in kids):
+        if (fn in ("plus", "minus") and len(kids) == 2 and any(k.get("type") != "constant" for k in kids)
+                and id(node) not in divide_last):
             # seen live 2026-11-20: 1 - ([A] / ZeroToNull([B])) read 1 where B is 0; [A] - [C] read [A] where the
-            # conditional metric C is blank. Only a division keeps a blank.
+            # conditional metric C is blank. Only a division keeps a blank. The divide-last form was verified live
+            # 2026-11-21 (scratch probe 9): blank on all 852 groups where 1 - [A] / [B] read 1, equal elsewhere.
             out.append("+ and - read a blank operand as 0: where an operand is blank (a ratio over ZeroToNull, a "
                        "conditional metric with no rows), the result reads the other side (1 - blank = 1, "
                        "[A] - blank = [A]) instead of blank. For 1 - [A] / [B], divide last: "
@@ -5467,9 +5476,12 @@ def cmd_create_compound_metric(m: MSTR, args):
     join = getattr(args, "join", None) or ""
     body = compound_metric_body(args.name, tree, description=description, join=join, fmt_values=fmt_values)
     method, path = ("PUT", f"{mp}/metrics/{target_id}") if target_id else ("POST", f"{mp}/metrics")
+    warnings = compound_constant_warnings(args.formula)
     if getattr(args, "dry_run", False):
-        print(json.dumps({"ok": True, "dry_run": True,
-                          "plan": [{"method": method, "path": path, "params": q, "body": body}]}, indent=2))
+        out = {"ok": True, "dry_run": True, "plan": [{"method": method, "path": path, "params": q, "body": body}]}
+        if warnings:
+            out["warnings"] = warnings
+        print(json.dumps(out, indent=2))
         return
     cs = open_cs(m)
     try:
@@ -5481,8 +5493,10 @@ def cmd_create_compound_metric(m: MSTR, args):
     except BaseException:  # die() raises SystemExit; discard on every failure path
         discard_cs(m, cs)
         raise
-    print(json.dumps({"ok": True, "metric_id": metric_id,
-                      "action": "replaced" if target_id else "created"}, indent=2))
+    done = {"ok": True, "metric_id": metric_id, "action": "replaced" if target_id else "created"}
+    if warnings:
+        done["warnings"] = warnings
+    print(json.dumps(done, indent=2))
 
 
 # Aggregate-function objectIds are platform constants (same on every tenant) —

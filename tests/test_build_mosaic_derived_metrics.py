@@ -343,6 +343,8 @@ class CompoundFlowTests(unittest.TestCase):
         fake = _FakeMSTR(_metrics_routes())
         out = _run(bm.cmd_create_compound_metric, fake, _compound_args(join="outer"))
 
+        warnings = out.pop("warnings")   # a difference of two metrics: + / - read a blank operand as 0
+        self.assertTrue(any("divide last" in w for w in warnings))
         self.assertEqual(out, {"ok": True, "metric_id": NEW_ID, "action": "created"})
         self.assertEqual(_writes(fake), [("POST", "/api/model/changesets"), ("POST", f"{MP}/metrics"),
                                          ("POST", "/api/model/changesets/CS1/commit")])

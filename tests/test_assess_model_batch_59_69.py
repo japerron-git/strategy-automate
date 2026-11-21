@@ -153,6 +153,14 @@ class PlusMinusTests(unittest.TestCase):
                 self.assertTrue(any("divide last" in w for w in bm.compound_constant_warnings(f)))
         self.assertFalse(any("divide last" in w for w in bm.compound_constant_warnings("[a] / ZeroToNull([b])")))
 
+    def test_the_divide_last_form_is_not_warned(self):
+        for f in ("(ZeroToNull([b]) - [a]) / ZeroToNull([b])", "([b] + [a]) / [b]"):
+            with self.subTest(f=f):
+                self.assertFalse(any("divide last" in w for w in bm.compound_constant_warnings(f)))
+        # a different denominator still warns
+        self.assertTrue(any("divide last" in w for w in
+                            bm.compound_constant_warnings("(ZeroToNull([b]) - [a]) / ZeroToNull([c])")))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -243,9 +243,14 @@ attribute. **`Count` of a fact metric keeps it**: `Count<UseLookupForAttributes=
 
 **3b. `+` and `-` read a blank operand as 0; only a division keeps a blank** (seen live 2026-11-20):
 `1 - ([A] / ZeroToNull([B]))` read 1 where B is 0, and `[A] - [C]` read [A] where the conditional metric C
-had no rows; `[A] / [C]` stayed blank. `create-compound-metric` warns on `+` / `-` over metrics. For
-`1 - [A] / [B]`, divide last: `(ZeroToNull([B]) - [A]) / ZeroToNull([B])` (scratch probe 9). A difference of
-two metrics that can each be blank has no arithmetic fix: describe which groups read the other side.
+had no rows; `[A] / [C]` stayed blank. For `1 - [A] / [B]`, divide last:
+`(ZeroToNull([B]) - [A]) / ZeroToNull([B])` — **verified live 2026-11-21 (scratch probe 9)**: over 907 groups,
+`1 - [ratio]` read 1 on all 852 where the ratio was blank, while the divide-last form stayed blank there and
+equalled `1 - [ratio]` exactly on the other 55; the same held by a parent attribute (groups with no data blank,
+others equal) and with no GROUP BY. A difference of two metrics that can each be blank has no arithmetic fix:
+describe which groups read the other side. The warning (`compound_constant_warnings`) shows in the plan check
+and in `create-compound-metric`'s output (`warnings`); a `+` / `-` that is the numerator of a division by one
+of its own operands (the divide-last form) is not warned.
 
 **4. A filter drops the referenced fact metric's level rule.** A conditional metric (§0c) over a fact metric
 that carries `last_in_fact` on `[Period]` evaluates over every qualifying row: repeated post-exit rows were
