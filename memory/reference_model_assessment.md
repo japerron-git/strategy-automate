@@ -293,6 +293,24 @@ Resolved:
   Studio time attribute, not a date stored as a number, whatever its description says ("coded yyyyMM").
   It belongs to the date its description names, or to the model's only date. Maturity and the
   time-attribute suggestion read it that way.
+- *A filter on a compound metric is wrong* (verified live 2026-11-20 on two tenants, a ratio blank in 37 of 38
+  months): `WHERE r < 0.5` over a subquery's compound-metric column kept all 37 blank rows, `AND r IS NOT
+  NULL` too, and `HAVING` alike; `> x` drops them. The filter is pushed down and evaluated with a blank read as
+  0. Right: CASE buckets in the SELECT, or `ORDER BY ... LIMIT n` in the subquery (it stops the push-down; then
+  `<` and `>` both read right). A conditional metric filtered the same way was right. `check --bank` warns
+  (`compound_filter_lint`, compound metrics from scope.json formulas).
+- *The connector lags a publish* (seen 2026-11-20): right after a publish or certify, a column get_semantics
+  lists (new time attributes' `<date> (month)__id`, then `month__id`) failed with MOSAIC_SQL_COLUMN_NOT_FOUND
+  for about a minute, then worked as a bare column, in WHERE and in GROUP BY. Re-ask such a query once after a
+  minute before calling the name broken.
+- *All-blank rows in grading:* a row whose measures are all blank says "no value here": `grade` leaves such
+  rows out of the pairing on both sides and reports them under `blank_only_rows`. A blank where the reference
+  has a value still fails.
+- *Output aliases in `references`:* a name right after `AS` is the query's own label: never rewritten or
+  flagged; when a query names an output alias like a removed metric, its bare uses are the alias. Questions
+  whose own SQL was rewritten are listed under `carried`: they can't test that rename.
+- *Distinct counts in the probe's filter check:* a count of an attribute's values is judged against how many
+  of those values the filter keeps (one query, only when the warning would fire), not the share of fact rows.
 - *Result columns in grading:* `grade` matches a key or measure named `<attribute>__<form>` to the
   connector's `<attribute> (<form>)` header (and ignores case, quotes and spacing). A key or measure a result
   doesn't have is an error that names the result's columns, not a blank key. "Duplicate keys" blames grouping
@@ -751,8 +769,8 @@ customers / accounts / stores" questions, named like "active customers"
 (`reference_mosaic_derived_metrics.md` §0d rule 3). `add_time_attributes` takes
 `attribute`, `intervals` and optional `names` (`{"year": "Year"}`; default '<attribute> (Year)'): a name held by
 another attribute or time attribute stops the command, dry run included, and an existing time attribute is never
-renamed. **Names through the phases:** `plan` moves a `rename_describe` item that frees a name an earlier phase
-creates (a time attribute's name, a new metric's or attribute's `name`) into a rename step at the start of that
+renamed. **Names through the phases:** a `replace: true` keeps its object and needs no free name. `plan` moves a
+`rename_describe` item that frees a name an earlier phase creates (a time attribute's name, a new metric's or attribute's `name`) into a rename step at the start of that
 phase (`specs/rename_free_names_phase_<n>.json`), and reports a name created twice or renamed onto a created
 name. Custom time-attribute names: verified live 2026-11-20 (probe 7): created under the given name, values after a
 REST republish alone; a later Studio publish adds the date's other intervals, hidden, under default names.

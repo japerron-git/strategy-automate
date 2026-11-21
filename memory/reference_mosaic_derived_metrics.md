@@ -241,6 +241,12 @@ unit on `[Period]`** (both `Distinct=True` and `False`) unless the counted attri
 attribute. **`Count` of a fact metric keeps it**: `Count<UseLookupForAttributes=False>([M]) {~+}` plus a
 `[Period]` unit counts the snapshot rows in the selected period, which equals entities per period.
 
+**3b. `+` and `-` read a blank operand as 0; only a division keeps a blank** (seen live 2026-11-20):
+`1 - ([A] / ZeroToNull([B]))` read 1 where B is 0, and `[A] - [C]` read [A] where the conditional metric C
+had no rows; `[A] / [C]` stayed blank. `create-compound-metric` warns on `+` / `-` over metrics. For
+`1 - [A] / [B]`, divide last: `(ZeroToNull([B]) - [A]) / ZeroToNull([B])` (scratch probe 9). A difference of
+two metrics that can each be blank has no arithmetic fix: describe which groups read the other side.
+
 **4. A filter drops the referenced fact metric's level rule.** A conditional metric (§0c) over a fact metric
 that carries `last_in_fact` on `[Period]` evaluates over every qualifying row: repeated post-exit rows were
 summed (4× and 8× the true amount). Fix: put the period unit on the conditional metric itself —

@@ -5364,6 +5364,14 @@ def compound_constant_warnings(formula: str) -> list[str]:
                     out.append("a constant times a blank reads 0: groups where the other side is blank (a ratio "
                                "with no data) read 0, not blank. To keep them blank and real zeros 0, divide "
                                "instead: [A] / (ZeroToNull([B]) / 100)")
+        if fn in ("plus", "minus") and len(kids) == 2 and any(k.get("type") != "constant" for k in kids):
+            # seen live 2026-11-20: 1 - ([A] / ZeroToNull([B])) read 1 where B is 0; [A] - [C] read [A] where the
+            # conditional metric C is blank. Only a division keeps a blank.
+            out.append("+ and - read a blank operand as 0: where an operand is blank (a ratio over ZeroToNull, a "
+                       "conditional metric with no rows), the result reads the other side (1 - blank = 1, "
+                       "[A] - blank = [A]) instead of blank. For 1 - [A] / [B], divide last: "
+                       "(ZeroToNull([B]) - [A]) / ZeroToNull([B]). For [A] - [C] with a blank C, say in the "
+                       "description which groups read [A]")
         for k in kids:
             walk(k, in_divide or fn == "divide")
 
@@ -7393,13 +7401,18 @@ def rename_describe_writes(model: dict, mid: str, items: list[dict]) -> tuple[li
         names = by_name[kind]
         o, via_form = (names.get(cur.casefold()) or renamed[kind].get(cur.casefold())
                        or by_id[kind].get(cur.strip().upper())), False
-        if o is None and kind == "attribute":
+        # a time attribute named exactly so comes first: '<date> (year)' is Studio's name for one, and read as a
+        # form name it would resolve to the date attribute itself (seen 2026-11-20)
+        exact_smart = kind == "attribute" and o is None and \
+            (cur.strip().casefold() in smart or cur.strip().upper() in smart)
+        if o is None and kind == "attribute" and not exact_smart:
             for alt in attribute_name_candidates(cur)[1:]:
                 if alt in names:
                     o, via_form = names[alt], True
                     break
         if o is None and kind == "attribute":
-            hit = next((smart[c] for c in [cur.strip().upper()] + attribute_name_candidates(cur) if c in smart), None)
+            hit = next((smart[c] for c in [cur.strip().upper(), cur.strip().casefold()] + attribute_name_candidates(cur)
+                        if c in smart), None)
             if hit is not None:
                 sa, base = hit
                 si = sa.get("information") or {}

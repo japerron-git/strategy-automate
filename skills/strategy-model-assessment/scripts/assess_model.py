@@ -1223,6 +1223,17 @@ def _sql_literal(value: Any, typ: str = "") -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
+def _counted_attribute(formula: str, attrs_by: dict[str, dict]) -> str:
+    """The connector column of the attribute a Count(...) metric counts ('Count({Customer ID})',
+    'Count<Distinct=True, ...>([Customer ID]@...)'), or '' when it counts something else or it isn't listed."""
+    m = re.match(r"^\s*count\s*(?:<[^>]*>)?\s*\(\s*[{\[]([^}\]]+)[}\]]", formula or "", re.I)
+    if not m:
+        return ""
+    name = m.group(1).strip().casefold()
+    hits = [a for a in attrs_by if a.casefold() == name or a.casefold().startswith(name + " (")]
+    return hits[0] if len(hits) == 1 else (name if name in {a.casefold() for a in attrs_by} else "")
+
+
 def _blank(v: Any) -> bool:
     return v is None or str(v).strip().lower() in ("", "null", "none")
 
@@ -1300,10 +1311,10 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
     def rows_of(res: dict | None) -> list[dict] | None:
         return res["rows"] if res and res["ok"] else None
 
-    def entities(where_sql: str) -> float | None:   # anchored: entities with fact rows
-        if not entity:
+    def entities(where_sql: str, attribute: str = "") -> float | None:   # anchored: entities with fact rows
+        if not (attribute or entity):
             return None
-        E = quote_ident(entity)
+        E = quote_ident(attribute or entity)
         sql = f"SELECT CAST(COUNT(*) AS VARCHAR) AS n FROM (SELECT {E} AS e_ FROM {M}{where_sql} GROUP BY 1 HAVING COUNT({A}) > 0) t"  # nosec B608  # identifiers are quoted; the connector is read-only
         r = rows_of(ask(sql))
         return _num(r[0].get("n")) if r else None
@@ -1497,6 +1508,13 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
                          ((filt_rows / total) if total and filt_rows is not None else None)
             # exactly the value shown: _close's display allowance (0.005) called an average that moved from 0.672 to
             # 0.669 "the same" (seen 2026-11-18); a metric that ignores the filter returns the identical value
+            counted = _counted_attribute(m.get("formula") or "", attrs_by)   # a count of an attribute's values:
+            if fcond and t and f_total is not None and f_total == t and kept_share is not None \
+                    and kept_share < 0.9 and len(filled_f) >= 2 and counted:   # its own share decides (seen live
+                c_all, c_kept = entities(base, counted), entities(fcond, counted)   # 2026-11-20: 2 customers kept
+                if c_all and c_kept is not None:                                    # by a filter keeping 11% of
+                    kept_share = c_kept / c_all                                     # the promotions)
+                    item["notes"].append(f"counts '{counted}': the filter keeps {c_kept:g} of its {c_all:g} values")
             if fcond and t and f_total is not None and f_total == t and kept_share is not None \
                     and kept_share < 0.9 and len(filled_f) >= 2:   # one filled group = that group only, not this
                 item["issues"].append(f"ignores a filter that keeps {kept_share:.0%} of "
@@ -1987,19 +2005,35 @@ def reference_changes(old_scope: dict, new_scope: dict, *, export: dict | None =
     return out
 
 
+_AS_BEFORE = re.compile(r"\bAS\s*$", re.I)
+
+
 def replace_identifier(sql: str, old: str, new: str) -> tuple[str, int, int]:
     """Rewrite the quoted identifier "old" as "new" outside string literals. Returns (sql, quoted rewrites,
-    unquoted mentions left alone: a bare word may be a keyword or another name, so a person checks it)."""
+    unquoted mentions left alone: a bare word may be a keyword or another name, so a person checks it).
+    A name right after AS is an output alias the query chose, not a reference to the model: never rewritten
+    or counted. When the query names an output alias `old`, its bare mentions are taken as uses of the alias."""
     parts = _SQL_LITERAL.split(sql)
     quoted = re.compile('"' + re.escape(old) + '"', re.I)
     bare = re.compile(r'(?<![\w".])' + re.escape(old) + r'(?![\w"(])', re.I) \
         if re.fullmatch(r"[A-Za-z_]\w*", old) else None
+    code = "".join(parts[0::2])
+    is_alias = bool(re.search(r"\bAS\s+(\"" + re.escape(old) + r"\"|" + re.escape(old) + r"\b)", code, re.I))
     done = left = 0
     for i in range(0, len(parts), 2):
-        parts[i], n = quoted.subn(quote_ident(new).replace("\\", "\\\\"), parts[i])
-        done += n
-        if bare:
-            left += len(bare.findall(parts[i]))
+        text, out, pos = parts[i], [], 0
+        for m in quoted.finditer(text):
+            out.append(text[pos:m.start()])
+            if _AS_BEFORE.search(text[:m.start()]):
+                out.append(m.group(0))          # an output alias: the query's own name, kept
+            else:
+                out.append(quote_ident(new))
+                done += 1
+            pos = m.end()
+        out.append(text[pos:])
+        parts[i] = "".join(out)
+        if bare and not is_alias:
+            left += sum(1 for m in bare.finditer(text) if not _AS_BEFORE.search(text[:m.start()]))
     return "".join(parts), done, left
 
 
@@ -2059,7 +2093,10 @@ def apply_reference_changes(bank: dict, changes: list[dict], *, round_no: int | 
                                        "candidates": [], "why": "; ".join(res.get("problems") or [])})
                     continue
             rewritten.append(entry)
-    return {"rewritten": rewritten, "unresolved": unresolved, "applied": apply}
+    carried = [{"question": r["question"], "changes": r["changes"]} for r in rewritten if r["where"] == "question"]
+    return {"rewritten": rewritten, "unresolved": unresolved, "applied": apply,
+            # questions whose own SQL now reads the renamed object: they can't test that rename (verify-changes)
+            "carried": carried}
 
 
 _YYYYMM = r"(?:19|20)\d{2}(?:0[1-9]|1[0-2])"
@@ -3846,8 +3883,18 @@ def _compare(q: dict, rows: list[dict], ref: list[dict], tol: float,
             return "error", None, (f"comparison: {what} column {miss[0]!r} is not in the {side} result (its columns: "
                                    f"{', '.join(data[0].keys())}); name the column as the SQL outputs it, or give "
                                    f"both queries the same alias (reason kind sql_error)")
+    blank_only = {}
+    if measures:   # a row whose measures are all blank says "no value here", like a row left out
+        for side, data in ((sides[0], rows), (sides[1], ref)):
+            kept = [r for r in data if not all(_blank(r.get(mcol)) for mcol in measures)]
+            if len(kept) != len(data):
+                blank_only[side] = len(data) - len(kept)
+        rows = [r for r in rows if not all(_blank(r.get(mcol)) for mcol in measures)]
+        ref = [r for r in ref if not all(_blank(r.get(mcol)) for mcol in measures)]
     try:
         cmp = svm.compare_rows(rows, ref, keys, measures, float(tol), str(q.get("id")))
+        if blank_only:
+            cmp["blank_only_rows"] = blank_only   # left out of the pairing on both sides
         return {"ok": "pass", "mismatch": "fail", "empty": "empty"}.get(cmp["status"], "fail"), cmp, None
     except SystemExit as e:
         msg = str(e)
@@ -4039,11 +4086,67 @@ def time_shift_metrics(metrics: list[dict]) -> dict[str, dict]:
     return out
 
 
+COMPOUNDS_KEY = "\x00compounds"   # in the lint mapping: {casefolded name: name} of compound metrics
+
+
+def compound_metric_names(metrics: list[dict]) -> dict[str, str]:
+    """Metrics whose formula combines other metrics with + - * / ({A} / ZeroToNull({B}), 1 - {A}, ...):
+    {casefolded name: name}. A filter on such a metric's column is pushed down with a blank read as 0."""
+    out = {}
+    for m in metrics or []:
+        f = str(m.get("formula") or "")
+        if "{" in f and re.search(r"[})]\s*[-+*/]|[-+*/]\s*[({]|^\s*[\d.]+\s*[-+*/]", f):
+            out[str(m.get("name") or "").casefold()] = str(m.get("name") or "")
+    return out
+
+
 def time_shift_from_scope(path: str) -> dict[str, dict]:
-    """time_shift_metrics() of a scope.json's metrics; {} when the file is missing."""
+    """The lint mapping from a scope.json: time_shift_metrics() of its metrics, plus the compound metrics under
+    COMPOUNDS_KEY; {} when the file is missing."""
     if not path or not os.path.isfile(path):
         return {}
-    return time_shift_metrics(_load_json(path).get("metrics") or [])
+    metrics = _load_json(path).get("metrics") or []
+    out = time_shift_metrics(metrics)
+    comp = compound_metric_names(metrics)
+    if comp:
+        out[COMPOUNDS_KEY] = comp
+    return out
+
+
+_FILTER_CLAUSE = re.compile(r"\b(where|having)\b(.*?)(?=\bgroup\s+by\b|\border\s+by\b|\blimit\b|\bhaving\b|"
+                            r"\bunion\b|\)|$)", re.I | re.S)
+
+
+def compound_filter_lint(sql: str, compounds: dict[str, str] | None) -> list[str]:
+    """A WHERE or HAVING on a compound metric, or on a subquery column computed from one, is evaluated apart
+    from the projection with a blank read as 0: `< x` keeps the blank rows, `> x` drops them, IS NOT NULL
+    doesn't help (verified live 2026-11-20 on two tenants). CASE buckets in the SELECT, or an ORDER BY ... LIMIT
+    in the subquery (it stops the push-down), read right."""
+    if not compounds or not (sql or "").strip():
+        return []
+    text = _SQL_LITERAL.sub("''", sql)
+    if re.search(r"\blimit\s+\d+\s*\)", text, re.I):   # a LIMIT barrier in a subquery
+        return []
+    named = [n for n in compounds.values() if _mentions(text, n)]
+    if not named:
+        return []
+    aliases = set()
+    for m in re.finditer(r"\bAS\s+(\"[^\"]+\"|[A-Za-z_]\w*)", text, re.I):
+        expr = text[max(0, m.start() - 300):m.start()]
+        expr = expr[expr.rfind(",") + 1:] if "," in expr else expr
+        if any(_mentions(expr, n) for n in named):
+            aliases.add(m.group(1).strip('"').lower())
+    hits = []
+    for m in _FILTER_CLAUSE.finditer(text):
+        clause = m.group(2)
+        cols = [n for n in named if _mentions(clause, n)] + [a for a in sorted(aliases) if _mentions(clause, a)]
+        if cols:
+            hits.append(f"{m.group(1).upper()} on {', '.join(cols)}")
+    if not hits:
+        return []
+    return [f"it filters a compound metric ({'; '.join(hits)}): Mosaic evaluates such a filter with a blank read as 0, "
+            f"so '< x' keeps blank rows and '> x' drops them, IS NOT NULL included; count with CASE buckets in the "
+            f"SELECT, or put ORDER BY ... LIMIT in the subquery so the filter runs on its result"]
 
 
 def _mentions(text: str, name: str) -> bool:
@@ -4062,7 +4165,7 @@ def time_shift_sql_lint(sql: str, shifted: dict[str, dict] | None) -> list[str]:
     text = _SQL_LITERAL.sub("''", sql)
     grouped = {e.strip().strip('"').lower() for e in group_by_items(sql)}
     out = []
-    for key in sorted(shifted):
+    for key in sorted(k for k in shifted if k != COMPOUNDS_KEY):
         ts = shifted[key]
         if not _mentions(text, ts["name"]):
             continue
@@ -4089,7 +4192,8 @@ def _sql_lint(sql: str, shifted: dict[str, dict] | None = None) -> list[str]:
            f"an outer query over a subquery: group by the attribute itself or its time attribute ((year), (month) "
            f"forms), or compute the expression in the subquery's SELECT (e.g. YEAR(MAX(<date>)) AS vintage) and "
            f"group the outer query by that column"] if bad else []
-    return out + form_group_by_lint(sql) + time_shift_sql_lint(sql, shifted) + avg_decimal_lint(sql)
+    return (out + form_group_by_lint(sql) + time_shift_sql_lint(sql, shifted) + avg_decimal_lint(sql)
+            + compound_filter_lint(sql, (shifted or {}).get(COMPOUNDS_KEY)))
 
 
 def output_columns(sql: str) -> list[str | None] | None:
@@ -4488,6 +4592,14 @@ def no_change(f: dict) -> bool:
     """A finding decided as "no change": an explicit empty action list (`actions: []`), not covered by another
     finding. A finding with no `actions` key at all still becomes a manual step from its recommendation."""
     return isinstance(f.get("actions"), list) and not f["actions"] and not f.get("covered_by")
+
+
+def no_change_note(f: dict) -> str:
+    """The note a no-change finding's step prints: what was decided (rework note, then the decision's note), not
+    the proposal it started from."""
+    text = _one_line(f.get("rework_note") or f.get("decision_note") or f.get("recommendation") or f.get("title")
+                     or "decided to leave the model as it is")
+    return text if text.lower().startswith("no model change") else "No model change: " + text
 
 
 def _one_line(text: Any) -> str:
@@ -5009,8 +5121,8 @@ def free_names_ahead(ordered: list[dict], merged: dict[str, list[dict]], problem
         for a in f.get("actions") or []:
             kind, args, phase = a.get("kind"), a.get("args") or {}, action_phase(f, a)
             names = []
-            if kind in NAMED_CREATE_KINDS and args.get("name"):
-                names.append((str(args["name"]), f"{kind} '{args['name']}' ({f['id']})"))
+            if kind in NAMED_CREATE_KINDS and args.get("name") and not args.get("replace"):   # a replace keeps its
+                names.append((str(args["name"]), f"{kind} '{args['name']}' ({f['id']})"))      # object: no new name
             if kind == "add_time_attributes" and isinstance(args.get("names"), dict):
                 names += [(str(v), f"the {k} time attribute of '{args.get('attribute')}' ({f['id']})")
                           for k, v in args["names"].items() if v]
@@ -5200,7 +5312,9 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
                 continue
             cur = str(it.get("current_name") or "")
             base = form_base_name(cur)
-            if base:
+            if base and re.search(r"\((?:year|quarter|month|week|day)\)\s*$", cur, re.I):
+                base = ""   # '<date> (year)' is also Studio's name for a time attribute: rename-describe looks it up
+            if base:        # by exact name first (seen 2026-11-20), so it isn't read as a form here
                 if it.get("new_name"):
                     problems.append(f"{it['finding']}: rename_describe renames '{cur}', a connector form name of "
                                     f"'{base}'; forms can't be renamed. Rename the attribute or drop new_name")
@@ -5355,8 +5469,7 @@ def build_plan(findings_doc: dict, *, model_id: str = "", statuses: tuple[str, .
             if no_change(f):   # decided: nothing to change in the model (keep as is, ignore, assume correct)
                 steps.append({"finding": f["id"], "title": f.get("title"), "kind": "note", "dry_run": None,
                               "apply": None, "manual": None, "risks": [],
-                              "note": "No model change: " + _one_line(f.get("recommendation") or f.get("title") or
-                                                                       "decided to leave the model as it is")})
+                              "note": no_change_note(f)})
                 continue
             for action in f.get("actions") or [{"kind": "manual", "steps": f.get("recommendation")}]:
                 kind = action.get("kind")
@@ -6373,7 +6486,8 @@ def _offline(args: argparse.Namespace) -> int:
             _write_json(args.bank, bank)
         out = {"version": 1, "model": new.get("model"), "removed": changes, "usage": usage,
                "date_filters": {"changes": dchanges, "rewritten": dates},
-               "findings": reference_findings(changes, usage, args.round)}
+               "findings": reference_findings(changes, usage, args.round),
+               "carried": usage["carried"]}   # not tests of the rename they were carried to
         if getattr(args, "findings", None):
             done = resolved_findings(_load_json(args.findings), out["findings"])
             done = {k: [i for i in v if i.startswith("N-")] for k, v in done.items()}
