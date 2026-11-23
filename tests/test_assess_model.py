@@ -1191,6 +1191,14 @@ class EarlyStageSignalTests(unittest.TestCase):
         self.assertEqual(m["summed_rates_scores_or_ages"], ["interest rate", "customer age"])
         self.assertEqual(m["metrics_stored_as_text"], ["cumulative costs"])
 
+    def test_summed_ratio_names_count_stored_columns_only(self):
+        """item 79: a compound ratio carries its own arithmetic and reads right; a stored "per" value summed doesn't."""
+        scope = dict(self.SCOPE, metrics=[
+            {"name": "margin ratio", "type": "double", "formula": "Sum({Margin}) / Sum({Sales})"},
+            {"name": "lines per order", "type": "double", "formula": "sum(orders.{LINES_PER_ORDER})"},
+            {"name": "avg order value", "type": "double", "formula": "Sum({Sales}) / Count(Order (ID))"}])
+        self.assertEqual(am.maturity_signals(scope)["summed_rates_scores_or_ages"], ["lines per order"])
+
     def test_numeric_codes_and_integer_periods_get_lookups(self):
         sugg = {}
         for x in am.lookup_suggestions(self.SCOPE):
@@ -1897,6 +1905,18 @@ class RoleTests(unittest.TestCase):
         self.assertNotIn("store id", out)                                       # the entity key
         self.assertNotIn("region code", out)                                    # a code attribute is fine
 
+    def test_a_count_with_fractions_is_an_average(self):
+        """item 79: a per-row mean of a count (1 to 1.8 lines per order) summed adds up averages; a quantity can be
+        fractional and is left alone."""
+        scope = {"model": "Orders", "attributes": [], "metrics": [
+            {"name": m, "type": "double", "formula": f"sum(orders.{{{m}}})"} for m in ("lines per order", "weight quantity")]}
+        profiles = {"lines per order": {"min": "1", "max": "1.8", "non_blank": "900", "non_integer": "600"},
+                    "weight quantity": {"min": "0.5", "max": "40.25", "non_blank": "900", "non_integer": "700"}}
+        out = {c["name"]: c for c in am.classify_roles(scope, profiles, None)}
+        self.assertEqual(out["lines per order"]["role"], "average")
+        self.assertEqual([a["kind"] for a in out["lines per order"]["suggested_actions"]], ["patch_fact_metrics"])
+        self.assertNotIn("weight quantity", out)
+
     def test_one_row_per_entity_skips_the_constancy_rule(self):
         variation = {"entities": 900, "row_count": 900, "varying": {"opening size": 0}}
         out = am.classify_roles(self.SCOPE, {"opening size": self._profiles()["opening size"]}, variation)
@@ -2106,6 +2126,8 @@ def _aggregating(answer):
             return answer(sql)
         inner = re.sub(r", COUNT\((\"[^\"]+\")\) AS n", r", CAST(COUNT(\1) AS VARCHAR) AS n", m["inner"])
         table = answer(inner)
+        if isinstance(table, str):   # an error reply (_ErrRunner)
+            return table
         rows = [dict(zip(table[0], r)) for r in table[1:]]
         nonblank = [r for r in rows if not am._blank(r.get("v"))]
         if " AS listed" in m["outer"]:
@@ -2257,6 +2279,87 @@ class ProbeTests(unittest.TestCase):
         self.assertFalse(cc["agree"])
         self.assertIn("rows kept filtered: one-row 400.0 vs lists 250.0", cc["differences"])
         self.assertTrue(any("cross-check" in w and "dev chat" in w for w in out["warnings"]))
+
+    # item 73: a date filter is a DATE literal; item 71: unchecked shapes and repeated rows are said
+    DATED = {"model": "Orders", "anchor": {"metric": "order count"},
+             "attributes": [{"name": "order id", "type": "bigint", "profile": {"distinct_values": 1000}},
+                            {"name": "month start", "type": "date", "profile": {"distinct_values": 2}},
+                            {"name": "region", "type": "varchar", "profile": {"distinct_values": 3}},
+                            {"name": "status", "type": "varchar", "profile": {"distinct_values": 2}},
+                            {"name": "channel", "type": "varchar", "profile": {"distinct_values": 3}}],
+             "metrics": [{"name": "order count", "type": "bigint", "formula": "sum(orders.{N})"}]}
+
+    @staticmethod
+    def dated_answer(sql):
+        if "'2025-02-01'" in sql and "DATE '2025-02-01'" not in sql:
+            return "Cannot apply operator: date = varchar(10)"
+        flt = "DATE '2025-02-01'" in sql
+        if sql.startswith('SELECT CAST(COUNT("order count") AS VARCHAR) AS n FROM'):
+            return [["n"], ["400" if flt else "1000"]]
+        if sql.startswith('SELECT CAST("month start" AS VARCHAR) AS v, CAST(COUNT'):
+            return [["v", "n"], ["2025-01-01", "600"], ["2025-02-01", "400"]]
+        if sql.startswith('SELECT CAST("region" AS VARCHAR) AS v, CAST(COUNT'):
+            return [["v", "n"], ["a", "200" if flt else "500"], ["b", "100" if flt else "300"],
+                                ["c", "100" if flt else "200"]]
+        if sql.startswith('SELECT CAST("region" AS VARCHAR) AS v FROM'):
+            return [["v"], ["a"], ["b"], ["c"]]
+        if sql.startswith("SELECT CAST(COUNT(*) AS VARCHAR) AS n FROM (SELECT"):
+            return [["n"], ["100"]]
+        if 'AS p, CAST("month start" AS VARCHAR) AS t' in sql:
+            return [["p", "t", "n"], ["a", "2025-01-01", "300"], ["a", "2025-02-01", "200"]]
+        if '"status"' in sql and "COUNT(" in sql and "GROUP BY" in sql:   # reaches another fact only
+            return "The number of intermediate rows 50111512 exceeds the maximum number of intermediate rows"
+        if 'CAST("status" AS VARCHAR) AS v FROM' in sql:
+            return [["v"], ["open"], ["closed"]]
+        if 'CAST("channel" AS VARCHAR) AS v' in sql:
+            if "COUNT(" not in sql:
+                return [["v"], ["web"], ["store"], ["phone"]]
+            n = "400" if flt else "1000"                                      # a cross join: each value, all rows
+            if 'AS p, CAST("channel"' in sql:
+                return [["p", "v", "n"]] + [[p, v, "999"] for p in "abc" for v in ("web", "store", "phone")]
+            return [["v", "n"], ["web", n], ["store", n], ["phone", n]]
+        if sql.startswith('SELECT CAST("month start" AS VARCHAR) AS g') or sql.startswith('SELECT CAST("region" AS VARCHAR) AS g'):
+            return [["g", "m0"], ["x", "1"]]
+        if sql.startswith("SELECT CAST(SUM(") or sql.startswith("SELECT SUM("):
+            return [["m0"], ["1000"]]
+        raise AssertionError(sql)
+
+    def _dated(self, attributes):
+        runner = _ErrRunner(self.dated_answer)
+        return am.probe_objects(runner, "shop", self.DATED, period="month start", attributes=attributes), runner
+
+    def test_a_date_filter_is_a_date_literal(self):
+        out, runner = self._dated(["region"])
+        self.assertEqual(out["filter"]["sent"], "DATE '2025-02-01'")
+        self.assertEqual(out["filter"]["rows"], 400.0)
+        self.assertNotIn("error", out["filter"])
+        self.assertIn("filtered to month start = 2025-02-01", out["attributes"][0]["shapes"])
+        self.assertEqual(out["attributes"][0]["issues"], [])
+
+    def test_a_failing_filter_is_said_once_and_not_retried_per_attribute(self):
+        def answer(sql):   # the filter itself fails, whatever the literal
+            if "DATE '2025-02-01'" in sql:
+                return "Cannot apply operator"
+            return self.dated_answer(sql)
+        out = am.probe_objects(_ErrRunner(answer), "shop", self.DATED, period="month start", attributes=["region"])
+        self.assertIn("Cannot apply operator", out["filter"]["error"])
+        self.assertTrue(any("the filtered checks of every attribute and metric were not run" in w for w in out["warnings"]))
+        self.assertNotIn("filtered to month start = 2025-02-01", out["attributes"][0]["shapes"])
+
+    def test_a_shape_that_errors_is_said_not_skipped(self):
+        out, _ = self._dated(["status"])
+        status = out["attributes"][0]
+        self.assertIn("alone", status["not_checked"])
+        self.assertTrue(any("attribute 'status': alone: not checked against 'order count'" in w
+                            and "no join path" in w for w in out["warnings"]), out["warnings"])
+
+    def test_rows_that_multiply_are_an_issue(self):
+        out, _ = self._dated(["channel"])
+        issues = out["attributes"][0]["issues"]
+        self.assertTrue(any("alone: each of its 3 values gets all 1,000 fact rows" in i and "cross join" in i
+                            for i in issues), issues)
+        self.assertTrue(any("grouped with region: its groups hold 8,991 rows for 1,000" in i and "many-to-many" in i
+                            for i in issues), issues)
 
     def test_too_many_groups_is_said_not_judged(self):
         runner = _SqlRunner(self.answer)

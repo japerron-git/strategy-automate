@@ -679,7 +679,7 @@ def _weighted_part(m: dict) -> bool:
 
 
 # words naming a value that doesn't add up across rows; not 'term', which also names a horizon ('long term spend')
-_SUMMED_NONADDITIVE = re.compile(r"\b(rate|ratio|score|percent|percentage|pct|age|months|price|index|"
+_SUMMED_NONADDITIVE = re.compile(r"\b(rate|ratio|score|percent|percentage|pct|age|months|price|index|per|"
                                  r"average|avg|mean|latitude|longitude)\b", re.I)
 
 
@@ -823,9 +823,11 @@ def maturity_signals(scope: dict) -> dict[str, Any]:
     integer_dates = [a["name"] for a in attrs if looks_like_integer_date(a) and a["name"].lower() not in time_cols]
     text_dates = [a["name"] for a in attrs if (a.get("type") or "").lower() in _TEXT_TYPES and looks_like_stored_date(a)
                   and a["name"].lower() not in time_cols]
+    # a stored column summed (a compound metric's formula carries its own arithmetic: Sum({a}) / Sum({b}) is a
+    # ratio read right, seen 2026-11-23); "per" names a value already divided on each row
     summed_nonadditive = [m["name"] for m in metrics if m.get("formula") and
-                          re.match(r"^sum\(", m["formula"].strip(), re.I) and _SUMMED_NONADDITIVE.search(_words(m["name"]))
-                          and not _weighted_part(m)]
+                          _RAW_METRIC.match(m["formula"].strip()) and re.match(r"^sum\(", m["formula"].strip(), re.I)
+                          and _SUMMED_NONADDITIVE.search(_words(m["name"])) and not _weighted_part(m)]
     text_metrics = [m["name"] for m in metrics if m.get("type", "").lower() in ("varchar", "char", "string", "text")]
     share = round(described / total, 3)
     structural = len(summed_nonadditive) >= 3 or len(integer_dates) + len(text_dates) >= 2 or bool(text_metrics)
@@ -863,6 +865,9 @@ ROLE_LOW_SPAN = 30            # an integer measure spanning at most this many va
 ROLE_CONSTANT_SHARE = 0.01    # at most this share of entities with more than one value = one value per entity
 ROLE_MEASURE_DISTINCT = 1000  # a numeric attribute with at least this many values may be a measure
 _COUNT_LIKE = re.compile(r"\b(number of|count|num of|units|unit count|qty|quantity|items|lines)\b", re.I)
+# whole things counted: a fraction in one is an average or a ratio stored on each row (a quantity or units of
+# measure may be fractional, so they are not here); "per" names a ratio
+_WHOLE_COUNT = re.compile(r"\b(number of|count|num of|items|lines|per)\b", re.I)
 _CODE_LIKE = re.compile(r"\b(id|code|key|zip|postal|flag|indicator|status|type|class|category|band|bucket|"
                         r"tier|grade|year|month|quarter|week|day|number)\b", re.I)
 
@@ -910,6 +915,7 @@ def classify_roles(scope: dict, profiles: dict[str, dict], variation: dict[str, 
         rows_per_entity = (variation.get("row_count") or 0) / variation["entities"]
     multi_row = rows_per_entity is not None and rows_per_entity >= 1.5
     metric_names = {m["name"].lower() for m in scope.get("metrics") or []}
+    formulas = {m["name"]: (m.get("formula") or "").strip() for m in scope.get("metrics") or []}
     for name, p in profiles.items():
         if p.get("error") or p.get("pending"):
             continue
@@ -954,6 +960,14 @@ def classify_roles(scope: dict, profiles: dict[str, dict], variation: dict[str, 
                 role, reason = "review", (f"integers spanning {int(span) + 1} values: possibly a code, a band or a "
                                           f"small count. Check the data dictionary")
                 acts = [attr_act]
+        elif not integer and frac and _WHOLE_COUNT.search(words) and re.match(r"^sum\(", formulas.get(name, ""), re.I):
+            # a count with fractions (1.4 lines per order on each row): Sum adds up averages (seen 2026-11-23, a
+            # per-row mean summed to 90,000 times its value); the names alone missed it
+            role, reason = "average", (f"a count with fractions ({frac:,.0f} of {n:,.0f} rows, {lo:g} to {hi:g}): an "
+                                       f"average or a ratio stored on each row, so its Sum adds up averages. Average "
+                                       f"it, or rebuild it from its parts as a weighted average")
+            acts = [{"kind": "patch_fact_metrics", "args": {"metrics": [
+                {"name": name, "function": "<avg, or keep sum and say in its description what the total means>"}]}}]
         if constant:
             note = ("one value per entity, repeated on each of its rows: a Sum across rows multiplies it by the "
                     "rows per entity. Read it once per entity")
@@ -1058,6 +1072,9 @@ def review_roles(runner: Runner, project: str, scope: dict, *, entity: str = "",
 #              a value for one period only without "latest" in its name or description
 
 PROBE_MAX_VALUES = 200
+# the connector's error when a query needs more joined rows than it allows; across fact tables it is the sign of no
+# join path between the attribute and the fact (seen 2026-11-23: a 4-fact model, attributes of one fact)
+_NO_PATH_ERROR = re.compile(r"intermediate rows", re.I)
 PROBE_GROUP_LIMIT = 1_000_000   # the ORDER BY ... LIMIT barrier in probe's one-row checks; reaching it = too many groups
 _NONBLANK_V = "v IS NOT NULL AND TRIM(v) <> '' AND LOWER(TRIM(v)) NOT IN ('null', 'none')"   # _blank, in SQL
 _LATEST_WORDS = re.compile(r"\b(latest|current period|as of|point in time|most recent)\b", re.I)
@@ -1383,10 +1400,19 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             else:                                    # the largest group
                 filt_value = max(filled, key=lambda x: x[1])[0]
     filt_type = (attrs_by.get(filt) or {}).get("type") or ""
-    fcond = cond(f"{quote_ident(filt)} = {_sql_literal(filt_value, filt_type)}") if filt_value is not None else ""
+    # a literal of the attribute's type: a date compared with a quoted text fails in Trino ("Cannot apply operator:
+    # date = varchar(10)", seen 2026-11-23), and every filtered check then errors
+    filt_sql = _typed_literal(filt_value, filt_type) if filt_value is not None else ""
+    fcond = cond(f"{quote_ident(filt)} = {filt_sql}") if filt_value is not None else ""
+    filter_error = ""
     if fcond:   # what the filter keeps, counted directly: fact rows and entities
-        fr = rows_of(ask(f"SELECT CAST(COUNT({A}) AS VARCHAR) AS n FROM {M}{fcond}"))  # nosec B608
+        fres = ask(f"SELECT CAST(COUNT({A}) AS VARCHAR) AS n FROM {M}{fcond}")  # nosec B608
+        fr = rows_of(fres)
         filt_rows = _num(fr[0].get("n")) if fr else None
+        if fres is not None and fr is None:
+            filter_error = str(fres.get("error") or "no rows")
+            warnings.append(f"the filter {filt} = {filt_sql} fails ({filter_error[:160]}): the filtered checks of "
+                            f"every attribute and metric were not run")
     ent_total, ent_filtered = (entities(base), entities(fcond)) if fcond else (None, None)
     if partner and total:   # a partner that drops rows itself would blame every attribute grouped with it
         pr = rows_of(ask(f"SELECT CAST({quote_ident(partner)} AS VARCHAR) AS v, CAST(COUNT({A}) AS VARCHAR) AS n "  # nosec B608
@@ -1427,26 +1453,42 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
         V = "CAST({col} AS VARCHAR) AS v"
         listed_r = rows_of(ask(f"SELECT CAST(COUNT(CASE WHEN {_NONBLANK_V} THEN 1 END) AS VARCHAR) AS listed FROM "  # nosec B608
                                f"(SELECT {V.format(col=N)} FROM {M}{base} GROUP BY 1 ORDER BY 1 LIMIT {PROBE_GROUP_LIMIT}) t"))
-        alone_r = rows_of(ask(f"SELECT CAST(COUNT(*) AS VARCHAR) AS groups, CAST(COUNT(CASE WHEN n > 0 AND {_NONBLANK_V} "  # nosec B608
-                              f"THEN 1 END) AS VARCHAR) AS with_rows, CAST(SUM(n) AS VARCHAR) AS kept FROM (SELECT "
-                              f"{V.format(col=N)}, COUNT({A}) AS n FROM {M}{base} GROUP BY 1 ORDER BY 1 LIMIT {PROBE_GROUP_LIMIT}) t"))
-        shapes = [("alone", alone_r, total)]
-        if fcond and n != filt:
+        alone_res = ask(f"SELECT CAST(COUNT(*) AS VARCHAR) AS groups, CAST(COUNT(CASE WHEN n > 0 AND {_NONBLANK_V} "  # nosec B608
+                        f"THEN 1 END) AS VARCHAR) AS with_rows, CAST(SUM(n) AS VARCHAR) AS kept FROM (SELECT "
+                        f"{V.format(col=N)}, COUNT({A}) AS n FROM {M}{base} GROUP BY 1 ORDER BY 1 LIMIT {PROBE_GROUP_LIMIT}) t")
+        alone_r = rows_of(alone_res)
+        shapes = [("alone", alone_res, total)]
+        if fcond and n != filt and not filter_error:
             sql = (f"SELECT CAST(COUNT(*) AS VARCHAR) AS groups, CAST(SUM(n) AS VARCHAR) AS kept FROM (SELECT "  # nosec B608
                    f"{V.format(col=N)}, COUNT({A}) AS n FROM {M}{fcond} GROUP BY 1 ORDER BY 1 LIMIT {PROBE_GROUP_LIMIT}) t")
-            shapes.append((f"filtered to {filt} = {filt_value}", rows_of(ask(sql)), filt_rows))
+            shapes.append((f"filtered to {filt} = {filt_value}", ask(sql), filt_rows))
         if partner and n != partner:
             P = quote_ident(partner)
             sql = (f"SELECT CAST(COUNT(*) AS VARCHAR) AS groups, CAST(SUM(n) AS VARCHAR) AS kept FROM (SELECT "  # nosec B608
                    f"CAST({P} AS VARCHAR) AS p, {V.format(col=N)}, COUNT({A}) AS n FROM {M}{base} GROUP BY 1, 2 "
                    f"ORDER BY 1, 2 LIMIT {PROBE_GROUP_LIMIT}) t")
-            shapes.append((f"grouped with {partner}", rows_of(ask(sql)), total))
+            shapes.append((f"grouped with {partner}", ask(sql), total))
+        def not_checked(label: str, res: dict) -> None:   # nothing was checked in this shape: say so, and why
+            err = str(res.get("error") or "no rows")
+            item.setdefault("not_checked", {})[label] = err[:300]
+            text = (f"{label}: not checked against '{anchor}' ({err[:120]})"
+                    + ("; too many intermediate rows usually means no join path from this attribute to the anchor's "
+                       "fact table: check it against a fact it reaches" if _NO_PATH_ERROR.search(err) else ""))
+            warnings.append(f"attribute '{n}': {text}")
         if alone_r is None and listed_r is None:
             item["pending" if pending else "error"] = True
+            if alone_res is not None:
+                not_checked("alone", alone_res)
             attr_out.append(item)
             continue
-        for label, rows, expected in shapes:
-            if not rows or expected is None:
+        for label, res, expected in shapes:
+            if res is None:
+                continue   # pending
+            rows = rows_of(res)
+            if not rows:   # an error, or no reply row (item 71: seven attributes were silently skipped)
+                not_checked(label, res)
+                continue
+            if expected is None:
                 continue
             groups = _num(rows[0].get("groups")) or 0
             if groups >= PROBE_GROUP_LIMIT:
@@ -1457,6 +1499,17 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             if kept < expected - 0.5:
                 item["issues"].append(f"{label}: keeps {kept:,.0f} of {expected:,.0f} fact rows ({expected - kept:,.0f} "
                                       f"lost: a key its lookup lacks, often the blank one)")
+            elif expected and kept > expected + 0.5:
+                times = kept / expected
+                filled = _num(rows[0].get("with_rows")) or groups
+                if filled >= 2 and abs(times - round(times)) < 1e-9 and round(times) == round(filled):
+                    item["issues"].append(f"{label}: each of its {filled:,.0f} values gets all {expected:,.0f} fact rows "
+                                          f"({kept:,.0f} in all): a cross join, no join path from it to the fact table "
+                                          f"of '{anchor}'. Its metrics repeat the full total in every group")
+                else:
+                    item["issues"].append(f"{label}: its groups hold {kept:,.0f} rows for {expected:,.0f} fact rows "
+                                          f"({times:.1f}x): rows repeat, so the fact of '{anchor}' reaches it through a "
+                                          f"many-to-many path and its metrics are counted more than once per group")
         listed = _num(listed_r[0].get("listed")) if listed_r else None
         with_rows = _num(alone_r[0].get("with_rows")) if alone_r else None
         if listed is not None and with_rows is not None:
@@ -1620,6 +1673,16 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             warnings += [f"metric '{n}': {x}" for x in item["issues"]]
             met_out.append(item)
 
+    # The model's own compound metrics, read offline: the constant and blank rules the plan check applies to new
+    # ones (memory §0f, rule 3b). A ratio times 100 read 0 on every group with no data (seen 2026-11-23).
+    for it in met_out:
+        f = (mets_by[it["name"]].get("formula") or "").strip()
+        if not f or _RAW_METRIC.match(f):
+            continue
+        for w in dict.fromkeys(compound_constant_warnings(compound_from_display(f))):
+            it["issues"].append(f"its formula ({f[:120]}): {w}")
+            warnings.append(f"metric '{it['name']}': {it['issues'][-1]}")
+
     # Blank groups read as 0 (seen 2026-11-18): a constant times a blank operand evaluates as 0 in Mosaic, so
     # 100 * [ratio] reads 0 where the ratio is blank. Compare each derived metric's groups with its operands'
     # (read here when the probe list left them out), and with the previous round's probe of the same metric.
@@ -1667,7 +1730,8 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
     return {"version": 4, "model": model, "generated": time.strftime("%Y-%m-%d"), "anchor": anchor,
             **({"cross_check": cc_summary} if cross_check else {}),
             "total_rows": total, "entities": ent_total,
-            "filter": {"attribute": filt or None, "value": filt_value, "rows": filt_rows, "entities": ent_filtered},
+            "filter": {"attribute": filt or None, "value": filt_value, "sent": filt_sql or None, "rows": filt_rows,
+                       "entities": ent_filtered, **({"error": filter_error[:300]} if filter_error else {})},
             "partner": partner or None, "gaps": gaps, "pending_queries": pending,
             "attributes": attr_out, "metrics": met_out, "warnings": warnings,
             "notes": ["Each object is checked in several query shapes (alone, filtered, with a second attribute) "
@@ -4283,6 +4347,62 @@ def attribute_subquery_lint(sql: str) -> list[str]:
             f"subquery"]
 
 
+_SHIFT_DIVIDE = re.compile(r"/\s*(lag|lead)\s+over\b", re.I)   # in _top_level text: the call's parentheses are gone
+_SHIFT_OVER = re.compile(r"\b(lag|lead)\s+over\b", re.I)
+
+
+def window_shift_lint(sql: str) -> list[str]:
+    """LAG / LEAD in Mosaic (verified live 2026-11-23): a missing neighbouring row reads 0, not blank, so
+    x / LAG(x) - 1 reads -1 for the first period (two models); and in a grouped query filtered on an attribute it
+    doesn't select, the window brought back the groups the filter removed, blank (one model: a month grouped, a day
+    filtered; the same query without the window returned only the filtered months). A shift inside a FROM
+    subquery whose outer query filters its rows is the recommended shape and is not warned."""
+    text = _SQL_LITERAL.sub("''", sql or "")
+    outer_filters = bool(re.search(r"\bwhere\b", _top_level(text), re.I))
+    blocks = [(text, False)] + [(text[a:b], outer_filters) for a, b in _from_subqueries(text)]
+    divides, filtered = False, []
+    for block, trimmed in blocks:
+        own = _top_level(block)
+        if trimmed or not _SHIFT_OVER.search(own):
+            continue
+        divides = divides or bool(_SHIFT_DIVIDE.search(own))
+        where = re.search(r"\bwhere\b(.*?)(\bgroup\s+by\b|$)", own, re.I | re.S)
+        select = re.search(r"\bselect\b(.*?)\bfrom\b", own, re.I | re.S)
+        if where and select and re.search(r"\bgroup\s+by\b", own, re.I):
+            chosen = {c.lower() for c in re.findall(r'"([^"]+)"', select.group(1))}
+            filtered += [c for c in re.findall(r'"([^"]+)"', where.group(1)) if c.lower() not in chosen]
+    out = []
+    if divides:
+        out.append("it divides by LAG(...) / LEAD(...): Mosaic reads a missing previous (next) row as 0, so the first "
+                   "(last) period's change reads -1 instead of blank. Take the shifted value in a subquery and divide "
+                   "by NULLIF(<it>, 0) in the outer query, or filter that period out there")
+    if filtered:
+        out.append(f"it uses LAG / LEAD in a grouped query filtered on {', '.join(repr(c) for c in dict.fromkeys(filtered))}, "
+                   f"which it doesn't select: Mosaic can bring back the groups the filter removes, blank (seen on one "
+                   f"model). Group and shift in a subquery, and filter its rows in the outer query")
+    return out
+
+
+_NTILE_OVER = re.compile(r"\bntile\s*\([^()]*\)\s*over\s*\(", re.I)
+
+
+def ntile_lint(sql: str) -> list[str]:
+    """NTILE(...) OVER (ORDER BY a, b) fails in Mosaic: "The NTILE function only supports ordering by one metric"
+    (seen live 2026-11-23). Order by one column; break ties in a ROW_NUMBER instead."""
+    text = _SQL_LITERAL.sub("''", sql or "")
+    for m in _NTILE_OVER.finditer(text):
+        depth, j = 1, m.end()
+        while j < len(text) and depth:
+            depth += {"(": 1, ")": -1}.get(text[j], 0)
+            j += 1
+        over = text[m.end():j - 1]
+        order = re.search(r"\border\s+by\b(.*)$", over, re.I | re.S)
+        if order and len([x for x in _split_top(order.group(1)) if x.strip()]) > 1:
+            return ["NTILE(...) OVER (ORDER BY ...) orders by more than one column, which Mosaic refuses (\"The NTILE "
+                    "function only supports ordering by one metric\"): order it by one column"]
+    return []
+
+
 def _mentions(text: str, name: str) -> bool:
     """The query names this column, quoted ("name") or, for a one-word name, bare."""
     low = text.lower()
@@ -4327,7 +4447,8 @@ def _sql_lint(sql: str, shifted: dict[str, dict] | None = None) -> list[str]:
            f"forms), or compute the expression in the subquery's SELECT (e.g. YEAR(MAX(<date>)) AS vintage) and "
            f"group the outer query by that column"] if bad else []
     return (out + form_group_by_lint(sql) + time_shift_sql_lint(sql, shifted) + avg_decimal_lint(sql)
-            + compound_filter_lint(sql, (shifted or {}).get(COMPOUNDS_KEY)) + attribute_subquery_lint(sql))
+            + compound_filter_lint(sql, (shifted or {}).get(COMPOUNDS_KEY)) + attribute_subquery_lint(sql)
+            + ntile_lint(sql) + window_shift_lint(sql))
 
 
 def output_columns(sql: str) -> list[str | None] | None:
@@ -4829,6 +4950,38 @@ def compound_formula_problem(formula: str) -> str | None:
     """Why build_mosaic.py create-compound-metric would refuse this formula (syntax only), or None."""
     import build_mosaic   # the command's own parser; imported here to keep assess_model's start-up light
     return build_mosaic.compound_formula_problem(formula)
+
+
+_DISPLAY_AGG = re.compile(r"\b(sum|avg|average|count|min|max|median|stdev|var)\s*\(", re.I)
+
+
+def compound_from_display(formula: str) -> str:
+    """A derived metric's formula as get_semantics shows it (Sum({Sales}) / Count(Order (ID)) * 100), in the
+    syntax create-compound-metric reads: each aggregate call and each {metric} becomes one [operand], so the
+    constant and blank checks can read the model's own metrics. '' when there is nothing to read."""
+    out: list[str] = []
+    labels: dict[str, str] = {}
+    i, text = 0, formula or ""
+    while i < len(text):
+        m = _DISPLAY_AGG.match(text, i) if (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")) else None
+        if m:
+            depth, j = 0, m.end() - 1
+            while j < len(text):
+                depth += {"(": 1, ")": -1}.get(text[j], 0)
+                if depth == 0:
+                    break
+                j += 1
+            if depth:
+                return ""
+            call = re.sub(r"\s+", "", text[i:j + 1]).lower()   # the same call twice is the same operand
+            labels.setdefault(call, f"[operand {len(labels) + 1}]")
+            out.append(labels[call])
+            i = j + 1
+            continue
+        out.append(text[i])
+        i += 1
+    converted = re.sub(r"\{([^{}]+)\}", r"[\1]", "".join(out))
+    return converted if "[" in converted else ""
 
 
 def compound_constant_warnings(formula: str) -> list[str]:

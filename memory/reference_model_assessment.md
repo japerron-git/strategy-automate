@@ -191,9 +191,40 @@ Aggregates of fact metrics run on the fact. So:
     or `AVG(n)` (3 decimals shown), never `AVG(1.0 * n)` (`check` warns, `run` flags); a ratio of summed
     integer or decimal metrics is `1.0 * SUM(a) / SUM(b)`. Arithmetic is safe around summed metrics only: for a
     non-sum metric, read each aggregate plain and divide afterwards.
-- Models with several fact tables (user guidance, not yet tested here): a metric present in several
-  facts can be steered to one fact by adding a hint metric from that fact to the query; use one anchor
-  per fact table, and say in descriptions which hint metric to add.
+- **Models with several fact tables** (verified live 2026-11-23 on one model with four facts; user guidance
+  before that): a metric present in several facts can be steered to one fact by adding a hint metric from that
+  fact to the query; count each fact with its own anchor.
+  - An attribute with no join path to a fact shows in one of two ways when that fact's metric is grouped by it:
+    the query fails with "The number of intermediate rows ... exceeds the maximum number of intermediate rows
+    50000000" (a large fact), or every group returns the fact's full total with no error (a smaller fact: one
+    count repeated in every month). A query that counts several facts at once fails as a whole when any of them
+    can't reach the grouped attribute, so reach is tested one fact at a time.
+  - An attribute that reaches a fact only through a shared parent (a many-to-many path) repeats its rows: the
+    groups add up to several times the fact's total. `probe` reports both shapes ("a cross join", "rows repeat")
+    and says when an attribute could not be checked against the anchor, and why.
+  - A filter on a shared attribute, with metrics of several facts grouped by an entity, lists every entity the
+    attribute's lookup has: the entities the filter leaves without data come back with blank metrics (178 of
+    203 rows). `grade` leaves all-blank rows out; a ratio times a constant reads 0 there (§0f in
+    `reference_mosaic_derived_metrics.md`).
+  - A filter on a calendar attribute can be ignored with no error (a year filter returned both years' totals,
+    on two facts) while grouping by it works: a relationship missing between it and the date the facts join
+    through. `join-paths` tests this filter for every attribute.
+- **A DATE attribute compared with a quoted text fails** ("Cannot apply operator: date = varchar(10)"): write
+  `DATE 'yyyy-mm-dd'` (`TIMESTAMP '...'` for a timestamp). `probe` and `join-paths` write typed literals.
+- **Window functions** (verified live 2026-11-23):
+  - LAG / LEAD read a missing neighbouring row as 0, not blank, so `x / LAG(x) - 1` reads -1 for the first period
+    (two models). Take the shifted value in a subquery and divide by `NULLIF(<it>, 0)` in the outer query (that
+    read blank for the first period), or filter the first period out there.
+  - In a grouped query filtered on an attribute it doesn't select (months grouped, a day range filtered), LAG
+    brought back the months the filter removed, blank; the same query without LAG returned only the filtered
+    months (one model; a filter on another attribute of a second model's same lookup did not show it). Group and
+    shift in a subquery, filter its rows in the outer query.
+  - `NTILE(n) OVER (ORDER BY a, b)` fails: "The NTILE function only supports ordering by one metric". Order by one
+    column.
+  - Seen once, not reproduced: a governed rate metric summed in a subquery under `ROW_NUMBER() OVER (PARTITION BY
+    ...)` failed with "IMDB Partition Logic Exception: Invalid Index"; the same query with the rate's two counts
+    divided outside ran.
+  - `check --bank` warns on the divide, the filtered window and NTILE (`window_shift_lint`, `ntile_lint`).
 
 **Replies don't outlive a model change.** A replay folder's replies answer the SQL as the model was when
 they were saved; after a source rebuild or a reload the same SQL can give other rows. Use a new folder each

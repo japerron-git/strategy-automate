@@ -129,6 +129,9 @@ each numeric attribute, and names the role the evidence points to:
 - **measure** — continuous values held only as an attribute (`add_column_fact_metric` adds a fact metric on
   the same column, in phase 3);
 - **review** — a small integer range the names don't explain: check the dictionary.
+- **average** — a count with fractions (for example 1.4 lines per order on each row), summed: an average or a
+  ratio stored per row, so the Sum adds up averages. Average it (`patch_fact_metrics`), or rebuild it from its
+  parts as a weighted average.
 - **constant** — one value on every non-blank row (most often all zero): no role can be read from it in this
   data; say so in its description (`rename_describe`), and whether the source fills it elsewhere.
 
@@ -149,7 +152,12 @@ common defects show only in some shapes: rows lost once a filter or second attri
 in a lookup, numeric attributes read from their lookup, metrics whose value changes when wrapped in
 CAST, depends on the query's shape, or ignores a filter that drops most entities, one value in every
 group, summed metrics whose groups don't add up, metrics on a lookup table, gaps in a partner's periods,
-latest-only metrics that don't say so. Each confirmed warning is a finding. After a phase, probe only what it touched:
+latest-only metrics that don't say so, rows that repeat (each value gets the fact's full total: a cross join;
+or the groups add up to a multiple of it: a many-to-many path), and compound metrics whose formula multiplies
+or adds over a value that can be blank (read from the formula, no query). A shape it could not check (an
+error, often "too many intermediate rows" when the attribute doesn't reach the anchor's fact) is a warning that
+says why, and a filter that fails (a date compared with text) is reported once. Each confirmed warning is a
+finding. After a phase, probe only what it touched:
 `--changed-since <previous scope.json> --findings findings.json --phases <N>`.
 
 ### 1b4. Join paths → `join_paths.json`

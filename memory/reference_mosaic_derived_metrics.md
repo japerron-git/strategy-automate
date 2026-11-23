@@ -404,6 +404,11 @@ inside a ratio; wrapping that metric in ZeroToNull avoids the defect. `create-co
 `ZeroToNull(...)` and `NullToZero(...)` (tree function `zero_to_null`, verified: read back as
 `ZeroToNull({...})`), and `check --findings` warns on the other shapes.
 
+Seen again 2026-11-23 on a third, unrelated model (a ratio of two sums times 100, a multi-fact query grouped by
+an entity under a filter): every entity the filter left without data read 0, not blank, while the same ratio
+without the constant read blank. `probe` now applies these rules (and rule 3b's `+` / `-`) to the model's own
+compound metrics, from their formulas as `get_semantics` shows them (`compound_from_display`), with no query.
+
 ## 1. Compound metric — ratio of two metrics
 
 User example: `Avg({Competitor Lowest Price USD}) / Avg({Market Average Price USD})`.
