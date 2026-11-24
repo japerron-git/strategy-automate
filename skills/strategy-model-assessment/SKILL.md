@@ -65,7 +65,7 @@ command again until nothing is pending (exit code 3 means "replies still needed"
 
 ```bash
 python3 $REPO/skills/strategy-model-assessment/scripts/assess_model.py scope \
-  --project "<project>" --model "<model>" --out scope.json
+  --project "<project>" --model "<model>" [--model-export export.json] --out scope.json
 ```
 
 Records every attribute and metric (type, description, formula) from `get_semantics`, and profiles
@@ -80,6 +80,14 @@ that counts or conditions on fact rows — data checks, best answers, question S
 `COUNT(<anchor>)` or `COUNT(CASE WHEN <condition> THEN <anchor> END)` and sums a fact metric, never
 `COUNT(*)`, `SUM(CASE ... THEN 1)` or an aggregate of an attribute
 (`memory/reference_model_assessment.md`, "Which rows a query reads").
+
+With **several fact tables**, `scope` also writes `facts` (one per real fact: its anchor, rows, the dates
+that reach it, its period, its row id), `dimension_tables` (tables that carry a metric but describe an
+entity: not anchors), `reach` (per attribute and fact: reaches, not_reached, cross_join, many_to_many,
+no_path) and `entity` (an attribute that reaches the most facts, never a row id). Reach comes from the
+model export (`--model-export`, offline) or, without it, from one query per fact and attribute (`--no-reach`
+skips them). `relationships`, `roles`, `probe` and `join-paths` read them: each attribute and metric is checked
+against a fact it reaches. See "Models with several fact tables" in the memory note.
 
 `scope` also writes a **maturity estimate** (M0 raw build → M4 analyst-ready) from names,
 descriptions, formulas and profiles: default names, metrics that look like attributes (IDs or codes
@@ -156,8 +164,11 @@ latest-only metrics that don't say so, rows that repeat (each value gets the fac
 or the groups add up to a multiple of it: a many-to-many path), and compound metrics whose formula multiplies
 or adds over a value that can be blank (read from the formula, no query). A shape it could not check (an
 error, often "too many intermediate rows" when the attribute doesn't reach the anchor's fact) is a warning that
-says why, and a filter that fails (a date compared with text) is reported once. Each confirmed warning is a
-finding. After a phase, probe only what it touched:
+says why, and a filter that fails (a date compared with text) is reported once. Each calendar attribute
+(year, quarter, month, week, day, date, period) is also filtered on one value and compared with that value's
+group: an ignored filter is a finding with join-paths' id (`J-filter-<attribute>`; `--no-calendar-filters`
+skips it). `--cross-check [N]` asks the full value lists of a sample (default 8, flagged attributes first) to
+compare with the one-row checks. Each confirmed warning is a finding. After a phase, probe only what it touched:
 `--changed-since <previous scope.json> --findings findings.json --phases <N>`.
 
 ### 1b4. Join paths → `join_paths.json`

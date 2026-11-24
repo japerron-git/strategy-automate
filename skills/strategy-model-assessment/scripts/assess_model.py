@@ -526,7 +526,7 @@ def _profile_rows(runner: Runner, project: str, model: str, names: list[str], wh
 
 def scope_model(runner: Runner, project: str, model: str, *, profile: bool = True, where: str = "",
                 sample_max: int = 30, max_attributes: int = 200, profile_batch: int = 8,
-                reuse_from: dict | None = None,
+                reuse_from: dict | None = None, export: dict | None = None, reach: bool = True,
                 log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
     sem_result = runner.call("get_semantics", {"project": project, "model": model})
     if sem_result.get("isError"):
@@ -543,6 +543,8 @@ def scope_model(runner: Runner, project: str, model: str, *, profile: bool = Tru
                                                              if not m["description"]]}}
     if not profile:   # no attribute profiles, but still the anchor (one cheap COUNT query per eight metrics)
         out["anchor"] = choose_anchor(runner, project, model, semantics["metrics"], where, profile_batch)
+        out.update(fact_structure(runner, project, out, export=export, where=where, reach=reach and bool(export),
+                                  log=log))
         out["maturity"] = maturity_signals(out)
         return out
     # a time attribute's __start timestamp holds the same periods as its __id: not profiled (saves replay queries)
@@ -572,6 +574,11 @@ def scope_model(runner: Runner, project: str, model: str, *, profile: bool = Tru
     if skipped > 0:
         out["notes"]["unprofiled_attributes"] = skipped
     out["anchor"] = choose_anchor(runner, project, model, semantics["metrics"], where, profile_batch)
+    reused = reuse_fact_structure(out, reuse_from) if reuse_from and not export else None
+    out.update(reused or fact_structure(runner, project, out, export=export, where=where, reach=reach, log=log))
+    if out.get("reach_waiting"):   # replay: the period test needs the entity, which needs reach
+        out["maturity"] = maturity_signals(out)
+        return out
     prev = (reuse_from or {}).get("period") if isinstance(reuse_from, dict) else None
     if prev and prev.get("kind") in ("snapshot", "event", "mixed") and prev.get("attribute") == guess_period(out):
         period = {**prev, "reused": True}   # a metric-only round doesn't change which periods each entity has
@@ -1075,6 +1082,7 @@ PROBE_MAX_VALUES = 200
 # the connector's error when a query needs more joined rows than it allows; across fact tables it is the sign of no
 # join path between the attribute and the fact (seen 2026-11-23: a 4-fact model, attributes of one fact)
 _NO_PATH_ERROR = re.compile(r"intermediate rows", re.I)
+PROBE_CROSS_CHECK_SAMPLE = 8   # attributes probe --cross-check asks the full value lists of (item 32 / 75)
 PROBE_GROUP_LIMIT = 1_000_000   # the ORDER BY ... LIMIT barrier in probe's one-row checks; reaching it = too many groups
 _NONBLANK_V = "v IS NOT NULL AND TRIM(v) <> '' AND LOWER(TRIM(v)) NOT IN ('null', 'none')"   # _blank, in SQL
 _LATEST_WORDS = re.compile(r"\b(latest|current period|as of|point in time|most recent)\b", re.I)
@@ -1335,13 +1343,38 @@ def _probe_cross_check(ask, rows_of, M: str, N: str, A: str, base: str, fcond: s
     return {"agree": not diffs, "differences": diffs, "one_row": one_row, "lists": lists}
 
 
+_COUNT_REF = re.compile(r"count\s*(?:<[^>]*>)?\s*\(\s*(?:[{\[]([^}\]]+)[}\]]|([^(){}\[\]]+?)\s*(?:\(([^()]*)\))?\s*\))", re.I)
+
+
+def _metric_fact_key(name: str, mets_by: dict[str, dict], attrs_by: dict[str, dict], scope: dict,
+                     depth: int = 0) -> str | None:
+    """The table (casefolded) a metric's rows come from: its own for a raw metric; for a derived one, the one
+    table its operands read, else the largest fact the attribute it counts reaches ('Count(Order (ID))').
+    None when that isn't one table."""
+    m = mets_by.get(name) or {}
+    t = _metric_table(m)
+    if t:
+        return t.casefold()
+    formula = m.get("formula") or ""
+    keys = {_metric_fact_key(o, mets_by, attrs_by, scope, depth + 1) for o in formula_operands(formula, list(mets_by))
+            if o != name} if depth < 4 else set()
+    for hit in _COUNT_REF.finditer(formula):
+        ref = (hit.group(1) or hit.group(2) or "").strip().casefold()
+        names = [a for a in attrs_by if _base_name(a) == ref or a.casefold() == ref]
+        reached = reached_facts(scope, names[0]) if names else None
+        keys.add(str(reached[0]["table"]).casefold() if reached else None)
+    return next(iter(keys)) if len(keys) == 1 else None
+
+
 def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list[str] | None = None,
                   metrics: list[str] | None = None, period: str = "", split: str = "", filter_spec: str = "",
                   where: str = "", max_values: int = PROBE_MAX_VALUES, batch: int = 6,
-                  previous: dict | None = None, cross_check: bool = False,
-                  log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
+                  previous: dict | None = None, cross_check: int = 0, calendar_filters: bool = True,
+                  round_no: int | None = None, log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
     model = scope["model"]
     anchor = (scope.get("anchor") or {}).get("metric")
+    asked_attributes = attributes is not None
+    cross_check = PROBE_CROSS_CHECK_SAMPLE if cross_check is True else int(cross_check or 0)
     if not anchor:
         raise SystemExit("probe: scope.json has no anchor metric; run scope again (it picks one)")
     entity = guess_entity(scope)
@@ -1361,24 +1394,28 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
 
     pending = 0
     warnings: list[str] = []
+    asked: dict[str, dict] = {}
 
-    def ask(sql: str) -> dict | None:
+    def ask(sql: str) -> dict | None:   # one answer per query in a run (several facts share checks)
         nonlocal pending
+        if sql in asked:
+            return asked[sql]
         try:
             parsed = parse_query_result(runner.call("query", {"project": project, "query": sql}))
         except PendingReply:
             pending += 1
             return None
+        asked[sql] = parsed
         return parsed
 
     def rows_of(res: dict | None) -> list[dict] | None:
         return res["rows"] if res and res["ok"] else None
 
-    def entities(where_sql: str, attribute: str = "") -> float | None:   # anchored: entities with fact rows
+    def entities(where_sql: str, attribute: str = "", anchor_q: str = "") -> float | None:   # entities with fact rows
         if not (attribute or entity):
             return None
         E = quote_ident(attribute or entity)
-        sql = f"SELECT CAST(COUNT(*) AS VARCHAR) AS n FROM (SELECT {E} AS e_ FROM {M}{where_sql} GROUP BY 1 HAVING COUNT({A}) > 0) t"  # nosec B608  # identifiers are quoted; the connector is read-only
+        sql = f"SELECT CAST(COUNT(*) AS VARCHAR) AS n FROM (SELECT {E} AS e_ FROM {M}{where_sql} GROUP BY 1 HAVING COUNT({anchor_q or A}) > 0) t"  # nosec B608  # identifiers are quoted; the connector is read-only
         r = rows_of(ask(sql))
         return _num(r[0].get("n")) if r else None
 
@@ -1421,6 +1458,35 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             warnings.append(f"attribute '{partner}': grouping by it alone loses fact rows; not used as a partner")
             partner = ""
 
+    # Several facts (scope.json `facts` and `reach`): each attribute is checked against the largest fact it reaches,
+    # and the filter and partner are used only where they reach that fact (item 71). One fact: the model's anchor.
+    facts = scope.get("facts") or []
+    multi = len(facts) > 1 and bool(scope.get("reach"))
+    fact_by_table = {str(f["table"]).casefold(): f for f in facts}
+    dim_by_table = {str(d["table"]).casefold(): d for d in scope.get("dimension_tables") or []}
+
+    def total_of(anchor_name: str, _total: float | None = total) -> float | None:
+        if anchor_name == anchor:
+            return _total
+        r = rows_of(ask(f"SELECT CAST(COUNT({quote_ident(anchor_name)}) AS VARCHAR) AS n FROM {M}{base}"))  # nosec B608
+        return _num(r[0].get("n")) if r else None
+
+    def filtered_rows(anchor_name: str, _fcond: str = fcond, _rows: float | None = filt_rows) -> float | None:
+        if anchor_name == anchor:
+            return _rows
+        r = rows_of(ask(f"SELECT CAST(COUNT({quote_ident(anchor_name)}) AS VARCHAR) AS n FROM {M}{_fcond}"))  # nosec B608
+        return _num(r[0].get("n")) if r else None
+
+    def fits(attribute: str, table: str, *, strict: bool = False) -> bool:   # may the attribute group this table?
+        if not attribute or not multi:
+            return bool(attribute)
+        verdict = reach_of(scope, attribute, table)
+        return verdict == "reaches" or (verdict is None and not strict)
+
+    def fact_of_attribute(n: str) -> dict | None:
+        reached = reached_facts(scope, n) if multi else None
+        return reached[0] if reached else None
+
     # gaps: periods with no fact rows inside a partner value's range (a deal-month missing from the data)
     gaps: list[dict[str, Any]] = []
     if partner and period and partner != period:
@@ -1442,10 +1508,29 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
                                     f"{' …' if len(missing) > 6 else ''}, inside its range (missing data, or a load gap)")
 
     attr_out = []
+    later: dict[str, tuple] = {}
     for n in [x for x in attributes if x in attrs_by]:
         log(f"probe attribute {n}")
         a, N = attrs_by[n], quote_ident(n)
         item: dict[str, Any] = {"name": n, "issues": [], "shapes": {}}
+        fact = fact_of_attribute(n)
+        if multi and fact is None and reached_facts(scope, n) == []:   # scope's reach: no fact to check it against
+            item["not_checked"] = {"all": "reaches none of the fact tables (scope.json reach)"}
+            warnings.append(f"attribute '{n}': reaches none of the fact tables (scope.json reach): not checked")
+            attr_out.append(item)
+            continue
+        anchor_n = fact["anchor"] if fact else anchor
+        A_n = quote_ident(anchor_n)
+        total_n = total_of(anchor_n)
+        if fact and anchor_n != anchor:
+            item["anchor"] = anchor_n
+        f_ok = bool(fcond) and (fact is None or fits(filt, fact["table"]))
+        p_ok = bool(partner) and (fact is None or fits(partner, fact["table"]))
+        fcond_n = fcond if f_ok else ""
+        partner_n = partner if p_ok else ""
+        for label, wanted, ok in (("filtered", filt, f_ok), ("grouped with", partner, p_ok)):
+            if wanted and not ok and n != wanted:
+                item.setdefault("not_asked", {})[label] = f"'{wanted}' doesn't reach {fact['table'] if fact else 'its fact'}"
         # Each check is one row: the connector sums and counts the groups, so a replayed reply is never a long value
         # list (item 32). The ORDER BY ... LIMIT barrier is needed: without it an outer aggregate over an
         # attribute-only GROUP BY is pushed down and misreads (COUNT(*) read 1 on one tenant and the fact's row count
@@ -1455,23 +1540,23 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
                                f"(SELECT {V.format(col=N)} FROM {M}{base} GROUP BY 1 ORDER BY 1 LIMIT {PROBE_GROUP_LIMIT}) t"))
         alone_res = ask(f"SELECT CAST(COUNT(*) AS VARCHAR) AS groups, CAST(COUNT(CASE WHEN n > 0 AND {_NONBLANK_V} "  # nosec B608
                         f"THEN 1 END) AS VARCHAR) AS with_rows, CAST(SUM(n) AS VARCHAR) AS kept FROM (SELECT "
-                        f"{V.format(col=N)}, COUNT({A}) AS n FROM {M}{base} GROUP BY 1 ORDER BY 1 LIMIT {PROBE_GROUP_LIMIT}) t")
+                        f"{V.format(col=N)}, COUNT({A_n}) AS n FROM {M}{base} GROUP BY 1 ORDER BY 1 LIMIT {PROBE_GROUP_LIMIT}) t")
         alone_r = rows_of(alone_res)
-        shapes = [("alone", alone_res, total)]
-        if fcond and n != filt and not filter_error:
+        shapes = [("alone", alone_res, total_n)]
+        if fcond_n and n != filt and not filter_error:
             sql = (f"SELECT CAST(COUNT(*) AS VARCHAR) AS groups, CAST(SUM(n) AS VARCHAR) AS kept FROM (SELECT "  # nosec B608
-                   f"{V.format(col=N)}, COUNT({A}) AS n FROM {M}{fcond} GROUP BY 1 ORDER BY 1 LIMIT {PROBE_GROUP_LIMIT}) t")
-            shapes.append((f"filtered to {filt} = {filt_value}", ask(sql), filt_rows))
-        if partner and n != partner:
+                   f"{V.format(col=N)}, COUNT({A_n}) AS n FROM {M}{fcond} GROUP BY 1 ORDER BY 1 LIMIT {PROBE_GROUP_LIMIT}) t")
+            shapes.append((f"filtered to {filt} = {filt_value}", ask(sql), filtered_rows(anchor_n)))
+        if partner_n and n != partner:
             P = quote_ident(partner)
             sql = (f"SELECT CAST(COUNT(*) AS VARCHAR) AS groups, CAST(SUM(n) AS VARCHAR) AS kept FROM (SELECT "  # nosec B608
-                   f"CAST({P} AS VARCHAR) AS p, {V.format(col=N)}, COUNT({A}) AS n FROM {M}{base} GROUP BY 1, 2 "
+                   f"CAST({P} AS VARCHAR) AS p, {V.format(col=N)}, COUNT({A_n}) AS n FROM {M}{base} GROUP BY 1, 2 "
                    f"ORDER BY 1, 2 LIMIT {PROBE_GROUP_LIMIT}) t")
-            shapes.append((f"grouped with {partner}", ask(sql), total))
+            shapes.append((f"grouped with {partner}", ask(sql), total_n))
         def not_checked(label: str, res: dict) -> None:   # nothing was checked in this shape: say so, and why
             err = str(res.get("error") or "no rows")
             item.setdefault("not_checked", {})[label] = err[:300]
-            text = (f"{label}: not checked against '{anchor}' ({err[:120]})"
+            text = (f"{label}: not checked against '{anchor_n}' ({err[:120]})"
                     + ("; too many intermediate rows usually means no join path from this attribute to the anchor's "
                        "fact table: check it against a fact it reaches" if _NO_PATH_ERROR.search(err) else ""))
             warnings.append(f"attribute '{n}': {text}")
@@ -1505,10 +1590,10 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
                 if filled >= 2 and abs(times - round(times)) < 1e-9 and round(times) == round(filled):
                     item["issues"].append(f"{label}: each of its {filled:,.0f} values gets all {expected:,.0f} fact rows "
                                           f"({kept:,.0f} in all): a cross join, no join path from it to the fact table "
-                                          f"of '{anchor}'. Its metrics repeat the full total in every group")
+                                          f"of '{anchor_n}'. Its metrics repeat the full total in every group")
                 else:
                     item["issues"].append(f"{label}: its groups hold {kept:,.0f} rows for {expected:,.0f} fact rows "
-                                          f"({times:.1f}x): rows repeat, so the fact of '{anchor}' reaches it through a "
+                                          f"({times:.1f}x): rows repeat, so the fact of '{anchor_n}' reaches it through a "
                                           f"many-to-many path and its metrics are counted more than once per group")
         listed = _num(listed_r[0].get("listed")) if listed_r else None
         with_rows = _num(alone_r[0].get("with_rows")) if alone_r else None
@@ -1516,7 +1601,7 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             only_lookup: list[str] = []
             if listed > with_rows:   # some listed values have no fact rows: list both to name them
                 listing = rows_of(ask(f"SELECT {V.format(col=N)} FROM {M}{base} GROUP BY 1"))  # nosec B608  # attribute only: the lookup
-                alone = rows_of(ask(f"SELECT {V.format(col=N)}, CAST(COUNT({A}) AS VARCHAR) AS n FROM {M}{base} GROUP BY 1"))  # nosec B608
+                alone = rows_of(ask(f"SELECT {V.format(col=N)}, CAST(COUNT({A_n}) AS VARCHAR) AS n FROM {M}{base} GROUP BY 1"))  # nosec B608
                 if listing is not None and alone is not None:
                     with_data = {str(r.get("v")) for r in alone if (_num(r.get("n")) or 0) > 0 and not _blank(r.get("v"))}
                     only_lookup = sorted({str(r.get("v")) for r in listing if not _blank(r.get("v"))} - with_data)
@@ -1527,32 +1612,101 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
                 shown = ", ".join(only_lookup[:12]) + (f" and {len(only_lookup) - 12} more" if len(only_lookup) > 12 else "")
                 count = len(only_lookup) if listed_r and not only_lookup[0].startswith("(") else listed - with_rows
                 item["issues"].append(f"{count:,.0f} value(s) only in its lookup (listed, but no fact rows): {shown}")
-        if cross_check:
-            item["cross_check"] = _probe_cross_check(ask, rows_of, M, N, A, base, fcond, partner, n, filt, item,
-                                                     listed, with_rows)
-            if not item["cross_check"]["agree"]:
-                warnings.append(f"attribute '{n}': cross-check: the one-row checks and the full lists disagree "
-                                f"({'; '.join(item['cross_check']['differences'])}): send probes.json to the dev chat")
+        if cross_check:   # asked after the loop, for a sample: flagged attributes first
+            later[n] = (N, A_n, fcond_n, partner_n, listed, with_rows)
         if (a.get("type") or "").lower() in _NUMERIC and not _CODE_LIKE.search(_words(n)) \
-                and not looks_like_integer_date(a) and total:
+                and not looks_like_integer_date(a) and total_n:
             cr = rows_of(ask(f"SELECT CAST(COUNT({N}) AS VARCHAR) AS n FROM {M}{base}"))  # nosec B608
             counted = _num(cr[0].get("n")) if cr else None
             item["count_over_attribute"] = counted
-            if counted is not None and counted < 0.5 * total:
+            if counted is not None and counted < 0.5 * total_n:
                 item["issues"].append(f"numeric attribute read from its lookup: COUNT over it gives {counted:,.0f}, the "
-                                      f"fact has {total:,.0f} rows, so AVG or SUM over it averages the lookup's values")
+                                      f"fact has {total_n:,.0f} rows, so AVG or SUM over it averages the lookup's values")
         warnings += [f"attribute '{n}': {x}" for x in item["issues"]]
         attr_out.append(item)
+
+    # item 32 / 75: the full value lists (the old way) for a sample, next to the one-row checks. Attributes the
+    # one-row checks flagged (lookup-only values, lost rows) first, then clean ones, in the probe's order.
+    sampled: list[str] = []
+    if cross_check:
+        def flagged(it: dict) -> bool:
+            return bool(it.get("lookup_only_values")) or any("lost" in x for x in it["issues"])
+        order = [it for it in attr_out if it["name"] in later]
+        sample = ([it for it in order if flagged(it)] + [it for it in order if not flagged(it)])[:max(cross_check, 0)]
+        for it in sample:
+            N_s, A_s, fcond_s, partner_s, listed_s, with_rows_s = later[it["name"]]
+            it["cross_check"] = _probe_cross_check(ask, rows_of, M, N_s, A_s, base, fcond_s, partner_s, it["name"],
+                                                   filt, it, listed_s, with_rows_s)
+            sampled.append(it["name"])
+            if not it["cross_check"]["agree"]:
+                warnings.append(f"attribute '{it['name']}': cross-check: the one-row checks and the full lists disagree "
+                                f"({'; '.join(it['cross_check']['differences'])}): send probes.json to the dev chat")
+
+    # item 74: a calendar attribute whose filter is ignored (WHERE year = 2025 returned both years, seen
+    # 2026-11-23) is caught only by a filter test; join-paths has one, but it is often skipped for cost. Here each
+    # calendar attribute (year, quarter, month, week, day, date, period) is filtered on one value against a fact
+    # it reaches (two queries). An ignored filter is join-paths' finding, same id.
+    calendar: dict[str, Any] = {}
+    findings: list[dict] = []
+    if calendar_filters:
+        wanted = {_base_name(x) for x in attributes} if asked_attributes else None
+        for t in _testable_attributes(scope, None):
+            if not _CALENDAR_NAME.search(_words(t["attribute"])) or (wanted is not None and t["attribute"] not in wanted):
+                continue
+            if (_distinct(attrs_by.get(t["name"]) or {}) or 0) < 2 or t["name"].casefold().endswith("__start"):
+                continue
+            fact = fact_of_attribute(t["name"])
+            if multi and fact is None and reached_facts(scope, t["name"]) == []:
+                continue
+            anchor_c = fact["anchor"] if fact else anchor
+            log(f"probe calendar filter {t['name']}")
+            res = filter_check(ask, model, t["name"], t["type"], anchor_c, where)
+            if res is None:
+                continue
+            calendar[t["name"]] = res
+            if res.get("verdict") in ("ignored", "mismatch"):
+                findings.append(filter_finding(t["name"], [res], round_no=round_no, source="probe"))
+                warnings.append(f"attribute '{t['name']}': a filter on it alone "
+                                f"{'is ignored' if res['verdict'] == 'ignored' else 'gives another count'}: "
+                                f"= {res.get('sent')} counts {res.get('filtered')} rows of '{anchor_c}', its group "
+                                f"holds {res.get('grouped')} (finding {findings[-1]['id']})")
 
     # Metrics are read plain, as analysts write them: wrapping an aggregate (CAST, ROUND, arithmetic) can bypass a
     # fact metric's own aggregation. The connector's thousands separators are parsed.
     anchor_table = _metric_table(mets_by.get(anchor) or {})
     met_out = []
     mnames = [n for n in metrics if n in mets_by]
-    queue = [mnames[i:i + max(batch, 1)] for i in range(0, len(mnames), max(batch, 1))]
+    # Several facts: each metric is checked with its own fact's anchor, and grouped or filtered only by attributes
+    # that reach its table (a fact's metric grouped by another fact's period repeats one value in every group). A
+    # query mixing two facts' metrics fails as a whole when one can't reach the grouping, so chunks keep one table.
+    keys = {n: _metric_fact_key(n, mets_by, attrs_by, scope) if multi else None for n in mnames}
+    by_key: dict[str | None, list[str]] = {}
+    for n in mnames:
+        by_key.setdefault(keys[n], []).append(n)
+    queue = [names[i:i + max(batch, 1)] for names in by_key.values() for i in range(0, len(names), max(batch, 1))]
+    model_wide = (period, filt, fcond, partner, filt_rows, ent_total, ent_filtered, total)
     while queue:
         chunk = queue.pop(0)
         log(f"probe {len(chunk)} metrics")
+        period, filt, fcond, partner, filt_rows, ent_total, ent_filtered, total = model_wide
+        A_c, mkey = A, keys[chunk[0]]
+        if mkey:
+            mfact, mdim = fact_by_table.get(mkey), dim_by_table.get(mkey)
+            tab = str((mfact or mdim or {}).get("table") or mkey)
+            strict = mfact is None   # a dimension table (or one scope doesn't know): only what is known to reach it
+            own_period = "" if strict else str((mfact or {}).get("period") or "")
+            new_period = period if fits(period, tab, strict=strict) else own_period
+            anchor_c = (mfact or {}).get("anchor") or anchor
+            A_c = quote_ident(anchor_c)
+            if fcond and not fits(filt, tab, strict=strict):
+                fcond, filt, filt_rows, ent_total, ent_filtered = "", "", None, None, None
+            elif fcond and anchor_c != anchor:
+                filt_rows = filtered_rows(anchor_c)
+                ent_total, ent_filtered = entities(base, "", A_c), entities(fcond, "", A_c)
+            if partner and not fits(partner, tab, strict=strict):
+                partner = ""
+            total = total_of(anchor_c)
+            period = new_period
         plain = ", ".join(f"SUM({quote_ident(n)}) AS m{i}" for i, n in enumerate(chunk))
         wrapped = ", ".join(f"CAST(SUM({quote_ident(n)}) AS VARCHAR) AS m{i}" for i, n in enumerate(chunk))
         tot_res = ask(f"SELECT {plain} FROM {M}{base}")  # nosec B608
@@ -1578,6 +1732,9 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             m = mets_by[n]
             key = f"m{i}"
             item = {"name": n, "issues": [], "filter": f"{filt} = {filt_value}" if fcond else None, "partner": partner or None}
+            if mkey:
+                item.update(fact=mkey, grouped_by={"period": period or None, "partner": partner or None},
+                            **({"anchor": anchor_c} if anchor_c != anchor else {}))
             if tot is None:
                 item["pending" if tot_res is None else "error"] = True
                 if tot_res is not None:   # the plain read analysts write first fails: say so, and what works instead
@@ -1641,7 +1798,7 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             counted = _counted_attribute(m.get("formula") or "", attrs_by)   # a count of an attribute's values:
             if fcond and t and f_total is not None and f_total == t and kept_share is not None \
                     and kept_share < 0.9 and len(filled_f) >= 2 and counted:   # its own share decides (seen live
-                c_all, c_kept = entities(base, counted), entities(fcond, counted)   # 2026-11-20: 2 customers kept
+                c_all, c_kept = entities(base, counted, A_c), entities(fcond, counted, A_c)   # 2026-11-20: 2 kept
                 if c_all and c_kept is not None:                                    # by a filter keeping 11% of
                     kept_share = c_kept / c_all                                     # the promotions)
                     item["notes"].append(f"counts '{counted}': the filter keeps {c_kept:g} of its {c_all:g} values")
@@ -1666,12 +1823,20 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
                 item["issues"].append("returns a value for one period only, and neither its name nor its description "
                                       "says it is a latest-period metric")
             table = _metric_table(m)
-            if table and anchor_table and table != anchor_table:
+            dim = dim_by_table.get(table.casefold()) if table else None
+            if facts and dim:   # scope told facts from tables that describe an entity: only those are warned
+                item["issues"].append(f"reads '{table}', a table that describes '{dim.get('key') or 'an entity'}' (one row "
+                                      f"each), not a fact: grouped by anything finer than that, or summed with a fact's "
+                                      f"rows, it repeats the entity's value or reads that table's rows. Say how to read "
+                                      f"it in its description (per {dim.get('key') or 'entity'}), or move it to the fact")
+            elif not facts and table and anchor_table and table != anchor_table:
                 item["issues"].append(f"reads table '{table}', not the fact table of the anchor ('{anchor_table}'): if "
                                       f"it is a lookup or mapping table, aggregating it reads that table's rows, not "
                                       f"the facts (fine if it is another fact table)")
             warnings += [f"metric '{n}': {x}" for x in item["issues"]]
             met_out.append(item)
+
+    period, filt, fcond, partner, filt_rows, ent_total, ent_filtered, total = model_wide
 
     # The model's own compound metrics, read offline: the constant and blank rules the plan check applies to new
     # ones (memory §0f, rule 3b). A ratio times 100 read 0 on every group with no data (seen 2026-11-23).
@@ -1710,7 +1875,8 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
                 continue
             hit = [str(g) for g, v in rows if v == 0 and all(ov.get(str(g)) is None for ov in op_vals)]
             if hit:
-                it["issues"].append(f"reads 0 in {len(hit)} group(s) of '{dims[dim]}' where {', '.join(repr(o) for o in ops)} "
+                label = (it.get("grouped_by") or {}).get(dim) or dims[dim]
+                it["issues"].append(f"reads 0 in {len(hit)} group(s) of '{label}' where {', '.join(repr(o) for o in ops)} "
                                     f"{'is' if len(ops) == 1 else 'are'} blank ({', '.join(hit[:5])}"
                                     f"{', ...' if len(hit) > 5 else ''}): a constant times a blank operand reads 0 in "
                                     f"Mosaic. Rebuild it so those groups stay blank, or say in its description that 0 "
@@ -1718,7 +1884,7 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
                 warnings.append(f"metric '{n}': {it['issues'][-1]}")
         changes = blank_zero_changes(it["groups"], (prev_items.get(n) or {}).get("groups") or {})
         if changes:
-            text = "; ".join(f"by '{dims[d]}' {', '.join(c[:5])}{', ...' if len(c) > 5 else ''}" for d, c in changes.items())
+            text = "; ".join(f"by '{(it.get('grouped_by') or {}).get(d) or dims[d]}' {', '.join(c[:5])}{', ...' if len(c) > 5 else ''}" for d, c in changes.items())
             it["issues"].append(f"blank and 0 changed places since the previous probe ({text}): a rewritten formula "
                                 f"changed how groups with no data read")
             warnings.append(f"metric '{n}': {it['issues'][-1]}")
@@ -1726,13 +1892,19 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
         checked = [a for a in attr_out if "cross_check" in a]
         cc_summary = {"attributes": len(checked), "agree": sum(1 for a in checked if a["cross_check"]["agree"]),
                       "with_lost_rows": sum(1 for a in checked if a["cross_check"]["lists"]["lost_rows"]),
-                      "with_lookup_only_values": sum(1 for a in checked if a["cross_check"]["lists"]["lookup_only"])}
-    return {"version": 4, "model": model, "generated": time.strftime("%Y-%m-%d"), "anchor": anchor,
+                      "with_lookup_only_values": sum(1 for a in checked if a["cross_check"]["lists"]["lookup_only"]),
+                      "sample_size": cross_check, "sampled": sampled,
+                      "note": "attributes the one-row checks flagged (lookup-only values, lost rows) first, then clean "
+                              "ones in probe order"}
+    return {"version": 5, "model": model, "generated": time.strftime("%Y-%m-%d"), "anchor": anchor,
             **({"cross_check": cc_summary} if cross_check else {}),
             "total_rows": total, "entities": ent_total,
             "filter": {"attribute": filt or None, "value": filt_value, "sent": filt_sql or None, "rows": filt_rows,
                        "entities": ent_filtered, **({"error": filter_error[:300]} if filter_error else {})},
             "partner": partner or None, "gaps": gaps, "pending_queries": pending,
+            **({"facts": [{"table": f["table"], "anchor": f["anchor"], "rows": total_of(f["anchor"])} for f in facts]}
+               if multi else {}),
+            **({"calendar_filters": calendar} if calendar else {}), "findings": findings,
             "attributes": attr_out, "metrics": met_out, "warnings": warnings,
             "notes": ["Each object is checked in several query shapes (alone, filtered, with a second attribute) "
                       "because the common defects only show in some of them.",
@@ -1893,7 +2065,10 @@ def _distinct(attr: dict) -> float | None:
 
 def guess_entity(scope: dict) -> str:
     """The attribute most likely to be the entity key: the most distinct values, preferring names
-    or descriptions that look like an identifier."""
+    or descriptions that look like an identifier. With several facts, scope's `entity` (one that reaches
+    them all, never a fact's row id)."""
+    if (scope.get("entity") or {}).get("attribute"):
+        return str(scope["entity"]["attribute"])
     attrs = [a for a in scope.get("attributes") or [] if _distinct(a)]
     if not attrs:
         return ""
@@ -1903,9 +2078,19 @@ def guess_entity(scope: dict) -> str:
     return max(attrs, key=rank)["name"]
 
 
+def share_a_fact(scope: dict, a: str, b: str) -> bool:
+    """With several facts, do two attributes reach a common one? A pair that doesn't is a cross join, not a
+    dependency (seen 2026-11-23). True when the scope doesn't say."""
+    ra, rb = reached_facts(scope, a), reached_facts(scope, b)
+    if ra is None or rb is None:
+        return True
+    return bool({f["table"] for f in ra} & {f["table"] for f in rb})
+
+
 def entity_pairs(scope: dict, entity: str) -> list[dict[str, Any]]:
     attrs = [a["name"] for a in scope.get("attributes") or [] if (_distinct(a) or 0) >= 2]
-    return [{"child": entity, "parent": n, "kind": "entity"} for n in attrs if n != entity] if entity in attrs else []
+    return [{"child": entity, "parent": n, "kind": "entity"} for n in attrs
+            if n != entity and share_a_fact(scope, entity, n)] if entity in attrs else []
 
 
 def candidate_pairs(scope: dict, *, entity: str = "", levels: dict[str, str] | None = None, max_pairs: int = 120,
@@ -1921,6 +2106,8 @@ def candidate_pairs(scope: dict, *, entity: str = "", levels: dict[str, str] | N
             if child == parent or _form_base(child) == _form_base(parent):
                 continue
             if levels and levels.get(child) and levels.get(parent) and levels[child] != levels[parent]:
+                continue
+            if not share_a_fact(scope, child, parent):
                 continue
             dc, dp = _distinct(attrs[child]) or 0, _distinct(attrs[parent]) or 0
             if dp > dc or dp > max_parent_values or (dp == dc and child > parent):
@@ -2403,6 +2590,370 @@ def reference_findings(changes: list[dict], usage: dict, round_no: int | None) -
     return out
 
 
+# ── several fact tables ──────────────────────────────────────────────────────────────────────
+# A model can hold several fact tables (sales, claims, tickets), and a table that describes an entity can carry a
+# metric too (a store's floor area, a product group's margin target). Each real fact gets its own anchor, period and reach:
+# an attribute that reaches one fact can't reach another, and then grouping that fact by it gives every group the
+# full total (a cross join), repeats rows (a many-to-many path through a third table) or fails with "too many
+# intermediate rows" (seen 2026-11-23). So checks are made against a fact the attribute reaches. Reach comes from
+# the model export when there is one (offline, no queries); without it, from one-row queries, one fact at a time:
+# a query reading several facts fails as a whole when one of them can't reach the grouped attribute.
+
+_CALENDAR_NAME = re.compile(r"\b(year|quarter|month|week|day|date|period|snapshot|as of|fiscal)\b", re.I)
+
+
+def _base_name(name: str) -> str:
+    """The attribute a connector name belongs to, casefolded: 'region__code' and 'region (code)' are 'region'."""
+    m = _FORM_NAME.match(name)
+    return (m.group("base") if m else name).casefold()
+
+
+def metric_tables(scope: dict) -> dict[str, dict[str, Any]]:
+    """Tables the raw fact metrics read, largest first: their metrics, their rows (the fullest metric's non-blank
+    rows, from scope's anchor counts) and their anchor (the model's anchor when it reads the table, else the
+    fullest metric, first in model order)."""
+    counts = (scope.get("anchor") or {}).get("counts") or {}
+    model_anchor = (scope.get("anchor") or {}).get("metric")
+    raw = set(raw_fact_metrics(scope.get("metrics") or []))
+    out: dict[str, dict[str, Any]] = {}
+    for m in scope.get("metrics") or []:
+        t = _metric_table(m) if m["name"] in raw else ""
+        if not t:
+            continue
+        e = out.setdefault(t.casefold(), {"table": t, "metrics": [], "rows": None, "anchor": None})
+        e["metrics"].append(m["name"])
+        c = _num(counts.get(m["name"]))
+        if c is not None and (e["rows"] is None or c > e["rows"]):
+            e["rows"], e["anchor"] = c, m["name"]
+    for e in out.values():
+        if model_anchor in e["metrics"]:
+            e["anchor"] = model_anchor
+        e["anchor"] = e["anchor"] or e["metrics"][0]
+    return dict(sorted(out.items(), key=lambda kv: -(kv[1]["rows"] or 0)))
+
+
+def _export_table_graph(model: dict) -> dict[str, Any]:
+    """Per attribute (lowercase name): the tables its forms read and its lookup table; per table, the attributes
+    mapped on it. Table names casefolded. An attribute without a lookup in the export takes its one table that
+    no fact metric reads, if it has exactly one."""
+    metric_tabs = {t.casefold() for t in _export_fact_tables(model)}
+    attr_tables = {a: {t.casefold() for t in tabs} for a, tabs in _attribute_tables(model).items()}
+    lookup: dict[str, str] = {}
+    for a in model.get("attributes") or []:
+        name = str((a.get("information") or {}).get("name") or "").lower()
+        lt = (a.get("attributeLookupTable") or {}).get("name")
+        if name and lt:
+            lookup[name] = str(lt).casefold()
+    for name, tabs in attr_tables.items():
+        if name not in lookup:
+            others = sorted(t for t in tabs if t not in metric_tabs)
+            if len(others) == 1:
+                lookup[name] = others[0]
+    on_table: dict[str, set[str]] = {}
+    for name, tabs in attr_tables.items():
+        for t in tabs:
+            on_table.setdefault(t, set()).add(name)
+    return {"attr_tables": attr_tables, "lookup": lookup, "on_table": on_table}
+
+
+def _reached_tables(table: str, graph: dict[str, Any], metric_tables: set[str] | None = None) -> set[str]:
+    """Tables a fact table reaches the way Mosaic joins: from a table to the lookup table of each attribute
+    mapped on it (many rows to one), then on from that lookup (a snowflake). Also, from a table some metric
+    reads, to a table with no metric that shares one of its own attributes (an attribute whose lookup is that
+    table: a period mapping table keyed on the fact's own period). Never from a lookup back to the other tables
+    its key is mapped on: that is how a fact reaches another fact's rows, many to many."""
+    metric_tables = metric_tables or set()
+    seen, todo = {table}, [table]
+    while todo:
+        t = todo.pop()
+        for a in sorted(graph["on_table"].get(t, ())):
+            lt = graph["lookup"].get(a)
+            nxt = {lt} if lt else set()
+            if lt == t and t in metric_tables:
+                nxt |= {x for x in graph["attr_tables"].get(a, set()) if x not in metric_tables}
+            for x in sorted(nxt - seen):
+                seen.add(x)
+                todo.append(x)
+    return seen
+
+
+def _rows(e: dict) -> float:
+    return float(e.get("rows") or 0)
+
+
+def tables_from_export(scope: dict, export: dict | None) -> dict[str, Any] | None:
+    """Facts and dimension tables, and which attributes reach each, from the export alone. A table some fact
+    metric reads is a dimension when a larger metric table reaches it as a lookup (its key is that table's
+    attribute): its metrics describe the entity, one row each, and are not anchors."""
+    model = _export_model(export)
+    tables = metric_tables(scope)
+    if not model or not tables:
+        return None
+    graph = _export_table_graph(model)
+    metric_tabs = {t.casefold() for t in _export_fact_tables(model)} | set(tables)
+    reached = {t: _reached_tables(t, graph, metric_tabs) for t in tables}
+    dims: dict[str, dict[str, Any]] = {}
+    for t, e in tables.items():
+        by = [f for f in tables if f != t and t in reached[f] and (
+            (_rows(tables[f]) > _rows(e)) if e["rows"] is not None and tables[f]["rows"] is not None
+            else f not in reached[t])]
+        if by:
+            keys = sorted(a for a, lt in graph["lookup"].items()
+                          if lt == t and graph["attr_tables"].get(a, set()) & (reached[by[0]] - {t}))
+            dims[t] = {"reached_by": tables[by[0]]["table"], "key": keys[0] if keys else None, "evidence": "export"}
+    if len(dims) == len(tables):   # every table reaching another one both ways: no dimension can be told apart
+        dims = {}
+    reach: dict[str, dict[str, dict[str, Any]]] = {}
+    for a, tabs in graph["attr_tables"].items():
+        reach[a] = {tables[t]["table"]: {"verdict": "reaches" if tabs & reached[t] else "not_reached",
+                                         "source": "export"} for t in tables}
+    return {"tables": tables, "dimensions": dims, "reach": reach, "source": "export"}
+
+
+def _alone_sql(M: str, N: str, A: str, base: str) -> str:
+    """probe's one-row 'alone' check: groups, groups with fact rows, and the fact rows the groups keep. The
+    ORDER BY ... LIMIT barrier stops the outer aggregate from being pushed down (it misreads without it)."""
+    return (f"SELECT CAST(COUNT(*) AS VARCHAR) AS groups, CAST(COUNT(CASE WHEN n > 0 AND {_NONBLANK_V} "  # nosec B608  # identifiers are quoted; the connector is read-only
+            f"THEN 1 END) AS VARCHAR) AS with_rows, CAST(SUM(n) AS VARCHAR) AS kept FROM (SELECT "
+            f"CAST({N} AS VARCHAR) AS v, COUNT({A}) AS n FROM {M}{base} GROUP BY 1 ORDER BY 1 LIMIT {PROBE_GROUP_LIMIT}) t")
+
+
+def reach_verdict(parsed: dict | None, total: float | None) -> dict[str, Any]:
+    """Does grouping a fact's anchor by an attribute keep the fact's rows once each? From the 'alone' check:
+    the same rows (fewer when a key is missing from the lookup) is 'reaches'; every value getting all rows is
+    'cross_join'; rows repeated otherwise is 'many_to_many'; a query that fails ('too many intermediate rows')
+    is 'no_path'."""
+    if parsed is None:
+        return {"verdict": "pending"}
+    if not parsed.get("ok") or not parsed.get("rows"):
+        err = str(parsed.get("error") or "no rows")
+        return {"verdict": "no_path" if _NO_PATH_ERROR.search(err) or _JOIN_ERROR.search(err) else "error",
+                "error": err[:300]}
+    row = parsed["rows"][0]
+    groups, kept = _num(row.get("groups")) or 0, _num(row.get("kept")) or 0
+    filled = _num(row.get("with_rows")) or groups
+    if groups >= PROBE_GROUP_LIMIT or total is None:
+        return {"verdict": "unknown", "why": "too many groups to check" if total is not None else "no fact total"}
+    if total and kept > total + 0.5:
+        times = kept / total
+        if filled >= 2 and abs(times - round(times)) < 1e-9 and round(times) == round(filled):
+            return {"verdict": "cross_join", "kept": kept, "total": total}
+        return {"verdict": "many_to_many", "kept": kept, "total": total, "times": round(times, 2)}
+    return {"verdict": "reaches", "kept": kept, "total": total}
+
+
+def _key_candidates(scope: dict, rows: float, table: str) -> list[str]:
+    """Attributes whose distinct values equal a table's rows (its possible key), the names closest to the
+    table's first (fewest queries), at most three."""
+    tokens = _tokens(re.sub(r"[._]+", " ", table))
+    names = [a["name"] for a in scope.get("attributes") or [] if _distinct(a) == rows]
+    return sorted(names, key=lambda n: (-len(_tokens(n) & tokens), n))[:3]
+
+
+def tables_by_query(ask: Callable[[str], dict | None], scope: dict, *, where: str = "",
+                    reach: bool = True, log: Callable[[str], None] = lambda s: None) -> dict[str, Any] | None:
+    """The fallback with no export. A metric table whose rows equal some attribute's distinct values may be a
+    dimension; it is one when a larger metric table, grouped by that attribute, keeps its own rows (real groups,
+    not a cross join or a failed query). A fact's own row id also matches the first test, but no larger fact
+    reaches it. Then each fact's reach: one 'alone' query per fact and attribute, one fact at a time."""
+    tables = metric_tables(scope)
+    if not tables:
+        return None
+    if any(e["rows"] is None for e in tables.values()):   # replay: the anchor counts come first
+        return {"tables": tables, "dimensions": {}, "reach": {}, "source": "query", "waiting": "the anchor counts"}
+    M = quote_model(scope["model"])
+    base = f" WHERE {where}" if where else ""
+    attrs = _testable_attributes(scope, None)
+    distinct = {a["name"]: _distinct(a) for a in scope.get("attributes") or []}
+    reach_out: dict[str, dict[str, dict[str, Any]]] = {}
+
+    def test(att: str, t: str) -> dict[str, Any]:
+        e = tables[t]
+        if (distinct.get(att) or 0) >= PROBE_GROUP_LIMIT:   # the barrier would cut the groups: smallest two instead
+            parsed = ask(join_path_sql(scope["model"], att, e["anchor"], where))
+            if parsed is None:
+                return {"verdict": "pending"}
+            if not parsed.get("ok"):
+                return reach_verdict(parsed, e["rows"])
+            counts = [_num(r.get("n")) for r in parsed.get("rows") or []]
+            cross = len(counts) >= 2 and e["rows"] and all(c is not None and _close(c, e["rows"]) for c in counts)
+            return {"verdict": "cross_join" if cross else "reaches", "smallest_groups": counts}
+        return reach_verdict(ask(_alone_sql(M, quote_ident(att), quote_ident(e["anchor"]), base)), e["rows"])
+
+    dims: dict[str, dict[str, Any]] = {}
+    for t, e in tables.items():
+        larger = [f for f in tables if f != t and e["rows"] is not None and _rows(tables[f]) > _rows(e)]
+        for key in _key_candidates(scope, e["rows"], e["table"]) if larger else []:
+            for f in larger:
+                v = test(key, f)
+                reach_out.setdefault(_base_name(key), {})[tables[f]["table"]] = {**v, "source": "query"}
+                if v["verdict"] == "reaches":
+                    dims[t] = {"reached_by": tables[f]["table"], "key": key, "evidence": "query"}
+                    break
+            if t in dims:
+                break
+    facts = [t for t in tables if t not in dims] or list(tables)
+    if any(v.get("verdict") == "pending" for r in reach_out.values() for v in r.values()):
+        return {"tables": tables, "dimensions": dims, "reach": {}, "source": "query",
+                "waiting": "the fact / dimension tests"}   # replay: which tables are facts comes first
+    if reach and len(facts) > 1:
+        log(f"reach: {len(facts)} fact tables x {len(attrs)} attributes, one query each")
+        for t in facts:
+            for att in attrs:
+                known = reach_out.get(_base_name(att["name"]), {}).get(tables[t]["table"])
+                if not known:
+                    reach_out.setdefault(_base_name(att["name"]), {})[tables[t]["table"]] = {
+                        **test(att["name"], t), "source": "query"}
+    return {"tables": tables, "dimensions": dims, "reach": reach_out if len(facts) > 1 else {}, "source": "query"}
+
+
+def reach_of(scope: dict, name: str, table: str) -> str | None:
+    """'reaches', another verdict, or None (not known) for an attribute and a metric table, from scope.json."""
+    r = (scope.get("reach") or {}).get(_base_name(name)) or {}
+    hit = next((v for t, v in r.items() if t.casefold() == table.casefold()), None)
+    return str(hit.get("verdict")) if hit else None
+
+
+def reached_facts(scope: dict, name: str) -> list[dict[str, Any]] | None:
+    """The fact tables an attribute reaches, largest first; None when the scope doesn't say (one fact, or an
+    older scope.json)."""
+    facts = scope.get("facts") or []
+    if len(facts) < 2 or not scope.get("reach"):
+        return None
+    out = [f for f in facts if reach_of(scope, name, f["table"]) == "reaches"]
+    if all(reach_of(scope, name, f["table"]) is None for f in facts):
+        return None
+    return out
+
+
+def _dates_reaching(scope: dict, table: str) -> list[str]:
+    return [a["name"] for a in scope.get("attributes") or []
+            if (a.get("type", "").lower() in ("date", "timestamp") or looks_like_stored_date(a))
+            and reach_of(scope, a["name"], table) == "reaches" and (_distinct(a) or 0) >= 2]
+
+
+def _row_id(scope: dict, fact: dict, n_facts: int) -> str | None:
+    """A fact's own row id: as many values as the fact has rows, and (with several facts) reaching no other."""
+    for a in scope.get("attributes") or []:
+        if fact["rows"] and _distinct(a) == fact["rows"] and reach_of(scope, a["name"], fact["table"]) != "not_reached":
+            others = [f for f in scope.get("facts") or [] if f["table"] != fact["table"]
+                      and reach_of(scope, a["name"], f["table"]) == "reaches"]
+            if n_facts < 2 or not others:
+                return a["name"]
+    return None
+
+
+def multi_fact_entity(scope: dict) -> dict[str, Any] | None:
+    """The entity for a model with several facts: an attribute that reaches the most facts (every one, ideally),
+    then one that looks like an identifier, then the most values; never a fact's row id, a date or a number with
+    fractions. The single-fact guess picked one fact's row id here, and the relationship pairs then cross-joined."""
+    facts = scope.get("facts") or []
+    if len(facts) < 2 or not scope.get("reach"):
+        return None
+    row_ids = {f.get("row_id") for f in facts if f.get("row_id")}
+    by_attr = {a["name"]: a for a in scope.get("attributes") or []}
+    best = None
+    for t in _testable_attributes(scope, None):
+        a = by_attr.get(t["name"]) or {}
+        typ = (a.get("type") or "").lower()
+        if t["name"] in row_ids or (_distinct(a) or 0) < 2 or typ in _SKIP_TYPES or typ in ("date", "timestamp") \
+                or looks_like_stored_date(a) or _CALENDAR_NAME.search(_words(t["name"])):
+            continue
+        n = sum(1 for f in facts if reach_of(scope, t["name"], f["table"]) == "reaches")
+        hint = bool(_ENTITY_HINT.search(_words(t["name"]))) or "identifier" in (a.get("description") or "").lower()
+        rank = (n, hint, _distinct(a) or 0)
+        if n and (best is None or rank > best[0]):
+            best = (rank, t["name"], n)
+    if not best:
+        return None
+    return {"attribute": best[1], "facts_reached": best[2], "facts": len(facts),
+            "note": "reaches every fact table" if best[2] == len(facts) else
+                    f"reaches {best[2]} of {len(facts)} fact tables: no attribute reaches them all"}
+
+
+def reuse_fact_structure(scope: dict, previous: dict) -> dict[str, Any] | None:
+    """A metric-only round (scope --reuse-profiles) keeps the previous round's facts, dimension tables, reach and
+    entity when the same tables carry the raw metrics: no fact or attribute changed. The rows come from this
+    round's anchor counts."""
+    if not previous.get("facts") or previous.get("reach_waiting"):
+        return None
+    tables = metric_tables(scope)
+    before = {str(f["table"]).casefold() for f in previous["facts"]} | \
+             {str(d["table"]).casefold() for d in previous.get("dimension_tables") or []}
+    if set(tables) != before:
+        return None
+    out = {k: copy.deepcopy(previous[k]) for k in ("facts", "dimension_tables", "reach", "entity") if k in previous}
+    for f in out["facts"] + out.get("dimension_tables", []):
+        f["rows"] = tables[str(f["table"]).casefold()]["rows"]
+    out["fact_source"] = f"{previous.get('fact_source') or 'previous round'} (reused: only derived metrics changed)"
+    return out
+
+
+def fact_structure(runner: Runner | None, project: str, scope: dict, *, export: dict | None = None,
+                   where: str = "", reach: bool = True, log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
+    """scope's `facts` (one entry per real fact: table, anchor, rows, metrics, the dates that reach it, its
+    period, its row id), `dimension_tables` (tables that carry a metric but describe an entity), `reach` (per
+    attribute and fact: reaches, not_reached, cross_join, many_to_many, no_path) and the multi-fact `entity`.
+    With one metric table nothing is asked and reach is left out (every attribute must reach that fact)."""
+    tables = metric_tables(scope)
+    if len(tables) < 2:
+        only = next(iter(tables.values()), None)
+        return {"facts": [{"table": only["table"], "anchor": only["anchor"], "rows": only["rows"],
+                           "metrics": only["metrics"]}] if only else [],
+                "fact_source": "one metric table"}
+    pending = 0
+
+    def ask(sql: str) -> dict | None:
+        nonlocal pending
+        if runner is None:
+            return None
+        try:
+            return parse_query_result(runner.call("query", {"project": project, "query": sql}))
+        except PendingReply:
+            pending += 1
+            return None
+
+    res = tables_from_export(scope, export) if export else None
+    if res is None:
+        res = tables_by_query(ask, scope, where=where, reach=reach, log=log)
+    if res is None:
+        return {}
+    out: dict[str, Any] = {"fact_source": res["source"], "reach": res["reach"]}
+    if res.get("waiting"):
+        out["reach_waiting"] = f"waiting for {res['waiting']}: run scope again once the pending replies are saved"
+    dims = res["dimensions"]
+    out["dimension_tables"] = [{"table": e["table"], "rows": e["rows"], "metrics": e["metrics"], **dims[t]}
+                               for t, e in res["tables"].items() if t in dims]
+    view = {**scope, "reach": res["reach"]}
+    facts = [{"table": e["table"], "anchor": e["anchor"], "rows": e["rows"], "metrics": e["metrics"]}
+             for t, e in res["tables"].items() if t not in dims]
+    view["facts"] = facts
+    for f in facts:
+        f["dates"] = _dates_reaching(view, f["table"]) if res["reach"] else []
+        f["period"] = guess_period(view, among=f["dates"]) if f["dates"] else ""
+        f["row_id"] = _row_id(view, f, len(facts))
+    out["facts"] = facts
+    view["facts"] = facts
+    entity = multi_fact_entity(view)
+    if entity:
+        out["entity"] = entity
+    if res["source"] == "query" and not reach and len(facts) > 1:
+        out["reach_note"] = "reach not tested (--no-reach): checks use the model's one anchor"
+    if pending:
+        out["reach_pending"] = pending
+        out.setdefault("reach_waiting", "waiting for the reach queries: run scope again once the pending replies "
+                                        "are saved")
+    return out
+
+
+def fact_anchors(scope: dict) -> list[dict[str, Any]]:
+    """One anchor per real fact: scope's `facts` when it has them (dimension tables that carry a metric left
+    out), else one per table a raw metric reads (older scope files)."""
+    if scope.get("facts"):
+        return [{"table": f["table"], "anchor": f["anchor"]} for f in scope["facts"] if f.get("anchor")]
+    return _anchors_by_fact(scope)
+
+
 def _anchors_by_fact(scope: dict) -> list[dict[str, Any]]:
     """One anchor per fact table (the fullest raw fact metric reading it): an attribute can join one fact
     table and not another, so join paths are tested against each."""
@@ -2669,6 +3220,53 @@ def resolved_findings(findings_doc: dict, current: list[dict],
     return out
 
 
+def filter_finding(n: str, probs: list[dict], *, rel_note: str = "", metrics: list[str] | None = None,
+                   proposal: dict[str, str] | None = None, round_no: int | None = None,
+                   source: str = "join-paths") -> dict[str, Any]:
+    """'Filtering on X doesn't filter the fact': one id (J-filter-<attribute>) whether join-paths or probe's
+    calendar filter test found it, so the two merge into one finding."""
+    detail = "; ".join(f"with {p['anchor']}: {n} = {p.get('sent') or repr(p['value'])} counts {p['filtered']} rows "
+                       f"filtered, {p['grouped']} grouped" + (" (the full total: the filter is ignored)"
+                                                              if p["verdict"] == "ignored" else "") for p in probs)
+    return integrity_finding(
+        f"J-filter-{_slug(n)}", f"Filtering on '{n}' doesn't filter the fact", "relationship",
+        detail + rel_note + (f". Metrics that filter on it: {metrics}" if metrics else ""),
+        "Grouped by the attribute the counts are right, but a filter on it alone isn't applied to the fact: "
+        "usually a missing parent-child relationship to the attribute its table joins the fact through. "
+        + (f"Proposed: {proposal['parent']} -> {proposal['child']} through {proposal['table']} "
+           f"(one to many). Approve to create it, Modify to change it, or Decline."
+           if proposal else "Create the relationship (wire_relationships); say which, or decline."),
+        round_no=round_no, source=source,
+        actions=[_relationship_action(proposal)] if proposal else None,
+        checks=[{"command": "join-paths", "attribute": n, "expect": "filter ok"}])
+
+
+def filter_check(ask: Callable[[str], dict | None], model: str, name: str, typ: str, anchor: str,
+                 where: str = "") -> dict[str, Any] | None:
+    """join-paths' filter test for one attribute and anchor (two queries): COUNT(<anchor>) grouped by the
+    attribute's two smallest groups, then filtered to the smallest filled value alone. 'ignored': the filtered
+    count is the fact's full total; 'mismatch': neither. None when the group query gives nothing to test."""
+    parsed = ask(join_path_sql(model, name, anchor, where))
+    if parsed is None or not parsed.get("ok"):
+        return None
+    rows = [(r.get("v"), _num(r.get("n"))) for r in parsed.get("rows") or []]
+    pick = next(((v, c) for v, c in rows if not _blank(v)), None)
+    if not pick:
+        return None
+    clause = f" WHERE {where}" if where else ""
+    tot = ask(f"SELECT COUNT({quote_ident(anchor)}) AS n FROM {quote_model(model)}{clause}")  # nosec B608  # identifiers are quoted; the connector is read-only
+    total = _num(tot["rows"][0].get("n")) if tot and tot.get("ok") and tot.get("rows") else None
+    fq = ask(filter_test_sql(model, name, anchor, pick[0], typ, where))
+    if fq is None:
+        return {"value": pick[0], "verdict": "pending"}
+    got = _num(fq["rows"][0].get("n")) if fq.get("ok") and fq.get("rows") else None
+    fv = ("error" if got is None else "ok" if pick[1] is not None and _close(got, pick[1]) else
+          "ignored" if total is not None and _close(got, total) else "mismatch")
+    return {"anchor": anchor, "value": pick[0], "sent": _typed_literal(pick[0], typ), "grouped": pick[1],
+            "filtered": got, "total": total, "verdict": fv,
+            **({"error": (fq.get("error") or "")[:300]} if not fq.get("ok") else {})}
+
+
 def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export: dict | None = None,
                      previous: dict | None = None, where: str = "", round_no: int | None = None,
                      max_attributes: int = 300, log: Callable[[str], None] = lambda s: None) -> dict[str, Any]:
@@ -2681,7 +3279,8 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
     declared relationships, compared with the previous round's when both have some."""
     model = scope["model"]
     graph = export_join_graph(export) if export else {}
-    facts = _anchors_by_fact(scope)
+    facts = fact_anchors(scope)
+    multi = len(facts) > 1 and bool(scope.get("reach"))
     todo = _testable_attributes(scope, export)[:max_attributes]
     results: dict[str, dict[str, dict]] = {}
     skipped: dict[str, list[str]] = {}
@@ -2699,6 +3298,11 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
         log(f"join paths against {anchor}: {len(todo)} attributes")
         for att in todo:
             n = att["name"]
+            known = reach_of(scope, n, ftable) if multi and ftable else None
+            if known and known not in ("reaches", "unknown", "pending", "error"):   # scope tested it: not asked again
+                results.setdefault(n, {})[anchor] = {"verdict": "not_reached", "reach": known,
+                                                     "from": f"scope ({scope.get('fact_source') or 'reach'})"}
+                continue
             # mapped to this fact table directly: it can't cross-join it, but its filter still needs testing
             if att["tables"] is not None and ftable and ftable.casefold() in {t.casefold() for t in att["tables"]}:
                 skipped.setdefault(anchor, []).append(n)
@@ -2742,7 +3346,7 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
     unjoined: dict[str, list[str]] = {}
     filter_problems: dict[str, list[dict]] = {}
     for n, by_anchor in results.items():
-        bad = [a for a, r in by_anchor.items() if r["verdict"] in ("cross_join", "join_error")]
+        bad = [a for a, r in by_anchor.items() if r["verdict"] in ("cross_join", "join_error", "not_reached")]
         if bad:
             unjoined[n] = bad
         for a, r in by_anchor.items():
@@ -2773,8 +3377,13 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
                                                else "this export has no relationships")}
     findings = []
     all_anchors = [f["anchor"] for f in facts]
+    table_of = {f["anchor"]: f.get("table") or f["anchor"] for f in facts}
+    partial: dict[str, list[str]] = {}
     for n, bad in sorted(unjoined.items()):
         none = all(a in bad for a in all_anchors) or bad[0].startswith("(export")
+        if multi and not none:   # several facts: most attributes serve some of them; one finding lists them all
+            partial[n] = [table_of[a] for a in all_anchors if a not in bad]
+            continue
         mets = [x["metric"] for x in filtering if x["attribute"] == n]
         ev = results.get(n, {})
         detail = "; ".join(f"with {a}: {r['verdict']}" + (f" (every group = {r.get('total')})"
@@ -2793,6 +3402,21 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
             "which, or decline if it is meant to stand alone.", round_no=round_no,
             impact="high" if none else "medium", source="join-paths",
             checks=[{"command": "join-paths", "attribute": n, "expect": "joined"}]))
+    if partial:
+        groups: dict[tuple[str, ...], list[str]] = {}
+        for n, reached in partial.items():
+            groups.setdefault(tuple(reached), []).append(n)
+        findings.append(integrity_finding(
+            "J-partial-reach", f"{len(partial)} attribute(s) reach only some of the {len(facts)} fact tables",
+            "relationship",
+            "; ".join(f"only {', '.join(k)}: {', '.join(v[:12])}{' …' if len(v) > 12 else ''}"
+                      for k, v in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])))
+            + ". With another fact's metrics, such an attribute gives every group that fact's full total, repeats "
+              "its rows, or fails with 'too many intermediate rows'",
+            "Normal in a model with several facts, but analysts can't see it. Say in each attribute's description "
+            "which facts it serves (or in the model description, once per group above), and map its key on a fact it "
+            "should serve but doesn't. Say which, or decline.", round_no=round_no, impact="low", source="join-paths",
+            checks=[{"command": "join-paths", "expect": "reach as described"}]))
     rels = graph.get("relationships") or []
     joins = _join_attributes(export) if export else {}
     for n, probs in sorted(filter_problems.items()):
@@ -2804,20 +3428,9 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
         rel_note = ("" if not graph else f". Declared relationships: {mine}" if mine else
                     ". The export declares no relationship for it: a filter on an attribute that isn't selected "
                     "needs one to the attribute its table joins the fact through")
-        detail = "; ".join(f"with {p['anchor']}: {n} = {p.get('sent') or repr(p['value'])} counts {p['filtered']} rows filtered, "
-                           f"{p['grouped']} grouped" + (" (the full total: the filter is ignored)"
-                                                        if p["verdict"] == "ignored" else "") for p in probs)
-        findings.append(integrity_finding(
-            f"J-filter-{_slug(n)}", f"Filtering on '{n}' doesn't filter the fact", "relationship",
-            detail + rel_note + (f". Metrics that filter on it: {mets}" if mets else ""),
-            "Grouped by the attribute the counts are right, but a filter on it alone isn't applied to the fact: "
-            "usually a missing parent-child relationship to the attribute its table joins the fact through. "
-            + (f"Proposed: {joins[base]['parent']} -> {joins[base]['child']} through {joins[base]['table']} "
-               f"(one to many). Approve to create it, Modify to change it, or Decline."
-               if base in joins and not mine else "Create the relationship (wire_relationships); say which, or decline."),
-            round_no=round_no, source="join-paths",
-            actions=[_relationship_action(joins[base])] if base in joins and not mine else None,
-            checks=[{"command": "join-paths", "attribute": n, "expect": "filter ok"}]))
+        findings.append(filter_finding(n, probs, rel_note=rel_note, metrics=mets,
+                                       proposal=joins[base] if base in joins and not mine else None,
+                                       round_no=round_no, source="join-paths"))
     invalid = [r for r in graph.get("relationships") or [] if str(r.get("status") or "").lower() == "invalid"]
     if invalid:
         findings.append(integrity_finding(
@@ -2842,6 +3455,7 @@ def check_join_paths(runner: Runner | None, project: str, scope: dict, *, export
             actions=[_relationship_action(spec)] if spec else None,
             checks=[{"command": "join-paths", "relationship": [r["parent"], r["child"]], "expect": "present"}]))
     return {"version": 2, "model": model, "facts": facts, "attributes": results,
+            **({"partial_reach": partial} if partial else {}),
             "mapped_to_fact": skipped,
             "not_tested": [t["name"] for t in todo if t["name"] not in results] if runner is not None
             else [t["name"] for t in todo],
@@ -3133,12 +3747,18 @@ PERIOD_EVENT_SHARE = 0.9      # at least this share of entities with one period:
 PERIOD_SNAPSHOT_AVG = 1.5     # at least this many periods per entity on average: a snapshot period
 
 
-def guess_period(scope: dict) -> str:
+def guess_period(scope: dict, among: list[str] | None = None) -> str:
     """The attribute most likely to be the model's period: a date (or a number or text holding one) whose name
-    says period, date, month..., preferring reporting / snapshot / as-of names, then the most values."""
+    says period, date, month..., preferring reporting / snapshot / as-of names, then the most values. With
+    several facts, only dates that reach the model's anchor fact (or `among`, one fact's dates)."""
+    if among is None and len(scope.get("facts") or []) > 1 and scope.get("reach"):
+        anchor = (scope.get("anchor") or {}).get("metric")
+        main = next((f for f in scope["facts"] if anchor in (f.get("metrics") or [])), scope["facts"][0])
+        among = [a["name"] for a in scope.get("attributes") or [] if reach_of(scope, a["name"], main["table"]) != "not_reached"]
     dated = [a for a in scope.get("attributes") or []
              if (a.get("type", "").lower() in ("date", "timestamp") or looks_like_stored_date(a))
-             and _PERIOD_NAME.search(_words(a["name"])) and (_distinct(a) or 0) >= 2]
+             and _PERIOD_NAME.search(_words(a["name"])) and (_distinct(a) or 0) >= 2
+             and (among is None or a["name"] in among)]
     if not dated:
         return ""
     return max(dated, key=lambda a: (bool(_PERIOD_PREFERRED.search(_words(a["name"]))), _distinct(a) or 0))["name"]
@@ -3204,6 +3824,10 @@ def period_profile(runner: Runner, project: str, model: str, scope: dict, where:
     if latest is not None and prof.get("values"):
         out["latest_observed"] = latest
     entity, anchor = guess_entity(scope), (scope.get("anchor") or {}).get("metric")
+    main = next((f for f in scope.get("facts") or [] if anchor in (f.get("metrics") or [])), None)
+    if len(scope.get("facts") or []) > 1 and main and main.get("row_id"):
+        entity = main["row_id"]   # several facts: the model-wide entity repeats across periods in any fact; a row id
+        #                           decides it for the anchor's own fact (one period per row: an event table)
     if not entity or entity == attribute or not anchor:
         out["note"] = "no entity or anchor metric to test it with"
         return out
@@ -6258,6 +6882,12 @@ def build_parser() -> argparse.ArgumentParser:
                                               "and type keep their profile instead of being queried again")
     sp.add_argument("--findings", help="findings.json, with --reuse-profiles")
     sp.add_argument("--phases", nargs="*", default=[], help="applied phases (3,4,6), with --reuse-profiles")
+    sp.add_argument("--model-export", help="the model export (build_mosaic.py export-model): with several fact "
+                                           "tables, which tables are facts and which attributes reach each come "
+                                           "from it, with no queries")
+    sp.add_argument("--no-reach", action="store_true",
+                    help="with several fact tables and no export: don't ask the per-fact reach queries (one per "
+                         "fact and attribute); later checks then use the model's one anchor")
 
     sp = sub.add_parser("run", help="run a question bank through the MCP query tool")
     sp.add_argument("--project", required=True)
@@ -6317,9 +6947,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--batch", type=int, default=6)
     sp.add_argument("--previous", help="the previous round's probes.json: a metric whose groups went from blank to 0 "
                                        "(or back) is a warning (verify-changes)")
-    sp.add_argument("--cross-check", action="store_true",
-                    help="also ask each attribute's full value lists (the old way) and record under cross_check "
-                         "whether they agree with the one-row checks (item 32; a full assessment's first probe)")
+    sp.add_argument("--cross-check", nargs="?", type=int, const=PROBE_CROSS_CHECK_SAMPLE, default=0, metavar="N",
+                    help="also ask the full value lists (the old way) of a sample of N attributes (default 8: those "
+                         "the one-row checks flag first) and record under cross_check whether they agree with the "
+                         "one-row checks (item 32; a full assessment's first probe)")
+    sp.add_argument("--no-calendar-filters", action="store_true",
+                    help="skip the filter test on calendar attributes (year, quarter, month, date...; two queries "
+                         "each): a filter that is ignored when the attribute isn't selected")
+    sp.add_argument("--round", type=int, help="round number for the findings the calendar filter test raises")
 
     sp = sub.add_parser("question-sql", help="rewrite a question's governed SQL, keeping the earlier version")
     sp.add_argument("--bank", required=True)
@@ -6530,16 +7165,27 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
                 why = f"applied phases change more than derived metrics ({', '.join(structural[:5])}): profiling every attribute"
             else:
                 reuse = _load_json(args.reuse_profiles)
+        export = _load_json(args.model_export) if args.model_export else None
         out = scope_model(runner(), args.project, args.model, profile=not args.no_profile, where=args.where,
                           sample_max=args.sample_max, max_attributes=args.max_attributes,
-                          profile_batch=args.profile_batch, reuse_from=reuse, log=log)
+                          profile_batch=args.profile_batch, reuse_from=reuse, export=export,
+                          reach=not args.no_reach, log=log)
         if why:
             out["notes"]["profiles_not_reused"] = why
+        if args.model_export:
+            out["sources"] = source_info(export=args.model_export)
         _write_json(args.out, out)
         if _pending(runner):
             return 3
+        facts = out.get("facts") or []
         print(json.dumps({"ok": True, "out": args.out, "attributes": len(out["attributes"]),
                           "metrics": len(out["metrics"]), "maturity": out["maturity"]["estimated_level"],
+                          **({"fact_tables": [f["table"] for f in facts],
+                              "dimension_tables_with_metrics": [d["table"] for d in out.get("dimension_tables") or []],
+                              "reach_from": out.get("fact_source"),
+                              **({"entity": out["entity"]["attribute"]} if out.get("entity") else {}),
+                              **({"reach_waiting": out["reach_waiting"]} if out.get("reach_waiting") else {})}
+                             if len(facts) > 1 or out.get("dimension_tables") else {}),
                           **out["notes"]}, indent=2))
         return 0
     if args.cmd == "relationships":
@@ -6587,7 +7233,8 @@ def _live(args: argparse.Namespace, runner: Callable[[], Runner], log: Callable[
         out = probe_objects(runner(), args.project, scope, attributes=attrs, metrics=mets, period=args.period,
                             split=args.split, filter_spec=args.filter, where=args.where, max_values=args.max_values,
                             batch=args.batch, previous=_load_json(args.previous) if args.previous else None,
-                            cross_check=args.cross_check, log=log)
+                            cross_check=args.cross_check or 0, calendar_filters=not args.no_calendar_filters,
+                            round_no=args.round, log=log)
         if type_checks:
             out["type_checks"] = type_checks
         if not_probed:

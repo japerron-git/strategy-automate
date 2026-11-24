@@ -208,7 +208,41 @@ Aggregates of fact metrics run on the fact. So:
     `reference_mosaic_derived_metrics.md`).
   - A filter on a calendar attribute can be ignored with no error (a year filter returned both years' totals,
     on two facts) while grouping by it works: a relationship missing between it and the date the facts join
-    through. `join-paths` tests this filter for every attribute.
+    through. `join-paths` tests this filter for every attribute; `probe` tests it for the calendar attributes
+    (year, quarter, month, week, day, date, period: two queries each, against a fact the attribute reaches) and
+    raises the same finding (`J-filter-<attribute>`), since join-paths is often skipped for cost.
+  - **Which tables are facts** (`scope`, offline 2026-11-24): a table some raw metric reads is a fact unless it
+    describes an entity: a larger metric table reaches it as a lookup (its key is an attribute the larger table
+    has). Such a table's metrics (a store's floor area, a category's weight) are "dimension metrics": not
+    anchors, and summed with a fact's rows they repeat the entity's value. With the export (`scope
+    --model-export`), the lookup tables decide, offline. Without it: a metric table whose rows equal an
+    attribute's distinct values is tested against each larger metric table (grouped by that attribute, real
+    groups make it a dimension); a fact's own row id matches the first test too, but no larger fact reaches it.
+    A header table carrying metrics (one row per order, lines in another fact) comes out as a dimension of the
+    lines: its metrics read once per order, which is how Mosaic joins it.
+  - **Reach** (`scope.json` `reach`: per attribute and fact, `reaches`, `not_reached`, `cross_join`,
+    `many_to_many`, `no_path`). From the export: a fact reaches the lookup table of each attribute mapped on it,
+    then on through those lookups (a snowflake), and from the fact itself into a table with no metric that
+    shares one of the fact's own attributes (a period map keyed on the fact's period: one test model's
+    latest-period flag lives there and filters work). Never from a lookup back into another fact through a
+    shared key: that is the many-to-many path. Without the export: one 'alone' query per fact and attribute
+    (probe's one-row shape, so replies are shared), one fact at a time; `--no-reach` skips them.
+  - **Per-fact scope:** `facts` (table, anchor, rows, metrics, the dates that reach it, its period, its row id),
+    `dimension_tables` and `entity` (an attribute reaching the most facts, then one that looks like an
+    identifier, then the most values; never a row id, a date or a fraction). `relationships` uses that entity
+    and pairs only attributes that share a fact; the period test uses the anchor fact's row id when it has one
+    (one period per row: an event table), since the model-wide entity repeats across periods in any fact.
+    `probe` checks each attribute against the largest fact it reaches, groups and filters a fact's metrics only
+    by attributes that reach it (its own period when the model's doesn't), and warns on a metric's table only
+    when it describes an entity. `join-paths` uses one anchor per real fact, asks nothing scope already knows
+    not to reach, and lists the attributes that reach only some facts in one low-impact finding
+    (`J-partial-reach`).
+  - **Writing SQL for several facts:** count each fact with its own anchor (`scope.json` `facts`); group a
+    fact only by attributes that reach it; for a fact with no calendar link, use its own date: a subquery per
+    row id with `date_trunc('month', MAX(<its date>)) AS m` and the fact's measures, then group the outer query
+    by `m` (the pattern the 2026-11-23 run's best answers used). A failed query
+    ("intermediate rows") or the same count in every group is the evidence of no join path, not a data
+    defect.
 - **A DATE attribute compared with a quoted text fails** ("Cannot apply operator: date = varchar(10)"): write
   `DATE 'yyyy-mm-dd'` (`TIMESTAMP '...'` for a timestamp). `probe` and `join-paths` write typed literals.
 - **Window functions** (verified live 2026-11-23):
@@ -342,8 +376,10 @@ Resolved:
   barrier: each attribute check is one row (groups, values with rows, rows kept) and the values are listed only
   when the counts show listed values without fact rows (item 32; same results as the stored lists on the
   other tenant's test model: 10 listed / 6 with rows / all rows kept, filtered and partner shapes too). Not yet
-  seen on a model that loses rows: `probe --cross-check` also asks the full lists and records agreement under
-  `cross_check` (the plugin runs it at full depth until a run with lost rows agrees; then drop it there).
+  seen on a model that loses rows: `probe --cross-check [N]` also asks the full lists of a sample (default 8:
+  the attributes the one-row checks flag, lost rows or lookup-only values, first; then clean ones in probe
+  order) and records agreement and the sample under `cross_check`. The plugin runs it at full depth until a run
+  agrees, ideally on an attribute with lost rows; then drop it there.
 - *The connector lags a publish* (seen 2026-11-20): right after a publish or certify, a column get_semantics
   lists (new time attributes' `<date> (month)__id`, then `month__id`) failed with MOSAIC_SQL_COLUMN_NOT_FOUND
   for about a minute, then worked as a bare column, in WHERE and in GROUP BY. Re-ask such a query once after a

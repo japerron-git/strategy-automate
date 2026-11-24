@@ -2255,13 +2255,25 @@ class ProbeTests(unittest.TestCase):
     def test_cross_check_agrees_and_counts_lost_rows(self):
         out = am.probe_objects(_SqlRunner(self.answer), "retail", self.SCOPE, period="period",
                                attributes=["exit type", "promo flag", "term months"], cross_check=True)
-        self.assertEqual(out["cross_check"], {"attributes": 3, "agree": 3, "with_lost_rows": 1,
-                                              "with_lookup_only_values": 2})
+        summary = {k: v for k, v in out["cross_check"].items() if k != "note"}
+        self.assertEqual(summary, {"attributes": 3, "agree": 3, "with_lost_rows": 1, "with_lookup_only_values": 2,
+                                   "sample_size": 8, "sampled": ["exit type", "promo flag", "term months"]})
         exit_type = next(a for a in out["attributes"] if a["name"] == "exit type")["cross_check"]
         self.assertEqual(exit_type["lists"]["kept"]["filtered"], 250.0)
         self.assertFalse(any("cross-check" in w for w in out["warnings"]))
         self.assertNotIn("cross_check", am.probe_objects(_SqlRunner(self.answer), "retail", self.SCOPE,
                                                          period="period", attributes=["term months"]))
+
+    def test_cross_check_samples_flagged_attributes_first(self):
+        """item 75: a sample, not every attribute: those the one-row checks flag (lost rows, lookup-only values)
+        come first, in probe order; a clean one only when the sample has room. Unsampled ones ask no list."""
+        runner = _SqlRunner(self.answer)
+        out = am.probe_objects(runner, "retail", self.SCOPE, period="period",
+                               attributes=["term months", "exit type", "promo flag"], cross_check=2)
+        self.assertEqual(out["cross_check"]["sampled"], ["exit type", "promo flag"])
+        self.assertNotIn("cross_check", next(a for a in out["attributes"] if a["name"] == "term months"))
+        self.assertFalse(any(re.match(r'SELECT CAST\("term months" AS VARCHAR\) AS v FROM', a["query"])
+                             for _, a in runner.calls))
 
     def test_cross_check_reports_a_disagreement(self):
         runner = _SqlRunner(self.answer)
