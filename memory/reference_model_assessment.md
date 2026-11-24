@@ -225,14 +225,28 @@ Aggregates of fact metrics run on the fact. So:
     then on through those lookups (a snowflake), and from the fact itself into a table with no metric that
     shares one of the fact's own attributes (a period map keyed on the fact's period: one test model's
     latest-period flag lives there and filters work). Never from a lookup back into another fact through a
-    shared key: that is the many-to-many path. Without the export: one 'alone' query per fact and attribute
+    shared key: that is the many-to-many path. Then the model's relationships (`hierarchy.relationships`): every
+    parent, grandparent... of a reached attribute is reached (a status kept on a snapshot table keyed by the
+    loan reaches the disbursements of that loan; a month reaches applications through application date ->
+    date -> month). A child is not reached, even when Mosaic returns groups because the data happens to be one
+    to one (it may not stay so); a many-to-many parent is not reached. Without the export: one 'alone' query per fact and attribute
     (probe's one-row shape, so replies are shared), one fact at a time; `--no-reach` skips them. Checked live
     2026-11-24 on a model with 4 facts and 4 entity tables carrying metrics: export reach agreed with all 33 live
     checks (cross joins, repeated rows, failed queries and real groups alike), and the query fallback found the
-    same facts and entity tables in 13 queries (replay asks one key test per table per pass: 3 passes).
+    same facts and entity tables in 13 queries (replay asks one key test per table per pass: 3 passes). On a
+    second model (4 facts; a loans table and a borrowers table carrying metrics, each the lookup of a larger
+    fact) the lookup rule alone missed 2 of 6 live reaches; with the relationships all agree but the one child.
+  - **No formulas from the connector:** some models' `get_semantics` lists metrics without formulas, and then
+    there is no anchor and no fact table. `scope --model-export` fills each missing formula from the export in the
+    connector's shape (a fact metric `sum(TABLE.COLUMN)`; a derived one `Sum({Metric})`, `Count(Order (ID))`):
+    identical to the connector's on all 34 metrics of a model that shows them. The connector names a metric
+    `x_1` when an attribute is also `x`. Without the export, scope's notes say `no_formulas`.
   - **Per-fact scope:** `facts` (table, anchor, rows, metrics, the dates that reach it, its period, its row id),
     `dimension_tables` and `entity` (an attribute reaching the most facts, then one that looks like an
-    identifier, then the most values; never a row id, a date or a fraction). `relationships` uses that entity
+    identifier, then the most values; never a row id, a date or a fraction). A fact's row id is an attribute
+    with one value per row that reaches it, on its own table first: a header fact's id (an application) also
+    reaches the facts that join to it. Its period prefers its own date (mapped on its table, or named like it
+    without the export) over one it reaches through another table, after the period-name preference. `relationships` uses that entity
     and pairs only attributes that share a fact; the period test uses the anchor fact's row id when it has one
     (one period per row: an event table), since the model-wide entity repeats across periods in any fact.
     `probe` checks each attribute against the largest fact it reaches, groups and filters a fact's metrics only

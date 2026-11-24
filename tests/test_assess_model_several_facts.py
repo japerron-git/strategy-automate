@@ -274,6 +274,91 @@ class ScopeCommandTests(unittest.TestCase):
             self.assertEqual(len(runner.calls), 1)   # the anchor counts only
 
 
+class RelationshipReachTests(unittest.TestCase):
+    """Reach follows the model's parent-child relationships too: an attribute reaches a fact when it is a parent
+    (grandparent...) of an attribute on it, even on a table no lookup leads to. A child doesn't reach; a
+    many-to-many parent doesn't either (checked live on a second multi-fact model, 2026-11-24)."""
+
+    def _graph(self):
+        exp = _export()
+        m = exp["model"]
+        m["attributes"].append({"information": {"name": "Promotion"}, "attributeLookupTable": {"name": "PROMOS"},
+                                "forms": [{"expressions": [{"tables": [{"name": "PROMOS"}]}]}]})
+        m["attributes"].append({"information": {"name": "Return Channel"}, "attributeLookupTable": {"name": "RCH"},
+                                "forms": [{"expressions": [{"tables": [{"name": "RCH"}]}]}]})
+        rel = lambda p, c, kind: {"parent": {"name": p}, "child": {"name": c}, "relationshipType": kind}  # noqa: E731
+        m["hierarchy"] = {"relationships": [rel("Promotion", "Order Line", "one_to_many"),
+                                            rel("Return Channel", "Return", "many_to_many"),
+                                            rel("Order Line", "Return", "one_to_many")]}
+        return am._export_table_graph(m)
+
+    def test_parents_reach_children_and_many_to_many_dont(self):
+        g = self._graph()
+        orders, returns = am.reached_attributes("orders", g), am.reached_attributes("returns", g)
+        self.assertIn("promotion", orders)               # a parent of the order line, on a table no lookup reaches
+        self.assertIn("order line", returns)             # the return's parent
+        self.assertIn("promotion", returns)              # and its grandparent
+        self.assertNotIn("return", orders)               # a child of the order line: not reached
+        self.assertNotIn("return channel", returns)      # many-to-many: grouping by it repeats rows
+
+    def test_a_header_facts_id_is_its_row_id_and_its_own_date_its_period(self):
+        view = {"attributes": [_attr("order line", "bigint"), _attr("order date", "date"),
+                               dict(_attr("return date", "date"), profile={"distinct_values": 900.0})],
+                "facts": [{"table": "orders", "rows": 1000.0}, {"table": "returns", "rows": 100.0}],
+                "reach": {"order line": {"orders": {"verdict": "reaches"}, "returns": {"verdict": "reaches"}},
+                          "order date": {"orders": {"verdict": "reaches"}},
+                          "return date": {"orders": {"verdict": "reaches"}}}}
+        fact = view["facts"][0]
+        self.assertEqual(am._row_id(view, fact, {"order line"}), "order line")   # also reaches returns
+        own = am._own_attributes(view, "orders", None)                            # no export: the table's words
+        self.assertEqual(own, {"order line", "order date"})
+        self.assertEqual(am.guess_period(view, among=["order date", "return date"], own=own), "order date")
+        self.assertEqual(am.guess_period(view, among=["order date", "return date"]), "return date")  # most values
+
+
+class FormulasFromExportTests(unittest.TestCase):
+    """Some connectors show no metric formulas: scope fills them from the export, in the connector's shape."""
+
+    def test_export_expressions_take_the_connector_shape(self):
+        cases = {
+            "Sum<UseLookupForAttributes=False>([Net Sales]){~+}/ Sum<UseLookupForAttributes=False>([Target]){~+}":
+                "Sum({Net Sales})/ Sum({Target})",
+            "Count<Distinct=True,UseLookupForAttributes=False>(Order@ID){~+}<[%Filter 1%]>": "Count(Order (ID))",
+            "[Returned Units]/ Count<UseLookupForAttributes=False>(Return){~+}": "{Returned Units}/ Count(Return)",
+            "Count<UseLookupForAttributes=False>(Order@ID){~+}<[%Filter 1%];+>": "Count(Order (ID))",
+            "Sum<UseLookupForAttributes=False>([Balance]){~+,![Status]+}": "Sum({Balance})",
+        }
+        for text, want in cases.items():
+            self.assertEqual(am.connector_formula(text), want)
+
+    def test_missing_formulas_are_filled_and_named(self):
+        exp = _export()
+        exp["model"]["factMetrics"][2]["function"] = "sum"
+        exp["model"]["factMetrics"][2]["fact"]["expressions"][0]["expression"]["text"] = "RETURNED_UNITS"
+        exp["model"]["metrics"] = [{"information": {"name": "Return Rate"},
+                                    "expression": {"text": "[Returned Units]/ [Quantity]"}}]
+        mets = [{"name": "returned units_1", "formula": ""}, {"name": "return rate", "formula": ""},
+                {"name": "quantity", "formula": "sum(orders.{QUANTITY})"}, {"name": "unknown", "formula": ""}]
+        filled = am.formulas_from_export(mets, exp)
+        self.assertEqual(filled, ["returned units_1", "return rate"])
+        self.assertEqual(mets[0]["formula"], "sum(RETURNS.RETURNED_UNITS)")   # a metric named like an attribute
+        self.assertEqual(mets[1]["formula"], "{Returned Units}/ {Quantity}")
+        self.assertEqual(mets[2]["formula"], "sum(orders.{QUANTITY})")         # the connector's own is kept
+        self.assertEqual(am.metric_tables({"metrics": [dict(mets[0], type="double")]}).keys(), {"returns"})
+
+    def test_scope_says_when_no_formula_is_shown(self):
+        bare = re.sub(r"\nsum\([^)]*\)", "", SEMANTICS)
+
+        class Runner(_Connector):
+            def call(self, tool, args):
+                if tool == "get_semantics":
+                    return {"content": [{"type": "text", "text": bare}]}
+                return super().call(tool, args)
+        out = am.scope_model(Runner(), "retail", "Retail Model", profile=False)
+        self.assertIn("--model-export", out["notes"]["no_formulas"])
+        self.assertIsNone(out["anchor"])
+
+
 class JoinPathTests(unittest.TestCase):
     def test_known_reach_isnt_asked_and_partial_reach_is_one_finding(self):
         scope, _ = _structured("export")
@@ -310,7 +395,7 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(mets["returns counted"]["fact"], "returns")
         self.assertEqual(mets["return rate"].get("fact"), None)    # reads two facts: model-wide as before
         self.assertFalse(any("not the fact table" in i for m in mets.values() for i in m["issues"]))
-        self.assertTrue(any("describes 'store id'" in i for i in mets["floor area"]["issues"]))
+        self.assertTrue(any("one row per 'store id'" in i for i in mets["floor area"]["issues"]))
         self.assertIsNone(mets["floor area"]["grouped_by"]["period"])
         for q in runner.calls:      # a query never mixes two tables' metrics
             names = re.findall(r'SUM\("([^"]+)"\)', q)

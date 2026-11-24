@@ -534,6 +534,7 @@ def scope_model(runner: Runner, project: str, model: str, *, profile: bool = Tru
     semantics = parse_semantics(tool_text(sem_result))
     if not semantics["attributes"] and not semantics["metrics"]:
         raise SystemExit("get_semantics returned no attributes or metrics (is the model certified?)")
+    from_export = formulas_from_export(semantics["metrics"], export)
     out: dict[str, Any] = {"version": 1, "project": project, "model": model,
                            "generated": time.strftime("%Y-%m-%d"), "profile_where": where or None,
                            "attributes": semantics["attributes"], "metrics": semantics["metrics"],
@@ -541,6 +542,14 @@ def scope_model(runner: Runner, project: str, model: str, *, profile: bool = Tru
                                                                 if not a["description"]],
                                      "undescribed_metrics": [m["name"] for m in semantics["metrics"]
                                                              if not m["description"]]}}
+    no_formula = [m["name"] for m in semantics["metrics"] if not m.get("formula")]
+    if from_export:
+        out["notes"]["formulas_from_export"] = from_export
+    if no_formula and len(no_formula) == len(semantics["metrics"]):
+        out["notes"]["no_formulas"] = ("the connector shows no metric formulas: the anchor, the fact tables and "
+                                       "the metric checks need them; run scope with --model-export")
+    elif no_formula:
+        out["notes"]["metrics_without_formula"] = no_formula
     if not profile:   # no attribute profiles, but still the anchor (one cheap COUNT query per eight metrics)
         out["anchor"] = choose_anchor(runner, project, model, semantics["metrics"], where, profile_batch)
         out.update(fact_structure(runner, project, out, export=export, where=where, reach=reach and bool(export),
@@ -588,6 +597,53 @@ def scope_model(runner: Runner, project: str, model: str, *, profile: bool = Tru
         out["period"] = period
     out["maturity"] = maturity_signals(out)
     return out
+
+
+_DEDUP_SUFFIX = re.compile(r"_\d+$")
+
+
+def connector_formula(text: str) -> str:
+    """An export metric expression in the connector's shape: 'Sum<UseLookupForAttributes=False>([Sales]){~+}'
+    is 'Sum({Sales})', 'Count<Distinct=True>(Order@ID){~+}<[%Filter 1%]>' is 'Count(Order (ID))'."""
+    t = re.sub(r"<\[[^\]]*\][^<>]*>", "", text)           # a condition ('<[%Filter 1%];+>'): the connector shows none
+    t = re.sub(r"\{~[^{}]*\}", "", t)                       # the level ('{~+}', '{~+,![Status]+}')
+    t = re.sub(r"(\w)<[^<>]*>\s*\(", r"\1(", t)              # function parameters
+    t = re.sub(r"\[([^\[\]]+)\]", r"{\1}", t)                # metric references
+    t = re.sub(r"([A-Za-z][\w ]*?)@(\w+)", r"\1 (\2)", t)     # attribute form
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def formulas_from_export(metrics: list[dict], export: dict | None) -> list[str]:
+    """Some models' connector shows no metric formulas (seen 2026-11-24): fill each missing one from the
+    export, in the connector's own shape: a fact metric as '<function>(<TABLE>.<column>)', a derived metric as
+    its expression. The connector names a metric 'x_1' when an attribute is also called 'x'. Returns the names
+    filled."""
+    model = _export_model(export)
+    if not model:
+        return []
+    found: dict[str, str] = {}
+    for fm in model.get("factMetrics") or []:
+        name = str((fm.get("information") or {}).get("name") or "").casefold()
+        exprs = ((fm.get("fact") or {}).get("expressions") or []) + (fm.get("expressions") or [])
+        hit = next(((str((e.get("expression") or {}).get("text") or ""), str(t.get("name")))
+                    for e in exprs for t in e.get("tables") or [] if t.get("name")), None)
+        if name and hit and hit[0]:
+            found[name] = f"{fm.get('function') or 'sum'}({hit[1]}.{hit[0]})"
+    for mm in model.get("metrics") or []:
+        name = str((mm.get("information") or {}).get("name") or "").casefold()
+        text = str((mm.get("expression") or {}).get("text") or "")
+        if name and text:
+            found.setdefault(name, connector_formula(text))
+    filled = []
+    for m in metrics:
+        if m.get("formula"):
+            continue
+        key = m["name"].casefold()
+        formula = found.get(key) or found.get(_DEDUP_SUFFIX.sub("", key))
+        if formula:
+            m["formula"], m["formula_source"] = formula, "export"
+            filled.append(m["name"])
+    return filled
 
 
 def raw_fact_metrics(metrics: list[dict]) -> list[str]:
@@ -1825,10 +1881,11 @@ def probe_objects(runner: Runner, project: str, scope: dict, *, attributes: list
             table = _metric_table(m)
             dim = dim_by_table.get(table.casefold()) if table else None
             if facts and dim:   # scope told facts from tables that describe an entity: only those are warned
-                item["issues"].append(f"reads '{table}', a table that describes '{dim.get('key') or 'an entity'}' (one row "
-                                      f"each), not a fact: grouped by anything finer than that, or summed with a fact's "
-                                      f"rows, it repeats the entity's value or reads that table's rows. Say how to read "
-                                      f"it in its description (per {dim.get('key') or 'entity'}), or move it to the fact")
+                key_n = dim.get("key") or "its key"
+                item["issues"].append(f"reads '{table}', one row per '{key_n}', which is also the lookup '{dim.get('reached_by')}' "
+                                      f"joins through: it is read per {key_n}, and next to '{dim.get('reached_by')}' "
+                                      f"metrics or grouped finer than {key_n} it repeats each {key_n}'s value. Say so in "
+                                      f"its description (one finding for the table's metrics)")
             elif not facts and table and anchor_table and table != anchor_table:
                 item["issues"].append(f"reads table '{table}', not the fact table of the anchor ('{anchor_table}'): if "
                                       f"it is a lookup or mapping table, aggregating it reads that table's rows, not "
@@ -2653,7 +2710,29 @@ def _export_table_graph(model: dict) -> dict[str, Any]:
     for name, tabs in attr_tables.items():
         for t in tabs:
             on_table.setdefault(t, set()).add(name)
-    return {"attr_tables": attr_tables, "lookup": lookup, "on_table": on_table}
+    parents: dict[str, set[str]] = {}
+    for r in _export_relationships(model, {"model": model}):
+        kind = str(r.get("type") or "one_to_many").lower()
+        if "many_to_many" in kind:   # a child has several parents: grouping by the parent repeats rows
+            continue
+        parents.setdefault(r["child"], set()).add(r["parent"])
+        if "one_to_one" in kind:
+            parents.setdefault(r["parent"], set()).add(r["child"])
+    return {"attr_tables": attr_tables, "lookup": lookup, "on_table": on_table, "parents": parents}
+
+
+def reached_attributes(table: str, graph: dict[str, Any], metric_tables: set[str] | None = None) -> set[str]:
+    """Attributes a fact table reaches: those mapped on the tables it reaches through lookups, then each one's
+    parents, grandparents... in the model's relationships (one-to-many or one-to-one; never many-to-many). A
+    child of a reached attribute is not reached: grouping by it repeats or splits the fact's rows."""
+    seen = {a for t in _reached_tables(table, graph, metric_tables) for a in graph["on_table"].get(t, ())}
+    todo = list(seen)
+    while todo:
+        for p in graph["parents"].get(todo.pop(), ()):
+            if p not in seen:
+                seen.add(p)
+                todo.append(p)
+    return seen
 
 
 def _reached_tables(table: str, graph: dict[str, Any], metric_tables: set[str] | None = None) -> set[str]:
@@ -2692,6 +2771,7 @@ def tables_from_export(scope: dict, export: dict | None) -> dict[str, Any] | Non
     graph = _export_table_graph(model)
     metric_tabs = {t.casefold() for t in _export_fact_tables(model)} | set(tables)
     reached = {t: _reached_tables(t, graph, metric_tabs) for t in tables}
+    attrs = {t: reached_attributes(t, graph, metric_tabs) for t in tables}
     dims: dict[str, dict[str, Any]] = {}
     for t, e in tables.items():
         by = [f for f in tables if f != t and t in reached[f] and (
@@ -2704,10 +2784,11 @@ def tables_from_export(scope: dict, export: dict | None) -> dict[str, Any] | Non
     if len(dims) == len(tables):   # every table reaching another one both ways: no dimension can be told apart
         dims = {}
     reach: dict[str, dict[str, dict[str, Any]]] = {}
-    for a, tabs in graph["attr_tables"].items():
-        reach[a] = {tables[t]["table"]: {"verdict": "reaches" if tabs & reached[t] else "not_reached",
+    for a in graph["attr_tables"]:
+        reach[a] = {tables[t]["table"]: {"verdict": "reaches" if a in attrs[t] else "not_reached",
                                          "source": "export"} for t in tables}
-    return {"tables": tables, "dimensions": dims, "reach": reach, "source": "export"}
+    own = {t: set(graph["on_table"].get(t, ())) for t in tables}
+    return {"tables": tables, "dimensions": dims, "reach": reach, "source": "export", "own": own}
 
 
 def _alone_sql(M: str, N: str, A: str, base: str) -> str:
@@ -2837,15 +2918,23 @@ def _dates_reaching(scope: dict, table: str) -> list[str]:
             and reach_of(scope, a["name"], table) == "reaches" and (_distinct(a) or 0) >= 2]
 
 
-def _row_id(scope: dict, fact: dict, n_facts: int) -> str | None:
-    """A fact's own row id: as many values as the fact has rows, and (with several facts) reaching no other."""
-    for a in scope.get("attributes") or []:
-        if fact["rows"] and _distinct(a) == fact["rows"] and reach_of(scope, a["name"], fact["table"]) != "not_reached":
-            others = [f for f in scope.get("facts") or [] if f["table"] != fact["table"]
-                      and reach_of(scope, a["name"], f["table"]) == "reaches"]
-            if n_facts < 2 or not others:
-                return a["name"]
-    return None
+def _own_attributes(scope: dict, table: str, own: set[str] | None) -> set[str]:
+    """Attributes on a fact's own table: from the export when there is one, else those whose name shares a word
+    with the table's ('disbursement date' for a disbursements table)."""
+    if own is not None:
+        return {a["name"] for a in scope.get("attributes") or [] if _base_name(a["name"]) in own}
+    words = {w.rstrip("s") for w in _tokens(re.sub(r"[._]+", " ", table))}
+    return {a["name"] for a in scope.get("attributes") or []
+            if {w.rstrip("s") for w in _tokens(_words(a["name"]))} & words}
+
+
+def _row_id(scope: dict, fact: dict, own: set[str]) -> str | None:
+    """A fact's own row id: as many values as the fact has rows and reaching it; one on the fact's own table
+    first (a header fact's id also reaches the facts that join to it), then the fewest facts reached."""
+    hits = [a["name"] for a in scope.get("attributes") or []
+            if fact["rows"] and _distinct(a) == fact["rows"] and reach_of(scope, a["name"], fact["table"]) != "not_reached"]
+    n_reached = {n: sum(1 for f in scope.get("facts") or [] if reach_of(scope, n, f["table"]) == "reaches") for n in hits}
+    return min(hits, key=lambda n: (n not in own, n_reached[n], n)) if hits else None
 
 
 def multi_fact_entity(scope: dict) -> dict[str, Any] | None:
@@ -2934,9 +3023,10 @@ def fact_structure(runner: Runner | None, project: str, scope: dict, *, export: 
              for t, e in res["tables"].items() if t not in dims]
     view["facts"] = facts
     for f in facts:
+        own = _own_attributes(view, f["table"], (res.get("own") or {}).get(f["table"].casefold()))
         f["dates"] = _dates_reaching(view, f["table"]) if res["reach"] else []
-        f["period"] = guess_period(view, among=f["dates"]) if f["dates"] else ""
-        f["row_id"] = _row_id(view, f, len(facts))
+        f["period"] = guess_period(view, among=f["dates"], own=own) if f["dates"] else ""
+        f["row_id"] = _row_id(view, f, own)
     out["facts"] = facts
     view["facts"] = facts
     entity = multi_fact_entity(view)
@@ -3752,13 +3842,16 @@ PERIOD_EVENT_SHARE = 0.9      # at least this share of entities with one period:
 PERIOD_SNAPSHOT_AVG = 1.5     # at least this many periods per entity on average: a snapshot period
 
 
-def guess_period(scope: dict, among: list[str] | None = None) -> str:
+def guess_period(scope: dict, among: list[str] | None = None, own: set[str] | None = None) -> str:
     """The attribute most likely to be the model's period: a date (or a number or text holding one) whose name
-    says period, date, month..., preferring reporting / snapshot / as-of names, then the most values. With
-    several facts, only dates that reach the model's anchor fact (or `among`, one fact's dates)."""
+    says period, date, month..., preferring reporting / snapshot / as-of names, then (with `own`) the fact's own
+    dates over those it reaches through another table, then the most values. With several facts, the anchor
+    fact's period (`among`: one fact's dates)."""
     if among is None and len(scope.get("facts") or []) > 1 and scope.get("reach"):
         anchor = (scope.get("anchor") or {}).get("metric")
         main = next((f for f in scope["facts"] if anchor in (f.get("metrics") or [])), scope["facts"][0])
+        if main.get("period"):
+            return str(main["period"])
         among = [a["name"] for a in scope.get("attributes") or [] if reach_of(scope, a["name"], main["table"]) != "not_reached"]
     dated = [a for a in scope.get("attributes") or []
              if (a.get("type", "").lower() in ("date", "timestamp") or looks_like_stored_date(a))
@@ -3766,7 +3859,8 @@ def guess_period(scope: dict, among: list[str] | None = None) -> str:
              and (among is None or a["name"] in among)]
     if not dated:
         return ""
-    return max(dated, key=lambda a: (bool(_PERIOD_PREFERRED.search(_words(a["name"]))), _distinct(a) or 0))["name"]
+    return max(dated, key=lambda a: (bool(_PERIOD_PREFERRED.search(_words(a["name"]))), a["name"] in (own or ()),
+                                     _distinct(a) or 0))["name"]
 
 
 def period_date(value: Any) -> datetime.date | None:
