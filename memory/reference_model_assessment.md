@@ -226,7 +226,10 @@ Aggregates of fact metrics run on the fact. So:
     shares one of the fact's own attributes (a period map keyed on the fact's period: one test model's
     latest-period flag lives there and filters work). Never from a lookup back into another fact through a
     shared key: that is the many-to-many path. Without the export: one 'alone' query per fact and attribute
-    (probe's one-row shape, so replies are shared), one fact at a time; `--no-reach` skips them.
+    (probe's one-row shape, so replies are shared), one fact at a time; `--no-reach` skips them. Checked live
+    2026-11-24 on a model with 4 facts and 4 entity tables carrying metrics: export reach agreed with all 33 live
+    checks (cross joins, repeated rows, failed queries and real groups alike), and the query fallback found the
+    same facts and entity tables in 13 queries (replay asks one key test per table per pass: 3 passes).
   - **Per-fact scope:** `facts` (table, anchor, rows, metrics, the dates that reach it, its period, its row id),
     `dimension_tables` and `entity` (an attribute reaching the most facts, then one that looks like an
     identifier, then the most values; never a row id, a date or a fraction). `relationships` uses that entity

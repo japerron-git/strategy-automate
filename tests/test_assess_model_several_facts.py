@@ -214,7 +214,7 @@ class FactTableTests(unittest.TestCase):
         self.assertEqual(Pending.calls, 0)
         out = am.fact_structure(Pending(), "retail", dict(SCOPE))
         self.assertIn("fact / dimension tests", out["reach_waiting"])
-        self.assertLess(Pending.calls, 10)   # the key tests only, not every fact x attribute
+        self.assertLessEqual(Pending.calls, 3)   # one key test per smaller table per pass, as live stops at a hit
 
     def test_a_metric_only_round_reuses_reach(self):
         before, _ = _structured("queries")

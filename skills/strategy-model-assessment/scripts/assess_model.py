@@ -2746,7 +2746,8 @@ def _key_candidates(scope: dict, rows: float, table: str) -> list[str]:
     """Attributes whose distinct values equal a table's rows (its possible key), the names closest to the
     table's first (fewest queries), at most three."""
     tokens = _tokens(re.sub(r"[._]+", " ", table))
-    names = [a["name"] for a in scope.get("attributes") or [] if _distinct(a) == rows]
+    picks = {t["name"] for t in _testable_attributes(scope, None)}   # one form per attribute
+    names = [a["name"] for a in scope.get("attributes") or [] if _distinct(a) == rows and a["name"] in picks]
     return sorted(names, key=lambda n: (-len(_tokens(n) & tokens), n))[:3]
 
 
@@ -2783,6 +2784,7 @@ def tables_by_query(ask: Callable[[str], dict | None], scope: dict, *, where: st
     dims: dict[str, dict[str, Any]] = {}
     for t, e in tables.items():
         larger = [f for f in tables if f != t and e["rows"] is not None and _rows(tables[f]) > _rows(e)]
+        waiting = False
         for key in _key_candidates(scope, e["rows"], e["table"]) if larger else []:
             for f in larger:
                 v = test(key, f)
@@ -2790,7 +2792,10 @@ def tables_by_query(ask: Callable[[str], dict | None], scope: dict, *, where: st
                 if v["verdict"] == "reaches":
                     dims[t] = {"reached_by": tables[f]["table"], "key": key, "evidence": "query"}
                     break
-            if t in dims:
+                if v["verdict"] == "pending":   # replay: one test per table per pass, as live stops at a hit
+                    waiting = True
+                    break
+            if t in dims or waiting:
                 break
     facts = [t for t in tables if t not in dims] or list(tables)
     if any(v.get("verdict") == "pending" for r in reach_out.values() for v in r.values()):
